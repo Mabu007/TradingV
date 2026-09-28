@@ -1,0 +1,7 @@
+# Agent Capabilities
+
+`CapabilityRegistry` is the only model-tool dispatch boundary. Each capability has metadata, input/output schema descriptions, a category and an executor that receives a constrained `CapabilityContext` (agent id, selected environment, symbol/timeframe and immutable policy). Capabilities are registered by application code and resolved per-agent from skill requirements plus the explicit agent allowlist.
+
+Implemented capability IDs cover market quote/bars/spread/session; SMA/EMA/RSI/ATR; swing highs/lows, support/resistance and breakout; balance/equity/margin/positions/orders/exposure; risk sizing/risk/exposure/check/daily loss/drawdown; and controlled order/position operations. Indicator and market structure calculations reuse existing deterministic code. Account and order reads depend on the configured environment contract. Current adapters report no pending orders because no pending-order implementation exists. Limit and cancel requests fail closed until that contract exists. Position modification is supported by the Hyperliquid DEMO adapter and reports failure rather than claiming success when the environment cannot perform it.
+
+Execution capabilities never touch the provider directly. Market order intents are validated against agent policy and TradingVibe `RiskManager`; approved operations call environment methods. A capability call is not permission to bypass action validation.
