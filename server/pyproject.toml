@@ -1,0 +1,60 @@
+[project]
+name = "tradingv-engine"
+version = "1.0.0"
+description = "TradingVibe market monitor, indicator engine, and condition evaluator"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+# Dependency decisions (see server/README.md for the full rationale):
+#   numpy / pandas  - the time-series substrate. Mature, deterministic,
+#                     no compiled surprises, and already present in the
+#                     environment.
+#   ta              - the standard technical-analysis library. BSD-3,
+#                     pure Python, covers every indicator in the
+#                     catalogue that has a canonical textbook definition.
+#                     Preferred over reimplementing them.
+#   fastapi/uvicorn - a small, well-understood HTTP boundary between the
+#                     browser and the monitor. No broker, no bus, no
+#                     orchestration.
+#   jsonschema      - validates the canonical condition tree against
+#                     shared/condition_schema_v1.json on both sides.
+#
+# Deliberately NOT included:
+#   ta-lib          - installation requires a system C library and
+#                     failed to build in this environment. `ta` covers
+#                     the same indicators.
+#   pandas-ta       - API changed between releases; not reliable enough
+#                     to depend on.
+dependencies = [
+  "numpy>=1.26,<3",
+  "pandas>=2.0,<3",
+  "ta==0.11.0",
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.30,<1",
+  "pydantic>=2.9,<3",
+  "jsonschema>=4.20,<5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "httpx>=0.27,<1",
+]
+
+[project.scripts]
+tradingv-engine = "tradingv_engine.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tradingv_engine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]

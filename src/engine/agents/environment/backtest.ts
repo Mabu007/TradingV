@@ -308,7 +308,7 @@ export class BacktestEnvironment implements ITradingEnvironment {
       unrealizedPnlPercent: 0,
       timestamp: (bar ? bar.time : Date.now()) * 1000,
       commission: this.costForVolume(params.volume),
-      botName: params.comment,
+      goatName: params.comment,
     };
 
     this.balance -= newPosition.commission || 0;

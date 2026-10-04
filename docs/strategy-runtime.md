@@ -1,12 +1,12 @@
 # Strategy Runtime & Sandbox Environment
 
-This document details the isolated strategy execution environment, TypeScript compilation, and the controlled `TradingContext` API in **TradingVibe**.
+This document details the isolated strategy execution environment, TypeScript compilation, and the controlled `TradingContext` API in **TradingGOATs**.
 
 ---
 
 ## 1. Strategy Execution Architecture
 
-Trading strategies in TradingVibe are written in standard TypeScript and executed in an isolated runtime environment (`src/engine/sandbox/sandboxEnv.ts`).
+Trading strategies in TradingGOATs are written in standard TypeScript and executed in an isolated runtime environment (`src/engine/sandbox/sandboxEnv.ts`).
 
 ```mermaid
 graph TD

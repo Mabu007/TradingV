@@ -1,6 +1,6 @@
 # Market Data & Instruments
 
-TradingVibe's only market-data provider is **Hyperliquid**, including its
+TradingGOATs's only market-data provider is **Hyperliquid**, including its
 **HIP-3** multi-namespace deployments.
 
 ## Supported asset groups
@@ -91,3 +91,16 @@ size is rejected, never silently corrected.
 `ConnectionStatus` reflects the websocket: `DISCONNECTED`, `CONNECTING`,
 `CONNECTED`, `RECONNECTING`, `ERROR`. Status changes are emitted on the
 event bus and surfaced in the UI.
+
+## Where instrument metadata is consumed
+
+The same `InstrumentMetadata` model feeds every layer that needs an
+instrument fact. In particular, the tracker runtime resolves metadata
+from the environment and attaches it to each tracker input, so proximity and
+threshold maths measures pip size, tick size, contract multiplier, and quote
+currency from the instrument itself rather than guessing from a symbol name.
+See [trackers.md](./trackers.md).
+
+Availability is decided here, once. A market that is `UNAVAILABLE` never
+becomes a price upstream: the execution adapter rejects it, the risk layer
+cannot value it, and a tracker measuring distance from it stays silent.

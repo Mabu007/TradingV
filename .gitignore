@@ -4,5 +4,19 @@ dist/
 coverage/
 .DS_Store
 *.log
-.env*
+
+# Local environment files. Anything named `.env*` is ignored; only the
+# committed template is allowed back in. No VITE_-prefixed secret may
+# ever be added to `.env.example`.
+.env
+.env.*
 !.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+server/.venv/
+server/build/

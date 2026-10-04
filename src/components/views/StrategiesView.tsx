@@ -34,13 +34,13 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
   };
 
   return (
-    <div className="flex-1 h-full overflow-y-auto p-6 bg-[#090d14] text-slate-200">
+    <div className="flex-1 h-full overflow-y-auto p-6 bg-bg-bg-alt text-ink-2">
       <div className="max-w-6xl mx-auto space-y-6">
         {/* Header */}
-        <div className="flex items-center justify-between pb-4 border-b border-[#1e293b]">
+        <div className="flex items-center justify-between pb-4 border-b border-line">
           <div>
             <h1 className="text-xl font-bold text-white tracking-tight">Strategies</h1>
-            <p className="text-xs text-slate-400 mt-0.5">
+            <p className="text-xs text-ink-3 mt-0.5">
               TypeScript strategy routines compatible across Backtest, Demo, and Live environments
             </p>
           </div>
@@ -62,39 +62,39 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
             return (
               <div
                 key={strat.id}
-                className={`bg-[#0c121e] border rounded-lg p-4 flex flex-col justify-between transition-colors shadow-xs ${
-                  isSelected ? 'border-sky-500/60' : 'border-[#1e293b] hover:border-slate-700'
+                className={`bg-bg-surface border rounded-lg p-4 flex flex-col justify-between transition-colors shadow-xs ${
+                  isSelected ? 'border-sky-500/60' : 'border-line hover:border-line-strong'
                 }`}
               >
                 <div>
                   <div className="flex items-start justify-between gap-2 mb-2">
                     <h3 className="text-sm font-semibold text-white tracking-tight">{strat.name}</h3>
-                    <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-[#162032] text-slate-300 border border-[#1e293b]">
+                    <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-surface-3 text-ink-2 border border-line">
                       {strat.category}
                     </span>
                   </div>
 
-                  <p className="text-xs text-slate-400 mb-4 line-clamp-2 leading-relaxed">
+                  <p className="text-xs text-ink-3 mb-4 line-clamp-2 leading-relaxed">
                     {strat.description}
                   </p>
 
-                  <div className="flex items-center gap-2 text-xs font-mono text-slate-300 mb-4">
+                  <div className="flex items-center gap-2 text-xs font-mono text-ink-2 mb-4">
                     <span className="font-semibold text-white">{strat.symbol}</span>
-                    <span className="text-slate-500">·</span>
+                    <span className="text-ink-4">·</span>
                     <span>{strat.timeframe}</span>
-                    <span className="text-slate-500">·</span>
-                    <span className="text-slate-400 text-[11px] font-sans">
+                    <span className="text-ink-4">·</span>
+                    <span className="text-ink-3 text-[11px] font-sans">
                       {new Date(strat.updatedAt).toLocaleDateString()}
                     </span>
                   </div>
                 </div>
 
-                <div className="flex items-center justify-between pt-3 border-t border-[#1e293b]/60 gap-2">
+                <div className="flex items-center justify-between pt-3 border-t border-line/60 gap-2">
                   <div className="flex items-center gap-1">
                     {strategies.length > 1 && (
                       <button
                         onClick={() => onDeleteStrategy(strat.id)}
-                        className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-[#1e293b] transition-colors"
+                        className="p-1 rounded text-ink-4 hover:text-rose-400 hover:bg-line-strong transition-colors"
                         title="Delete Strategy"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
@@ -129,32 +129,32 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
       {/* Create Modal */}
       {showCreateModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4">
-          <div className="w-full max-w-md bg-[#0c121e] border border-[#1e293b] rounded-lg shadow-2xl p-5 text-slate-200">
+          <div className="w-full max-w-md bg-bg-surface border border-line rounded-lg shadow-2xl p-5 text-ink-2">
             <h3 className="text-sm font-bold text-white mb-1">Create New Strategy</h3>
-            <p className="text-xs text-slate-400 mb-4">
-              Scaffold a clean TypeScript trading strategy with TradingVibe SDK types.
+            <p className="text-xs text-ink-3 mb-4">
+              Scaffold a clean TypeScript trading strategy with TradingGOATs SDK types.
             </p>
 
             <form onSubmit={handleCreate} className="space-y-3 text-xs">
               <div>
-                <label className="block text-slate-300 font-medium mb-1">Strategy Name</label>
+                <label className="block text-ink-2 font-medium mb-1">Strategy Name</label>
                 <input
                   type="text"
                   required
                   value={newStratName}
                   onChange={(e) => setNewStratName(e.target.value)}
                   placeholder="e.g. Bollinger Squeeze Scalper"
-                  className="w-full bg-[#131c2e] text-white border border-[#1e293b] rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 text-xs"
+                  className="w-full bg-bg-surface-3 text-white border border-line rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 text-xs"
                 />
               </div>
 
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label className="block text-slate-300 font-medium mb-1">Default Symbol</label>
+                  <label className="block text-ink-2 font-medium mb-1">Default Symbol</label>
                   <select
                     value={newStratSymbol}
                     onChange={(e) => setNewStratSymbol(e.target.value)}
-                    className="w-full bg-[#131c2e] text-white border border-[#1e293b] rounded px-2.5 py-1.5 focus:outline-none focus:border-sky-500 text-xs font-mono"
+                    className="w-full bg-bg-surface-3 text-white border border-line rounded px-2.5 py-1.5 focus:outline-none focus:border-sky-500 text-xs font-mono"
                   >
                     <option value="EUR/USD">EUR/USD</option>
                     <option value="GBP/USD">GBP/USD</option>
@@ -165,11 +165,11 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                 </div>
 
                 <div>
-                  <label className="block text-slate-300 font-medium mb-1">Timeframe</label>
+                  <label className="block text-ink-2 font-medium mb-1">Timeframe</label>
                   <select
                     value={newStratTf}
                     onChange={(e) => setNewStratTf(e.target.value)}
-                    className="w-full bg-[#131c2e] text-white border border-[#1e293b] rounded px-2.5 py-1.5 focus:outline-none focus:border-sky-500 text-xs font-mono"
+                    className="w-full bg-bg-surface-3 text-white border border-line rounded px-2.5 py-1.5 focus:outline-none focus:border-sky-500 text-xs font-mono"
                   >
                     <option value="1m">1m</option>
                     <option value="5m">5m</option>
@@ -180,11 +180,11 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
               </div>
 
               <div>
-                <label className="block text-slate-300 font-medium mb-1">Archetype Category</label>
+                <label className="block text-ink-2 font-medium mb-1">Archetype Category</label>
                 <select
                   value={newStratCat}
                   onChange={(e) => setNewStratCat(e.target.value as any)}
-                  className="w-full bg-[#131c2e] text-white border border-[#1e293b] rounded px-2.5 py-1.5 focus:outline-none focus:border-sky-500 text-xs"
+                  className="w-full bg-bg-surface-3 text-white border border-line rounded px-2.5 py-1.5 focus:outline-none focus:border-sky-500 text-xs"
                 >
                   <option value="Trend">Trend Following</option>
                   <option value="Breakout">Breakout / Expansion</option>
@@ -192,11 +192,11 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                 </select>
               </div>
 
-              <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#1e293b]">
+              <div className="flex items-center justify-end gap-2 pt-3 border-t border-line">
                 <button
                   type="button"
                   onClick={() => setShowCreateModal(false)}
-                  className="px-3 py-1.5 rounded text-xs text-slate-300 hover:text-white bg-[#1e293b] transition-colors"
+                  className="px-3 py-1.5 rounded text-xs text-ink-2 hover:text-white bg-line-strong transition-colors"
                 >
                   Cancel
                 </button>

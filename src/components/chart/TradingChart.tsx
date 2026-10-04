@@ -3,6 +3,8 @@ import * as LightweightCharts from 'lightweight-charts';
 import { Maximize2, Minimize2, Eye, EyeOff, Layers } from 'lucide-react';
 import { Bar, Position, SignalEvent, Trade } from '../../types/trading';
 import { calculateSMA } from '../../engine/indicators';
+import { readChartPalette } from '../../services/theme/chartTheme';
+import { useTheme } from '../../services/theme';
 
 interface TradingChartProps {
   symbol: string;
@@ -30,6 +32,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
   isMaximized = false,
   onToggleMaximize,
 }) => {
+  const { theme: themeName } = useTheme();
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<any>(null);
   const candleSeriesRef = useRef<any>(null);
@@ -56,39 +59,43 @@ export const TradingChart: React.FC<TradingChartProps> = ({
 
     const { createChart, ColorType, LineStyle, CrosshairMode } = LightweightCharts as any;
 
+    // One palette, read from the same CSS tokens as the rest of the UI, so
+    // the chart is themed rather than hardcoded.
+    const palette = readChartPalette(chartContainerRef.current ?? undefined);
+
     const chart = createChart(chartContainerRef.current, {
       layout: {
-        background: { type: ColorType?.Solid || 'solid', color: '#090d14' },
-        textColor: '#94a3b8',
+        background: { type: ColorType?.Solid || 'solid', color: palette.background },
+        textColor: palette.text,
         fontSize: 11,
         fontFamily: "'JetBrains Mono', monospace",
       },
       grid: {
-        vertLines: { color: 'rgba(30, 41, 59, 0.45)', style: LineStyle?.Dotted || 1 },
-        horzLines: { color: 'rgba(30, 41, 59, 0.45)', style: LineStyle?.Dotted || 1 },
+        vertLines: { color: palette.grid, style: LineStyle?.Dotted || 1 },
+        horzLines: { color: palette.grid, style: LineStyle?.Dotted || 1 },
       },
       crosshair: {
         mode: CrosshairMode?.Normal || 1,
         vertLine: {
-          color: '#64748b',
+          color: palette.lineStrong,
           width: 1,
           style: LineStyle?.Dashed || 2,
-          labelBackgroundColor: '#1e293b',
+          labelBackgroundColor: palette.line,
         },
         horzLine: {
-          color: '#64748b',
+          color: palette.lineStrong,
           width: 1,
           style: LineStyle?.Dashed || 2,
-          labelBackgroundColor: '#1e293b',
+          labelBackgroundColor: palette.line,
         },
       },
       timeScale: {
-        borderColor: '#1e293b',
+        borderColor: palette.line,
         timeVisible: true,
         secondsVisible: false,
       },
       rightPriceScale: {
-        borderColor: '#1e293b',
+        borderColor: palette.line,
         autoScale: true,
         scaleMargins: {
           top: 0.1,
@@ -104,21 +111,21 @@ export const TradingChart: React.FC<TradingChartProps> = ({
     let candleSeries: any;
     if (typeof chart.addCandlestickSeries === 'function') {
       candleSeries = chart.addCandlestickSeries({
-        upColor: '#10b981',
-        downColor: '#ef4444',
-        borderUpColor: '#10b981',
-        borderDownColor: '#ef4444',
-        wickUpColor: '#10b981',
-        wickDownColor: '#ef4444',
+        upColor: palette.pos,
+        downColor: palette.neg,
+        borderUpColor: palette.pos,
+        borderDownColor: palette.neg,
+        wickUpColor: palette.pos,
+        wickDownColor: palette.neg,
       });
     } else if (typeof chart.addSeries === 'function' && (LightweightCharts as any).CandlestickSeries) {
       candleSeries = chart.addSeries((LightweightCharts as any).CandlestickSeries, {
-        upColor: '#10b981',
-        downColor: '#ef4444',
-        borderUpColor: '#10b981',
-        borderDownColor: '#ef4444',
-        wickUpColor: '#10b981',
-        wickDownColor: '#ef4444',
+        upColor: palette.pos,
+        downColor: palette.neg,
+        borderUpColor: palette.pos,
+        borderDownColor: palette.neg,
+        wickUpColor: palette.pos,
+        wickDownColor: palette.neg,
       });
     }
     candleSeriesRef.current = candleSeries;
@@ -128,26 +135,26 @@ export const TradingChart: React.FC<TradingChartProps> = ({
     let slowSma: any;
     if (typeof chart.addLineSeries === 'function') {
       fastSma = chart.addLineSeries({
-        color: '#38bdf8',
+        color: palette.accent,
         lineWidth: 1.5,
         title: 'SMA 10',
         priceLineVisible: false,
       });
       slowSma = chart.addLineSeries({
-        color: '#f59e0b',
+        color: palette.warn,
         lineWidth: 1.5,
         title: 'SMA 30',
         priceLineVisible: false,
       });
     } else if (typeof chart.addSeries === 'function' && (LightweightCharts as any).LineSeries) {
       fastSma = chart.addSeries((LightweightCharts as any).LineSeries, {
-        color: '#38bdf8',
+        color: palette.accent,
         lineWidth: 1.5,
         title: 'SMA 10',
         priceLineVisible: false,
       });
       slowSma = chart.addSeries((LightweightCharts as any).LineSeries, {
-        color: '#f59e0b',
+        color: palette.warn,
         lineWidth: 1.5,
         title: 'SMA 30',
         priceLineVisible: false,
@@ -240,7 +247,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
       slowSmaSeriesRef.current.setData(slowData);
     }
 
-    // Build Chart Markers (AI Signals + Bot Entry/Exit Trades)
+    // Build Chart Markers (AI signals + GOAT entry/exit trades)
     const markers: any[] = [];
 
     // AI Signals
@@ -248,7 +255,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
       markers.push({
         time: sig.timestamp,
         position: sig.side === 'BUY' ? 'belowBar' : 'aboveBar',
-        color: sig.side === 'BUY' ? '#10b981' : '#ef4444',
+        color: sig.side === 'BUY' ? readChartPalette(chartContainerRef.current ?? undefined).pos : readChartPalette(chartContainerRef.current ?? undefined).neg,
         shape: sig.side === 'BUY' ? 'arrowUp' : 'arrowDown',
         text: `▲ AI ${sig.side}`,
       });
@@ -259,14 +266,14 @@ export const TradingChart: React.FC<TradingChartProps> = ({
       markers.push({
         time: trd.entryTime,
         position: trd.side === 'BUY' ? 'belowBar' : 'aboveBar',
-        color: '#38bdf8',
+        color: readChartPalette(chartContainerRef.current ?? undefined).accent,
         shape: 'circle',
         text: `● ENTRY ${trd.side}`,
       });
       markers.push({
         time: trd.exitTime,
         position: trd.side === 'BUY' ? 'aboveBar' : 'belowBar',
-        color: trd.pnl >= 0 ? '#10b981' : '#f43f5e',
+        color: trd.pnl >= 0 ? readChartPalette(chartContainerRef.current ?? undefined).pos : readChartPalette(chartContainerRef.current ?? undefined).neg,
         shape: 'square',
         text: `× EXIT ${trd.pnl >= 0 ? '+' : ''}$${trd.pnl}`,
       });
@@ -306,7 +313,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
       // Entry Line
       const entryLine = candleSeriesRef.current.createPriceLine({
         price: activePosition.entryPrice,
-        color: activePosition.side === 'BUY' ? '#38bdf8' : '#fb923c',
+        color: activePosition.side === 'BUY' ? readChartPalette(chartContainerRef.current ?? undefined).accent : readChartPalette(chartContainerRef.current ?? undefined).warn,
         lineWidth: 1,
         lineStyle: 0, // Solid
         axisLabelVisible: true,
@@ -318,7 +325,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
       if (activePosition.stopLoss) {
         const slLine = candleSeriesRef.current.createPriceLine({
           price: activePosition.stopLoss,
-          color: '#ef4444',
+          color: readChartPalette(chartContainerRef.current ?? undefined).neg,
           lineWidth: 1,
           lineStyle: 2, // Dashed
           axisLabelVisible: true,
@@ -331,7 +338,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
       if (activePosition.takeProfit) {
         const tpLine = candleSeriesRef.current.createPriceLine({
           price: activePosition.takeProfit,
-          color: '#10b981',
+          color: readChartPalette(chartContainerRef.current ?? undefined).pos,
           lineWidth: 1,
           lineStyle: 2, // Dashed
           axisLabelVisible: true,
@@ -358,22 +365,52 @@ export const TradingChart: React.FC<TradingChartProps> = ({
         }, 80);
       }
     }
-  }, [isMaximized]);
+  }, [isMaximized, themeName]);
+
+  /*
+   * A canvas chart cannot inherit CSS. When the theme changes we re-apply
+   * the palette in place instead of recreating the series, so the user's
+   * pan/zoom and loaded history survive the switch.
+   */
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+
+    const palette = readChartPalette(chartContainerRef.current ?? undefined);
+
+    try {
+      chart.applyOptions?.({
+        layout: { background: { type: 'solid', color: palette.background }, textColor: palette.text },
+        grid: { vertLines: { color: palette.grid }, horzLines: { color: palette.grid } },
+        timeScale: { borderColor: palette.line },
+        rightPriceScale: { borderColor: palette.line },
+      });
+      candleSeriesRef.current?.applyOptions?.({
+        upColor: palette.pos, downColor: palette.neg,
+        borderUpColor: palette.pos, borderDownColor: palette.neg,
+        wickUpColor: palette.pos, wickDownColor: palette.neg,
+      });
+      fastSmaSeriesRef.current?.applyOptions?.({ color: palette.accent });
+      slowSmaSeriesRef.current?.applyOptions?.({ color: palette.warn });
+    } catch {
+      // A missing optional method must never break the chart.
+    }
+  }, [themeName]);
 
   return (
-    <div className="relative w-full h-full select-none bg-[#090d14] flex flex-col">
+    <div className="relative w-full h-full select-none bg-bg-alt flex flex-col">
       {/* Chart Top Metadata Bar */}
-      <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#1e293b]/70 bg-[#0c121e]/90 text-xs">
+      <div className="flex items-center justify-between px-3 py-1.5 border-b border-line/70 bg-surface/90 text-xs">
         <div className="flex items-center gap-3 font-mono">
-          <span className="font-semibold text-white tracking-wide">{symbol}</span>
-          <span className="text-slate-400">{timeframe}</span>
+          <span className="font-semibold text-ink tracking-wide">{symbol}</span>
+          <span className="text-ink-3">{timeframe}</span>
           {showIndicators && (
             <div className="hidden sm:flex items-center gap-3 text-[11px]">
-              <span className="text-sky-400 flex items-center gap-1">
-                <span className="w-2 h-0.5 bg-sky-400 inline-block"></span> SMA 10
+              <span className="text-accent flex items-center gap-1">
+                <span className="w-2 h-0.5 bg-accent inline-block"></span> SMA 10
               </span>
-              <span className="text-amber-400 flex items-center gap-1">
-                <span className="w-2 h-0.5 bg-amber-400 inline-block"></span> SMA 30
+              <span className="text-warn flex items-center gap-1">
+                <span className="w-2 h-0.5 bg-warn inline-block"></span> SMA 30
               </span>
             </div>
           )}
@@ -382,22 +419,22 @@ export const TradingChart: React.FC<TradingChartProps> = ({
         {/* OHLC Tooltip & Right Chart Controls */}
         <div className="flex items-center gap-3">
           {activeTooltip && (
-            <div className="hidden md:flex items-center gap-3 font-mono text-[11px] tabular-nums text-slate-300">
-              <span>O: <strong className="text-white">{activeTooltip.open.toFixed(5)}</strong></span>
-              <span>H: <strong className="text-emerald-400">{activeTooltip.high.toFixed(5)}</strong></span>
-              <span>L: <strong className="text-rose-400">{activeTooltip.low.toFixed(5)}</strong></span>
-              <span>C: <strong className={activeTooltip.close >= activeTooltip.open ? 'text-emerald-400' : 'text-rose-400'}>{activeTooltip.close.toFixed(5)}</strong></span>
+            <div className="hidden md:flex items-center gap-3 font-mono text-[11px] tabular-nums text-ink-2">
+              <span>O: <strong className="text-ink">{activeTooltip.open.toFixed(5)}</strong></span>
+              <span>H: <strong className="text-pos">{activeTooltip.high.toFixed(5)}</strong></span>
+              <span>L: <strong className="text-neg">{activeTooltip.low.toFixed(5)}</strong></span>
+              <span>C: <strong className={activeTooltip.close >= activeTooltip.open ? 'text-pos' : 'text-neg'}>{activeTooltip.close.toFixed(5)}</strong></span>
             </div>
           )}
 
-          <div className="flex items-center gap-1 border-l border-[#1e293b]/60 pl-2">
+          <div className="flex items-center gap-1 border-l border-line/60 pl-2">
             {onToggleIndicators && (
               <button
                 onClick={onToggleIndicators}
                 className={`p-1 rounded text-xs transition-colors flex items-center gap-1 ${
                   showIndicators
-                    ? 'text-sky-400 bg-sky-950/40 hover:bg-sky-900/50'
-                    : 'text-slate-400 hover:text-slate-200 hover:bg-[#1e293b]'
+                    ? 'text-accent bg-accent-soft/40 hover:bg-accent-soft/50'
+                    : 'text-ink-3 hover:text-ink-2 hover:bg-surface-3'
                 }`}
                 title={showIndicators ? 'Hide Technical Indicators' : 'Show Technical Indicators'}
               >
@@ -411,8 +448,8 @@ export const TradingChart: React.FC<TradingChartProps> = ({
                 onClick={onToggleMaximize}
                 className={`p-1 rounded text-xs transition-colors flex items-center gap-1 font-medium ${
                   isMaximized
-                    ? 'bg-sky-600 text-white hover:bg-sky-500'
-                    : 'text-slate-300 hover:text-white bg-[#1e293b] hover:bg-[#334155]'
+                    ? 'bg-accent-strong text-accent-contrast hover:bg-accent'
+                    : 'text-ink-2 hover:text-ink bg-surface-3 hover:bg-line-strong'
                 }`}
                 title={isMaximized ? 'Exit Fullscreen Chart' : 'Fullscreen Chart'}
               >

@@ -176,14 +176,46 @@ export function marketAvailability(
   return { availability: 'TRADEABLE' };
 }
 
-/** Attach a live price snapshot to canonical metadata. */
-export function marketSymbol(metadata: InstrumentMetadata, price: number, previous?: MarketSnapshot): MarketSymbol {
+/**
+ * Percentage change of a price against its own 24-hour reference.
+ *
+ * Returns NaN rather than 0 when there is no usable reference. A missing
+ * reference is not a flat market, and reporting 0.00% for a market whose
+ * reference was never fetched is a confident wrong answer that no reader
+ * can distinguish from a real one.
+ */
+export function percentChange24h(price: number, previousDayPrice?: number): number {
+  if (!Number.isFinite(price) || !Number.isFinite(previousDayPrice) || (previousDayPrice as number) <= 0) {
+    return Number.NaN;
+  }
+  return ((price - (previousDayPrice as number)) / (previousDayPrice as number)) * 100;
+}
+
+/**
+ * Attach a live price snapshot to canonical metadata.
+ *
+ * `previousDayPrice` is the venue's own 24h-ago reference price. It is
+ * what makes `change24h` a measurement rather than a constant.
+ *
+ * `high24h` and `low24h` are left NaN when the caller has no 24h range.
+ * The previous shape took an optional snapshot and, with no caller ever
+ * passing one, silently substituted the current price for both -- so
+ * "24h High" and "24h Low" rendered as the live price and looked
+ * plausible. A NaN is honest: the UI already renders "unavailable"
+ * rather than a fabricated number.
+ */
+export function marketSymbol(
+  metadata: InstrumentMetadata,
+  price: number,
+  previousDayPrice?: number,
+  range?: { high: number; low: number },
+): MarketSymbol {
   return {
     ...metadata,
     lastPrice: price,
-    change24h: previous?.change24h ?? 0,
-    high24h: previous?.high24h ?? price,
-    low24h: previous?.low24h ?? price,
+    change24h: percentChange24h(price, previousDayPrice),
+    high24h: range?.high ?? Number.NaN,
+    low24h: range?.low ?? Number.NaN,
   };
 }
 

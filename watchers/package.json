@@ -1,0 +1,23 @@
+{
+  "name": "tradingvibe-watchers",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker and Durable Object watchers. Decides WHEN to wake a bot; never places an order.",
+  "scripts": {
+    "dev": "wrangler dev --local",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test:runtime": "vitest run --config vitest.runtime.config.ts",
+    "test:all": "npm run typecheck && npm run test && npm run test:runtime"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8.19",
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.7",
+    "wrangler": "^3.99.0"
+  }
+}

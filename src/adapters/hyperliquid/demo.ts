@@ -22,6 +22,7 @@ import { ACCOUNT_CURRENCY, marginForPosition, valuePriceDistance } from '../../e
 import { validateOrderSize } from '../../utils/orderSize';
 import { ITradingEnvironment } from '../../engine/agents/types';
 import { hyperliquidMarketData } from './marketData';
+import { MarketFacts } from '../../engine/agents/types';
 
 type DemoMarketOrderResult = {
   success: boolean;
@@ -32,6 +33,12 @@ type DemoMarketOrderResult = {
   error?: string;
   /** Structured reason plus a user-safe message. */
   rejection?: ExecutionRejection;
+  /**
+   * True when this is the earlier answer being returned again rather than
+   * a new submission. Surfaced so a caller can tell "already done" from
+   * "done now" without comparing timestamps.
+   */
+  duplicate?: boolean;
 };
 
 /**
@@ -56,6 +63,15 @@ export interface DemoMarketDataSource {
   getInstruments?(): Promise<
     Array<InstrumentMetadata & { market?: unknown }>
   >;
+  /**
+   * Funding, open interest and volume, where the source publishes them.
+   *
+   * Optional because the demo source is an interface, not a promise: a source
+   * that genuinely cannot answer must be able to say so rather than being
+   * forced to invent zeroes. The shipped Hyperliquid source does answer, which
+   * is why this exists — demo mode reads real public funding.
+   */
+  getMarketContext?(symbol: string): Promise<MarketFacts>;
 }
 
 export type PositionMark = {
@@ -167,9 +183,62 @@ export class HyperliquidDemoAdapter implements ITradingEnvironment {
   ) {}
 
   private balance = 10_000;
+  /**
+   * Realised profit and loss since the session started.
+   *
+   * A daily-loss limit cannot work without this: realised losses used to
+   * disappear from the account snapshot as soon as a position closed.
+   */
+  private realisedSessionPnL = 0;
+  /** High-water mark, so drawdown is measured from a peak and not from zero. */
+  private peakEquity = 10_000;
+  /**
+   * Monotonic counter making every generated id unique within this
+   * adapter, independent of clock resolution.
+   */
+  private sequence = 0;
+  private nextSequence(): number {
+    this.sequence += 1;
+    return this.sequence;
+  }
+
   private positions: Position[] = [];
   private orders: OrderResult[] = [];
   private unvaluableReported = new Set<string>();
+
+  /**
+   * The outcome already produced for each idempotency key.
+   *
+   * The problem this solves is not theoretical. An agent can wake twice on
+   * the same evidence, a user can click submit twice, a client can retry a
+   * request it never saw the answer to. Each of those produces a second
+   * order for one decision, and a position twice the intended size is not
+   * a bug that announces itself.
+   *
+   * So a submission with a key that has already been answered returns the
+   * answer it already got, rather than trading again. Recording the
+   * outcome *before* returning it — including a rejection — is what makes
+   * this work for the case that matters most: the request whose response
+   * was lost in transit.
+   */
+  private submissionsByKey = new Map<
+    string,
+    { fingerprint: string; result: DemoMarketOrderResult }
+  >();
+
+  /**
+   * What was actually asked for, so a reused key that means something else
+   * can be refused rather than silently answered with the wrong order.
+   */
+  private fingerprint(request: MarketOrderRequest): string {
+    return [
+      request.symbol,
+      request.side,
+      request.volume,
+      request.stopLoss ?? '',
+      request.takeProfit ?? '',
+    ].join('|');
+  }
   private instrumentLookup: InstrumentLookup =
     hyperliquidMarketData.getInstrumentLookup();
 
@@ -232,6 +301,8 @@ export class HyperliquidDemoAdapter implements ITradingEnvironment {
      * Hyperliquid margin requirement: real margin comes from the
      * exchange's clearing state, which this demo never queries.
      */
+    if (equity > this.peakEquity) this.peakEquity = equity;
+
     const margin = this.positions.reduce(
       (sum, position) => {
         const projected = marginForPosition({
@@ -251,8 +322,20 @@ export class HyperliquidDemoAdapter implements ITradingEnvironment {
       equity,
       margin,
       freeMargin: equity - margin,
-      dailyPnL: equity - this.balance,
-      drawdownPercent: 0,
+      /*
+       * Realised plus unrealised for the session.
+       *
+       * This used to be `equity - balance`, which is *only* the open P&L:
+       * a loss leaves the number the moment the position closes, so a GOAT
+       * could lose far more than its daily limit and stay under it. With
+       * no open positions that expression is exactly zero. The realised
+       * figure is tracked separately and the two are summed.
+       */
+      dailyPnL: this.realisedSessionPnL + unrealized,
+      realisedSessionPnL: this.realisedSessionPnL,
+      drawdownPercent: this.peakEquity > 0
+        ? Math.max(0, ((this.peakEquity - equity) / this.peakEquity) * 100)
+        : 0,
     };
   }
 
@@ -265,6 +348,26 @@ export class HyperliquidDemoAdapter implements ITradingEnvironment {
     }
 
     return this.marketData.getInstruments();
+  }
+
+  /**
+   * Funding, open interest and volume, forwarded to the source.
+   *
+   * DEMO is the mode the app actually ships in, and it is backed by the same
+   * public Hyperliquid market-data reader as live. Without this forwarding,
+   * every GOAT in the product — every user, every run — would be told no
+   * funding exists, while the code that fetches it sat behind a method nobody
+   * called.
+   */
+  async getMarketContext(symbol: string): Promise<MarketFacts> {
+    if (!this.marketData.getMarketContext) {
+      return {
+        symbol,
+        unavailable: ['This venue publishes no funding, open interest or volume.'],
+      };
+    }
+
+    return this.marketData.getMarketContext(symbol);
   }
 
   private getInstrument(
@@ -409,6 +512,48 @@ export class HyperliquidDemoAdapter implements ITradingEnvironment {
   async placeMarketOrder(
     params: MarketOrderRequest,
   ): Promise<DemoMarketOrderResult> {
+    /*
+     * Idempotency is checked before anything else, including validation.
+     * A retry of a submission that was already rejected must return that
+     * same rejection without re-validating, or a request whose size was
+     * invalid would be re-measured against a price that has since moved —
+     * and the answer to "did my order go through?" would depend on when it
+     * was asked.
+     */
+    if (params.idempotencyKey) {
+      const key = params.idempotencyKey;
+      const previous = this.submissionsByKey.get(key);
+      if (previous) {
+        if (previous.fingerprint !== this.fingerprint(params)) {
+          return {
+            success: false,
+            error:
+              'This idempotency key was already used for a different order.',
+            rejection: rejection(
+              'INVALID_ORDER',
+              `Idempotency key ${key} was reused for a different request.`,
+            ),
+          };
+        }
+        return { ...previous.result, duplicate: true };
+      }
+    }
+
+    const answer = await this.submitMarketOrder(params);
+
+    if (params.idempotencyKey) {
+      this.submissionsByKey.set(params.idempotencyKey, {
+        fingerprint: this.fingerprint(params),
+        result: answer,
+      });
+    }
+
+    return answer;
+  }
+
+  private async submitMarketOrder(
+    params: MarketOrderRequest,
+  ): Promise<DemoMarketOrderResult> {
     if (
       !params.symbol ||
       !Number.isFinite(params.volume) ||
@@ -505,11 +650,23 @@ export class HyperliquidDemoAdapter implements ITradingEnvironment {
 
     const now = Date.now();
 
+    /*
+     * Identifiers must be unique even for two events in the same
+     * millisecond.
+     *
+     * `Date.now()` alone produced identical ids for two fills in one tick,
+     * and history is de-duplicated by id: the second trade was dropped and
+     * its realised P&L vanished while the balance still moved. A monotonic
+     * per-adapter sequence is added to the timestamp, so uniqueness does
+     * not depend on clock resolution.
+     */
+    const sequence = this.nextSequence();
+
     const orderId =
-      `hl_demo_ord_${now}`;
+      `hl_demo_ord_${now}_${sequence}`;
 
     const positionId =
-      `hl_demo_pos_${now}`;
+      `hl_demo_pos_${now}_${sequence}`;
 
     const position: Position = {
       id: positionId,
@@ -547,7 +704,7 @@ export class HyperliquidDemoAdapter implements ITradingEnvironment {
     /*
      * Publish execution events.
      *
-     * These events use the existing TradeCodeEvent contract.
+     * These events use the existing TradingGOATsEvent contract.
      */
     eventBus.emit({
       type: 'ORDER',
@@ -733,11 +890,26 @@ export class HyperliquidDemoAdapter implements ITradingEnvironment {
     const pnlPercent = mark.unrealizedPnlPercent;
 
     this.balance += pnl;
+    this.realisedSessionPnL += pnl;
+
+    /*
+     * Mirror the realisation into the risk gate.
+     *
+     * The session figure above is what the interface shows; the gate
+     * keeps its own realised, UTC-day-scoped figure, and nothing wrote
+     * to it. So the daily-loss check was comparing a permanent zero
+     * against the limit and could never fire. Booking it here, at the
+     * single point where P&L becomes realised, means a partial close
+     * counts too, because a partial close settles through this method.
+     */
+    riskManager.recordPnL(pnl);
 
     const now = Date.now();
 
     const trade = {
-      id: `hl_demo_trade_${now}`,
+      // Same reasoning as the order id: a close in the same millisecond as
+      // another close must not be indistinguishable from it.
+      id: `hl_demo_trade_${now}_${this.nextSequence()}`,
       symbol: position.symbol,
       side: position.side,
       volume: closeVolume,

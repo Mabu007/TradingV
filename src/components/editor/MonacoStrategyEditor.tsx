@@ -75,16 +75,16 @@ export const MonacoStrategyEditor: React.FC<MonacoStrategyEditorProps> = ({
   const activeStrategy = strategies.find((s) => s.id === selectedStrategyId);
 
   return (
-    <div className="flex flex-col h-full w-full bg-[#0a0f18] border-t border-[#1e293b]/70 select-none">
+    <div className="flex flex-col h-full w-full bg-bg-surface-2 border-t border-line/70 select-none">
       {/* Editor Control Header */}
-      <div className="flex items-center justify-between px-3 py-1.5 bg-[#0d1422] border-b border-[#1e293b]/70 text-xs">
+      <div className="flex items-center justify-between px-3 py-1.5 bg-surface-2 border-b border-line/70 text-xs">
         {/* Left: Strategy Selector */}
         <div className="flex items-center gap-2">
-          <Layers className="w-3.5 h-3.5 text-slate-400" />
+          <Layers className="w-3.5 h-3.5 text-ink-3" />
           <select
             value={selectedStrategyId}
             onChange={(e) => onSelectStrategy(e.target.value)}
-            className="bg-[#131c2e] text-slate-200 border border-[#1e293b] rounded px-2 py-1 text-xs focus:outline-none focus:border-sky-500 font-medium"
+            className="bg-bg-surface-3 text-ink-2 border border-line rounded px-2 py-1 text-xs focus:outline-none focus:border-sky-500 font-medium"
           >
             {strategies.map((s) => (
               <option key={s.id} value={s.id}>
@@ -92,7 +92,7 @@ export const MonacoStrategyEditor: React.FC<MonacoStrategyEditorProps> = ({
               </option>
             ))}
           </select>
-          <span className="text-[11px] text-slate-400 font-mono hidden sm:inline">
+          <span className="text-[11px] text-ink-3 font-mono hidden sm:inline">
             strategy.ts
           </span>
         </div>
@@ -101,7 +101,7 @@ export const MonacoStrategyEditor: React.FC<MonacoStrategyEditorProps> = ({
         <div className="flex items-center gap-1.5">
           <button
             onClick={onAskAIAboutCode}
-            className="flex items-center gap-1 px-2.5 py-1 rounded bg-[#1e293b]/80 hover:bg-[#334155] text-sky-300 text-xs font-medium transition-colors"
+            className="flex items-center gap-1 px-2.5 py-1 rounded bg-line-strong/80 hover:bg-line-strong text-accent-ink text-xs font-medium transition-colors"
             title="Ask AI to review, explain, or optimize current code"
           >
             <Sparkles className="w-3.5 h-3.5 text-sky-400" />
@@ -110,7 +110,7 @@ export const MonacoStrategyEditor: React.FC<MonacoStrategyEditorProps> = ({
 
           <button
             onClick={handleFormat}
-            className="p-1 rounded text-slate-400 hover:text-slate-200 hover:bg-[#1e293b] transition-colors"
+            className="p-1 rounded text-ink-3 hover:text-ink-2 hover:bg-line-strong transition-colors"
             title="Format Code"
           >
             <RotateCcw className="w-3.5 h-3.5" />
@@ -127,11 +127,7 @@ export const MonacoStrategyEditor: React.FC<MonacoStrategyEditorProps> = ({
           <button
             onClick={onRunStrategy}
             disabled={isRunning}
-            className={`flex items-center gap-1.5 px-3 py-1 rounded text-xs font-semibold transition-colors ${
-              executionMode === 'LIVE'
-                ? 'bg-rose-600 hover:bg-rose-500 text-white'
-                : 'bg-emerald-600 hover:bg-emerald-500 text-white'
-            }`}
+            className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-semibold transition-colors bg-emerald-600 hover:bg-emerald-500 text-white"
           >
             <Play className="w-3.5 h-3.5 fill-current" />
             <span>{isRunning ? 'Running...' : `Run (${executionMode})`}</span>
@@ -140,7 +136,7 @@ export const MonacoStrategyEditor: React.FC<MonacoStrategyEditorProps> = ({
           {onToggleMaximize && (
             <button
               onClick={onToggleMaximize}
-              className="p-1 rounded text-slate-400 hover:text-slate-200 hover:bg-[#1e293b] transition-colors ml-1"
+              className="p-1 rounded text-ink-3 hover:text-ink-2 hover:bg-line-strong transition-colors ml-1"
               title={isMaximized ? 'Restore View' : 'Maximize Editor'}
             >
               {isMaximized ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
@@ -150,7 +146,7 @@ export const MonacoStrategyEditor: React.FC<MonacoStrategyEditorProps> = ({
           {onClose && (
             <button
               onClick={onClose}
-              className="p-1 rounded text-slate-400 hover:text-slate-200 hover:bg-[#1e293b] transition-colors"
+              className="p-1 rounded text-ink-3 hover:text-ink-2 hover:bg-line-strong transition-colors"
               title="Hide Editor (Focus Chart)"
             >
               <X className="w-3.5 h-3.5" />

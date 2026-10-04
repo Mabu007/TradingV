@@ -83,8 +83,8 @@ export class BacktestSimulator {
       // 3. Execute the strategy
       try {
         await strategyFn(ctx);
-      } catch (err: any) {
-        this.log('error', `Strategy runtime error on bar ${i} (${new Date(currentBar.time * 1000).toISOString()}): ${err.message}`);
+      } catch (err: unknown) {
+        this.log('error', `Strategy runtime error on bar ${i} (${new Date(currentBar.time * 1000).toISOString()}): ${err instanceof Error ? err.message : String(err)}`);
       }
 
       // 4. Update equity and drawdown curve

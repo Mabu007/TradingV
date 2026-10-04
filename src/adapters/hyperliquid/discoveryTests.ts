@@ -70,7 +70,7 @@ function fixtureTransport(): HyperliquidTransport {
 
 export async function runHyperliquidDiscoveryPolicyTest(): Promise<void> {
   const adapter = new HyperliquidMarketDataAdapter(
-    'mainnet',
+    'MAINNET',
     fixtureTransport(),
   );
 

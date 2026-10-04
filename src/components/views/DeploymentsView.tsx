@@ -14,23 +14,23 @@ export const DeploymentsView: React.FC<DeploymentsViewProps> = ({
   onOpenTerminalLogs,
 }) => {
   return (
-    <div className="flex-1 h-full overflow-y-auto p-6 bg-[#090d14] text-slate-200">
+    <div className="flex-1 h-full overflow-y-auto p-6 bg-bg-bg-alt text-ink-2">
       <div className="max-w-6xl mx-auto space-y-6">
         {/* Header */}
-        <div className="flex items-center justify-between pb-4 border-b border-[#1e293b]">
+        <div className="flex items-center justify-between pb-4 border-b border-line">
           <div>
             <h1 className="text-xl font-bold text-white tracking-tight">Strategy Deployments</h1>
-            <p className="text-xs text-slate-400 mt-0.5">
+            <p className="text-xs text-ink-3 mt-0.5">
               Isolated runtime processes executing TypeScript strategies against Hyperliquid environments
             </p>
           </div>
         </div>
 
         {/* Deployments Table */}
-        <div className="bg-[#0c121e] border border-[#1e293b] rounded-lg overflow-hidden shadow-xs">
+        <div className="bg-bg-surface border border-line rounded-lg overflow-hidden shadow-xs">
           <table className="w-full text-left text-xs border-collapse">
             <thead>
-              <tr className="border-b border-[#1e293b] bg-[#0f172a] text-slate-400 font-sans">
+              <tr className="border-b border-line bg-bg-surface-2 text-ink-3 font-sans">
                 <th className="py-2.5 px-4">Deployment / Strategy</th>
                 <th className="py-2.5 px-4">Market</th>
                 <th className="py-2.5 px-4">Environment</th>
@@ -41,18 +41,18 @@ export const DeploymentsView: React.FC<DeploymentsViewProps> = ({
                 <th className="py-2.5 px-4 text-right">Actions</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-[#1e293b]/50 font-mono">
+            <tbody className="divide-y divide-border-line/50 font-mono">
               {deployments.map((d) => {
                 const isRunning = d.status === 'RUNNING';
 
                 return (
-                  <tr key={d.id} className="hover:bg-[#131c2e] transition-colors">
+                  <tr key={d.id} className="hover:bg-bg-surface-3 transition-colors">
                     <td className="py-3 px-4">
-                      <div className="font-bold text-white text-sm">{d.botName}</div>
-                      <div className="text-[11px] text-slate-400 font-sans">{d.strategyName}</div>
+                      <div className="font-bold text-white text-sm">{d.goatName}</div>
+                      <div className="text-[11px] text-ink-3 font-sans">{d.strategyName}</div>
                     </td>
 
-                    <td className="py-3 px-4 font-semibold text-slate-200">
+                    <td className="py-3 px-4 font-semibold text-ink-2">
                       {d.symbol} · {d.timeframe}
                     </td>
 
@@ -75,17 +75,17 @@ export const DeploymentsView: React.FC<DeploymentsViewProps> = ({
                             isRunning ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'
                           }`}
                         />
-                        <span className={isRunning ? 'text-emerald-400 font-medium' : 'text-slate-400'}>
+                        <span className={isRunning ? 'text-emerald-400 font-medium' : 'text-ink-3'}>
                           {d.status}
                         </span>
                       </div>
                     </td>
 
-                    <td className="py-3 px-4 text-slate-300 tabular-nums">
+                    <td className="py-3 px-4 text-ink-2 tabular-nums">
                       {Math.floor(d.uptimeSeconds / 60)}m {d.uptimeSeconds % 60}s
                     </td>
 
-                    <td className="py-3 px-4 text-slate-300 tabular-nums">{d.tradesCount}</td>
+                    <td className="py-3 px-4 text-ink-2 tabular-nums">{d.tradesCount}</td>
 
                     <td
                       className={`py-3 px-4 font-semibold tabular-nums ${
@@ -99,7 +99,7 @@ export const DeploymentsView: React.FC<DeploymentsViewProps> = ({
                       <div className="flex items-center justify-end gap-2">
                         <button
                           onClick={onOpenTerminalLogs}
-                          className="flex items-center gap-1 px-2.5 py-1 rounded bg-[#1e293b] hover:bg-[#334155] text-slate-300 text-xs transition-colors"
+                          className="flex items-center gap-1 px-2.5 py-1 rounded bg-line-strong hover:bg-line-strong text-ink-2 text-xs transition-colors"
                         >
                           <Terminal className="w-3 h-3" />
                           <span>Logs</span>

@@ -70,8 +70,8 @@ export function prepareStrategyFunction(code: string): (ctx: TradingContext) => 
   try {
     const factory = new Function(wrapperCode);
     return factory();
-  } catch (err: any) {
-    throw new Error(`Strategy Compilation Error: ${err.message}`);
+  } catch (err: unknown) {
+    throw new Error(`Strategy Compilation Error: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 

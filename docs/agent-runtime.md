@@ -59,7 +59,7 @@ sequenceDiagram
 
 ## Risk boundary
 
-Agent natural-language instructions and model output cannot change policy or choose the environment. Opening a position requires an allowed symbol, a protective stop, a position/exposure budget, daily-loss/drawdown compliance, and the configured risk-per-trade ceiling. It then passes TradingVibe's existing `RiskManager`. Execution capabilities cannot place orders outside the same validation path; unsupported limit/cancel calls fail closed. Account/order state is read through environment contracts; adapters must provide authoritative values before live operation.
+Agent natural-language instructions and model output cannot change policy or choose the environment. Opening a position requires an allowed symbol, a protective stop, a position/exposure budget, daily-loss/drawdown compliance, and the configured risk-per-trade ceiling. It then passes TradingGOATs's existing `RiskManager`. Execution capabilities cannot place orders outside the same validation path; unsupported limit/cancel calls fail closed. Account/order state is read through environment contracts; adapters must provide authoritative values before live operation.
 
 ## Environments and limitations
 
@@ -73,4 +73,24 @@ No model receives browser globals, storage, filesystem, network clients, secrets
 
 `CONSERVATIVE_EURUSD_AGENT` is a DEMO-only integration fixture with EURUSD scope, 1% risk, one open position maximum and the six foundational skills. It is not a performance claim or profitability promise.
 
-The runtime receives event-trigger context through `AgentWakeEvent.data` and includes its concise wake reason in the model request. Trigger persistence, cooldowns, and timeline records are in-memory for V1. The built-in fallback model defaults to non-executing WAIT decisions. Demo adapter/account authority and daily historical P&L require production adapter work before any live deployment.
+The runtime receives tracker context through `AgentWakeEvent.data` and includes its concise wake reason in the model request. Tracker persistence, cooldowns, and timeline records are in-memory for V1. The built-in fallback model defaults to non-executing WAIT decisions. Demo adapter/account authority and daily historical P&L require production adapter work before any live deployment.
+
+---
+
+## Wallet and signing boundary
+
+The agent runtime has no access to the wallet.
+
+* No capability in `CapabilityRegistry` reaches Privy, a wallet provider, a
+  signer, a private key, or a seed phrase. The wallet lives behind
+  `src/services/wallet/`, which the runtime never imports.
+* `signMessage` on the wallet service is a user-facing message signature. It
+  is not a capability, so no skill can invoke it, and it is not an
+  order-signing path.
+* An agent can request a trade intent. `ActionValidator` and `RiskManager`
+  decide whether it is allowed. An agent cannot approve, resize, downgrade, or
+  retry past a rejection, cannot sign, and cannot transmit an order.
+* `createLiveEnvironment()` fails closed, so an agent cannot be registered
+  against a LIVE environment.
+* `bun run test:wallet` asserts each of these and fails if a signing, key, or
+  wallet capability is ever registered.

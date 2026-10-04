@@ -13,7 +13,7 @@ export const SAMPLE_STRATEGIES: Strategy[] = [
     code: `import { TradingContext } from './types';
 
 /**
- * TradingVibe Moving Average Crossover with RSI Momentum Filter
+ * TradingGOATs Moving Average Crossover with RSI Momentum Filter
  * Executes on EUR/USD 5m candles.
  */
 export default async function strategy(ctx: TradingContext) {

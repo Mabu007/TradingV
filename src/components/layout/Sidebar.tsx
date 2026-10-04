@@ -2,7 +2,7 @@ import React from 'react';
 import {
   CandlestickChart,
   Code2,
-  Bot,
+  Sparkles,
   BarChart3,
   Brain,
   Rocket,
@@ -14,7 +14,7 @@ export type MainView =
   | 'ide'
   | 'markets'
   | 'strategies'
-  | 'bots'
+  | 'goat'
   | 'backtests'
   | 'skills'
   | 'deployments'
@@ -34,8 +34,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const navItems: { id: MainView; label: string; icon: React.ReactNode; badge?: number }[] = [
     { id: 'ide', label: 'IDE Workspace', icon: <CandlestickChart className="w-4 h-4" /> },
     { id: 'markets', label: 'Markets', icon: <Globe2 className="w-4 h-4" /> },
+    { id: 'goat', label: 'GOAT', icon: <Sparkles className="w-4 h-4" />, badge: openBotsCount },
     { id: 'strategies', label: 'Strategies', icon: <Code2 className="w-4 h-4" /> },
-    { id: 'bots', label: 'Bots', icon: <Bot className="w-4 h-4" />, badge: openBotsCount },
     { id: 'backtests', label: 'Backtests', icon: <BarChart3 className="w-4 h-4" /> },
     { id: 'skills', label: 'AI Skills', icon: <Brain className="w-4 h-4" /> },
     { id: 'deployments', label: 'Deployments', icon: <Rocket className="w-4 h-4" /> },
@@ -43,7 +43,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   ];
 
   return (
-    <aside className="w-14 md:w-48 bg-[#080c14] border-r border-[#1e293b] flex flex-col justify-between shrink-0 select-none py-2">
+    <aside className="w-14 md:w-48 bg-bg-bg-alt border-r border-line flex flex-col justify-between shrink-0 select-none py-2">
       {/* Top Nav Items */}
       <div className="space-y-1 px-1.5">
         {navItems.map((item) => (
@@ -52,8 +52,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onClick={() => onSelectView(item.id)}
             className={`w-full flex items-center gap-3 px-2.5 py-2 rounded-md text-xs font-medium transition-colors ${
               activeView === item.id
-                ? 'bg-[#162032] text-white border-l-2 border-sky-400'
-                : 'text-slate-400 hover:text-slate-200 hover:bg-[#0f172a]'
+                ? 'bg-surface-3 text-white border-l-2 border-sky-400'
+                : 'text-ink-3 hover:text-ink-2 hover:bg-bg-surface-2'
             }`}
           >
             <span className="shrink-0">{item.icon}</span>
@@ -68,9 +68,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       {/* Bottom Version / SDK Indicator */}
-      <div className="px-3 py-2 border-t border-[#1e293b]/50 hidden md:block">
-        <div className="text-[11px] text-slate-400 font-mono">TradingVibes SDK</div>
-        <div className="text-[10px] text-slate-400">TypeScript · Hyperliquid</div>
+      <div className="px-3 py-2 border-t border-line/50 hidden md:block">
+        <div className="text-[11px] text-ink-3 font-mono">GOAT</div>
+        <div className="text-[10px] text-ink-3">Goal-Oriented Agentic Trader</div>
       </div>
     </aside>
   );

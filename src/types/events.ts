@@ -1,6 +1,6 @@
 import { Quote, Bar, OrderResult, Position, Trade, SignalEvent, LogEntry } from './trading';
 
-export type TradeCodeEvent =
+export type TradingGOATsEvent =
   | { type: 'AGENT_STARTED'; data: { agentId: string; timestamp: number } }
   | { type: 'AGENT_STOPPED'; data: { agentId: string; timestamp: number } }
   | { type: 'AGENT_OBSERVED'; data: { agentId: string; timestamp: number } }
@@ -24,14 +24,14 @@ export type TradeCodeEvent =
   | { type: 'RISK_VIOLATION'; data: { rule: string; message: string; timestamp: number } }
   | { type: 'STATUS_CHANGE'; data: { mode: string; status: string; message?: string } };
 
-export type EventListener<T extends TradeCodeEvent = TradeCodeEvent> = (event: T) => void;
+export type EventListener<T extends TradingGOATsEvent = TradingGOATsEvent> = (event: T) => void;
 
 class EventBus {
   private listeners: Map<string, Set<(event: any) => void>> = new Map();
 
-  on<T extends TradeCodeEvent['type']>(
+  on<T extends TradingGOATsEvent['type']>(
     type: T,
-    listener: (event: Extract<TradeCodeEvent, { type: T }>) => void
+    listener: (event: Extract<TradingGOATsEvent, { type: T }>) => void
   ): () => void {
     if (!this.listeners.has(type)) {
       this.listeners.set(type, new Set());
@@ -42,7 +42,7 @@ class EventBus {
     };
   }
 
-  emit(event: TradeCodeEvent): void {
+  emit(event: TradingGOATsEvent): void {
     const handlers = this.listeners.get(event.type);
     if (handlers) {
       handlers.forEach((h) => {
@@ -61,7 +61,7 @@ class EventBus {
     }
   }
 
-  onAll(listener: (event: TradeCodeEvent) => void): () => void {
+  onAll(listener: (event: TradingGOATsEvent) => void): () => void {
     if (!this.listeners.has('*')) {
       this.listeners.set('*', new Set());
     }

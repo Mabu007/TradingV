@@ -22,7 +22,7 @@ Explain the reason for every trading decision.`,
   skills: [
     'market-observation',
     'technical-analysis',
-    'risk-management',
+    'risk-discipline',
     'position-sizing',
     'trade-entry',
     'trade-management',

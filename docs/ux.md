@@ -1,6 +1,6 @@
 # User Experience & Design Philosophy
 
-This document outlines the UX philosophy, information architecture, and component design patterns that define **TradingVibe**.
+This document outlines the UX philosophy, information architecture, and component design patterns that define **TradingGOATs**.
 
 ---
 
@@ -8,7 +8,7 @@ This document outlines the UX philosophy, information architecture, and componen
 
 Traditional algorithmic trading software suffers from "terminal density": hundreds of microscopic buttons, cluttered charts, and deep configuration trees designed exclusively for multi-monitor workstations.
 
-**TradingVibe flips this paradigm**:
+**TradingGOATs flips this paradigm**:
 1. **Mobile is the Primary Platform**: Designed from the outset for viewport sizes like 390×844, 375×812, and 412×915.
 2. **Desktop is a Spacious Adaptation**: Desktop is not a separate application; it is simply a larger, breathing version of the mobile experience.
 3. **Complexity Belongs Underneath the Interface**: The everyday user can browse markets, check live trades, inspect charts, talk to AI, and create bots in plain English without ever encountering TypeScript or broker protocol codes.
@@ -50,7 +50,7 @@ No secondary top-level menus, side hamburger drawers, or competing destinations 
 
 On tablet and desktop viewports (`md:` breakpoint / 768px+):
 * The fixed bottom navigation automatically shifts into a **sleek left sidebar (w-64)**.
-* **Brand Header**: Fixed at the top with the TradingVibe logo and environment indicator.
+* **Brand Header**: Fixed at the top with the TradingGOATs logo and environment indicator.
 * **Sidebar Items**: The exact same 5 destinations are listed in identical hierarchy.
 * **Desktop Profile Area**: Anchored at the **bottom of the sidebar**, featuring:
   * Circular avatar with user initial
@@ -77,13 +77,39 @@ When the user opens the application, they land immediately on **Trades**.
   2. Clean, high-touch rows (minimum 64px height) displaying symbol, spread, real-time bid, ask, and 24h change.
   3. **Market Detail View**: Opens smoothly when a quote is tapped, presenting a TradingView Lightweight candlestick chart, timeframe pills, overlay toggles, and a prominent **[Trade]** action button.
 
-### Bots Screen (`bots`)
-* **Purpose**: "What bots do I have, and what can I create?"
+### GOATs Screen (`goat`)
+* **Purpose**: "What do I want a GOAT to do, and what is it already doing?"
+* **Live GOATs first.** A GOAT that is running right now is the answer to
+  the question the user came with, so it is at the top of the screen and
+  behind the `MY GOATs · EXPLORE GOATs` segmented control. Explore is a
+  tab, not a permanently open section: four starter cards sitting above
+  the user's own GOATs made their own GOATs look like leftovers.
 * **Hierarchy**:
-  1. Top `[+ Create Bot]` button triggering a conversational plain-English builder.
-  2. **My Bots**: Status badges (`● RUNNING`, `○ STOPPED`, `◐ TESTING`, `⚠ ERROR`), today's P&L, position counts, and quick Start/Stop toggles.
-  3. **Explore Bots**: Curated strategy blueprints (Trend Following, Breakouts, Mean Reversion) with plain-language summaries and zero misleading rankings.
-  4. **Progressive Disclosure**: Within a Bot's detail view, the `Advanced → Code` tab is where Monaco Editor is lazy-loaded on demand.
+  1. **Live GOATs** — running GOATs, newest first: name, what it is
+     working on, its work-plan step, its market and mode, and a count of
+     what it is watching.
+  2. **Create a GOAT** — name and description optional, one free-text
+     goal, optional skills that can be written in place, and the four
+     starters as examples beneath the form.
+  3. **My GOATs** — every goal created here, with `[Edit] [Deploy]
+     [Delete]`, where Delete archives rather than destroying so the goal,
+     its theses and its evidence survive.
+* **Progressive flow, always reversible**: compose → review → deploy →
+  command centre, with `← All GOATs` on every step and the selected GOAT
+  still there on return.
+* **Deploying asks for one thing: the market.** Display names only, no
+  provider symbols, no timeframe. Everything else is the GOAT's work.
+* **The command centre is one screen in the order the product works**:
+  what it is doing now → work plan → thesis → trackers → trade plan →
+  activity. Every value is read from a record the runtime wrote; an idle
+  GOAT shows an empty section with an explanation, not an animation. The
+  three controls that exist are `[Stop]`, `[Play]` and `[Steer]`: stop
+  keeps everything and retains the deployment, play restores that same
+  deployment rather than creating a new one, and steer sends a note the
+  next reasoning step reads.
+* **Real state only**: theses, trackers, events, evidence, trade plans and
+  the activity feed are the runtime's own records, and a steering note
+  appears in the same feed so "did it hear me?" has an answer.
 
 ### History Screen (`history`)
 * **Purpose**: Performance review and trade auditing.
@@ -104,9 +130,36 @@ When the user opens the application, they land immediately on **Trades**.
 
 ---
 
-## 5. Floating AI Assistant & Interaction Rules
+## 5. AI Assistant & Interaction Rules
 
-* **Floating Button**: Persistent circular button positioned above the bottom bar on the bottom-right, equipped with a subtle breathing pulse.
-* **Mobile Bottom Sheet**: Tapping slides up a 3/4 viewport sheet (not a full-page navigation), keeping the user in their active context.
-* **Contextual Intelligence**: Reads `AIContext` (`currentTab`, `selectedMarket`, `selectedBotId`, `selectedTradeId`).
-* **Safety Rule (Explain, Don't Blindly Execute)**: If the user prompts "Close my EURUSD trade", the AI never fires live orders invisibly. Instead, it generates a confirmation card with trade specifics and an explicit **[Close Position]** button for the user to confirm.
+* **One entry point**: the sparkles button in the header, at every screen
+  size. It opens the assistant; it does not open a settings dialog or fire
+  a canned question, and it is not duplicated as a floating button
+  covering content on a phone.
+* **Two layouts, deliberately different**:
+  * **Desktop** — a side panel beside the application, 400px wide,
+    capped in height so it never runs off the top or bottom of the
+    viewport. Header, model selector and composer stay put; only the
+    messages scroll.
+  * **Mobile** — the whole screen, sticky header, scrollable messages,
+    sticky composer with touch-sized targets.
+* **Empty state**: an introduction plus five starter questions. They are
+  questions, not claims: nothing pretends to know the market.
+* **Model**: a searchable picker over OpenRouter's live catalogue, on its
+  own row under the header so the model's name is readable. Changing it
+  keeps the conversation; the next message uses the new model.
+* **Keyboard**: Enter sends, Shift+Enter starts a new line.
+* **One request at a time**: the composer is disabled while a request is
+  in flight, guarded by a ref as well as by state so a double-click
+  cannot send twice. Closing the panel mid-request is safe.
+* **Errors**: each failure says what it was — rejected key, exhausted
+  credits, rate limit, retired model, unreachable OpenRouter — and offers
+  the one action that fixes it. The model is never changed silently.
+* **Contextual intelligence**: reads the sanitised app context
+  (`currentTab`, `selectedMarket`, GOATs, trackers, risk, wallet) and
+  offers navigation targets. It never receives keys, seed phrases or
+  signing secrets.
+* **Safety rule (explain, don't blindly execute)**: asking it to close a
+  trade produces a confirmation card with the specifics and an explicit
+  confirm button. It cannot place, modify or close anything by itself, and
+  it cannot enable live trading.

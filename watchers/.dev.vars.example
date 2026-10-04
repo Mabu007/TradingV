@@ -1,0 +1,14 @@
+# Copy to `.dev.vars` for local development. `.dev.vars` is git-ignored.
+#
+# Both tokens are required. Without them the Worker refuses traffic: an
+# unauthenticated feed would let anyone wake anyone's bot, and an
+# unauthenticated API would let anyone read and stop them.
+#
+# For local work, generate fresh values rather than copying a real one:
+#   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+
+AUTH_TOKEN=""
+MARKET_FEED_TOKEN=""
+
+# Optional: override the condition engine location.
+# ENGINE_URL = "http://127.0.0.1:8099"

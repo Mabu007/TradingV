@@ -24,23 +24,23 @@ export const StrategyDiffModal: React.FC<StrategyDiffModalProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4">
-      <div className="w-full max-w-5xl h-[85vh] bg-[#0c121e] border border-[#1e293b] rounded-lg shadow-2xl flex flex-col overflow-hidden animate-in fade-in duration-150">
+      <div className="w-full max-w-5xl h-[85vh] bg-bg-surface border border-line rounded-lg shadow-2xl flex flex-col overflow-hidden animate-in fade-in duration-150">
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 bg-[#0f172a] border-b border-[#1e293b]">
+        <div className="flex items-center justify-between px-4 py-3 bg-bg-surface-2 border-b border-line">
           <div className="flex items-center gap-2.5">
             <div className="p-1 rounded bg-sky-500/10 text-sky-400">
               <Sparkles className="w-4 h-4" />
             </div>
             <div>
               <h3 className="text-sm font-semibold text-white">AI Strategy Review & Code Diff</h3>
-              <p className="text-xs text-slate-400">Compare original strategy with AI recommendations</p>
+              <p className="text-xs text-ink-3">Compare original strategy with AI recommendations</p>
             </div>
           </div>
 
           <div className="flex items-center gap-2">
             <button
               onClick={onDiscard}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium text-slate-300 hover:text-white bg-[#1e293b] hover:bg-[#334155] transition-colors"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium text-ink-2 hover:text-white bg-line-strong hover:bg-line-strong transition-colors"
             >
               <X className="w-3.5 h-3.5" />
               <span>Discard</span>

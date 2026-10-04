@@ -22,7 +22,16 @@ export type RejectionCategory =
   | 'MARKET_DATA_UNAVAILABLE'
   | 'PRICE_UNAVAILABLE'
   | 'RISK_UNVALUABLE'
-  | 'INVALID_ORDER';
+  | 'INVALID_ORDER'
+  /*
+   * Distinct from PRICE_UNAVAILABLE on purpose. "I could not reach the
+   * venue" and "I reached the venue and it had no price" call for
+   * different responses — one is retried, one is not — and a user shown
+   * the wrong one either waits for a fill that was never possible or
+   * retries an order that was never sent.
+   */
+  | 'VENUE_UNREACHABLE'
+  | 'REQUEST_TIMEOUT';
 
 export interface ExecutionRejection {
   category: RejectionCategory;
@@ -55,6 +64,10 @@ const MESSAGES: Record<RejectionCategory, string> = {
     'This order cannot be risk-checked right now, so it was blocked rather than approved on incomplete information.',
   INVALID_ORDER:
     'That order is not valid. Check the size and price levels.',
+  VENUE_UNREACHABLE:
+    'The trading venue could not be reached, so nothing was sent. This is usually temporary.',
+  REQUEST_TIMEOUT:
+    'The trading venue did not answer in time, so nothing was sent. This is usually temporary.',
 };
 
 /** Build a rejection with the user-safe message for its category. */

@@ -1,9 +1,10 @@
 import { Bar, Position, Timeframe } from '../../../types/trading';
 import { InstrumentMetadata } from '../../../types/instruments';
 import { NormalizedQuote } from '../../../types/quotes';
-import { ITradingEnvironment, TradingEnvironmentMode } from '../types';
+import { MarketFacts, ITradingEnvironment, TradingEnvironmentMode } from '../types';
 import { ExecutionRejection } from '../../execution/errors';
 import { hyperliquidDemoAdapter } from '../../../adapters/hyperliquid/demo';
+import { MarketDataProvider } from '../../../adapters/marketData';
 
 export class DemoEnvironment implements ITradingEnvironment {
   public readonly mode: TradingEnvironmentMode = 'DEMO';
@@ -25,6 +26,31 @@ export class DemoEnvironment implements ITradingEnvironment {
    */
   async getInstruments(): Promise<InstrumentMetadata[]> {
     return this.adapter.getInstruments();
+  }
+
+  /**
+   * Funding, open interest and volume, where the venue publishes them.
+   *
+   * This was the seam where the whole market-context feature could have stayed
+   * quietly dead: the adapter could read funding perfectly well, and the
+   * capability could ask for it, but the environment sitting between them did
+   * not forward it. `market.getContext` would then have answered "this
+   * environment publishes no market context" on every instrument, forever,
+   * while the code that fetches it sat there looking finished.
+   *
+   * Optional on the interface, so the check is a real one rather than an
+   * assumption: an adapter without the method reports the fact as unavailable
+   * instead of inventing zeroes for funding.
+   */
+  async getMarketContext(symbol: string): Promise<MarketFacts> {
+    const adapter = this.adapter as Partial<MarketDataProvider>;
+    if (typeof adapter.getMarketContext !== 'function') {
+      return {
+        symbol,
+        unavailable: ['This venue publishes no funding, open interest or volume.'],
+      };
+    }
+    return adapter.getMarketContext(symbol);
   }
 
   async getAccountState() {

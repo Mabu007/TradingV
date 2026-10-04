@@ -10,9 +10,9 @@ import {
 } from './normalizer';
 import { runHyperliquidExecutionTests } from './executionTests';
 import { AgentRuntime } from '../../engine/agents/runtime';
-import { TriggerEngine } from '../../engine/agents/triggers/engine';
-import { TriggerRegistry } from '../../engine/agents/triggers/registry';
-import { AgentTrigger } from '../../engine/agents/triggers/types';
+import { TrackerRegistry } from '../../engine/agents/trackers/registry';
+import { TrackerRuntime } from '../../engine/agents/trackers/runtime';
+import { Tracker } from '../../engine/agents/trackers/types';
 import { CapabilityRegistry } from '../../engine/agents/capabilities/registry';
 import { SkillRegistry } from '../../engine/agents/skills/registry';
 import { ActionValidator } from '../../engine/agents/policy/validator';
@@ -42,23 +42,48 @@ const model: IAgentModel = {
   async run() { return { thought: 'fixture wake handled', decision: { type: 'WAIT', reason: 'deterministic fixture' } }; },
 };
 
-export async function runHyperliquidTriggerIntegrationTest(): Promise<void> {
+/**
+ * Market data -> tracker -> GOAT wake, through the real adapters.
+ *
+ * This is the observation path end to end: a normalized Hyperliquid
+ * candle reaches the tracker runtime, the tracker reports, and the agent
+ * is woken. The tracker is deliberately a bare engine-level one, because
+ * what is under test is the market-data half, not the thesis layer.
+ */
+export async function runHyperliquidTrackerIntegrationTest(): Promise<void> {
   const runtime = new AgentRuntime(new CapabilityRegistry(), new SkillRegistry(), new ActionValidator(), model, new InMemoryAgentTimelineStore());
   const agent: TradingAgent = { id: 'fixture-agent', name: 'Fixture Agent', description: '', instructions: '', skills: [], capabilities: [], policy: { maxRiskPerTrade: 0.01, maxOpenPositions: 1, maxExposure: 10_000, maxOrdersPerMinute: 5, allowedSymbols: ['EUR/USD'], allowTrading: true }, preferredEnvironment: 'DEMO', symbols: ['EUR/USD'], timeframe: '5m', enabled: true, createdAt: 1, updatedAt: 1 };
   runtime.registerAgent(agent, environment); await runtime.start(agent.id);
-  const registry = new TriggerRegistry((agentId) => runtime.getAgent(agentId));
-  const trigger: AgentTrigger = { id: 'fixture-new-bar', agentId: agent.id, type: 'NEW_BAR', enabled: true, symbol: 'EUR/USD', timeframe: '5m', config: {}, cooldownMs: 0, maxFiringsPerMinute: 10, createdAt: 1, updatedAt: 1 };
-  registry.register(trigger);
-  const engine = new TriggerEngine(registry, runtime, runtime.getTimelineStore()); engine.setEnvironment('DEMO'); engine.start();
-  const adapter = new HyperliquidMarketDataAdapter('testnet');
+  const registry = new TrackerRegistry((agentId) => runtime.getAgent(agentId));
+  const tracker: Tracker = {
+    id: 'fixture-new-bar',
+    agentId: agent.id,
+    kind: 'NEW_BAR',
+    symbol: 'EUR/USD',
+    timeframe: '5m',
+    config: {},
+    purpose: 'Know when a 5m candle closes.',
+    eventType: 'BAR_CLOSED',
+    dependencies: [],
+    dataRequirements: [{ kind: 'BARS', timeframe: '5m', barCount: 100 }],
+    evaluation: { priority: 0, cooldownMs: 0, maxEventsPerMinute: 10 },
+    lifecycle: { status: 'ACTIVE', eventCount: 0 },
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  registry.register(tracker);
+  const trackers = new TrackerRuntime({ registry, agents: runtime, timeline: runtime.getTimelineStore() });
+  trackers.setEnvironment('DEMO'); trackers.start();
+  const adapter = new HyperliquidMarketDataAdapter('TESTNET');
   const events: string[] = []; const unsubscribe = eventBus.on('BAR_UPDATE', (event) => events.push(`${event.symbol}:${event.timeframe}:${event.isClosed}`));
   adapter.registerInstrument({ id: 'fixture', symbol: 'EUR/USD', displayName: 'EUR/USD Perpetual', assetClass: 'FOREX', provider: 'HYPERLIQUID', providerSymbol: 'xyz:EUR', providerMarketId: 'xyz:EUR', providerDex: 'xyz', supportedTimeframes: ['5m'], active: true, availability: 'TRADEABLE', market: { symbol: 'EUR/USD', displayName: 'EUR/USD Perpetual', assetClass: 'FOREX', provider: 'HYPERLIQUID', providerSymbol: 'xyz:EUR', providerMarketId: 'xyz:EUR', providerDex: 'xyz', pricePrecision: 5, sizePrecision: 1, availability: 'TRADEABLE' } as never });
   adapter.ingestCandleFixture({ t: bar.time * 1000, T: Date.now() - 1, s: 'xyz:EUR', i: '5m', o: '1.14', c: '1.145', h: '1.15', l: '1.13', v: '100', n: 1 });
   await new Promise((resolve) => setTimeout(resolve, 20));
-  unsubscribe(); engine.stop(); await runtime.stop(agent.id);
+  unsubscribe(); trackers.stop(); await runtime.stop(agent.id);
   assert(events.includes('EUR/USD:5m:true'), 'fixture emitted normalized BAR_UPDATE');
-  assert((await runtime.getTimelineStore().getByAgent(agent.id)).some((entry) => entry.type === 'TRIGGER'), 'BAR_UPDATE fired NEW_BAR and woke the agent');
-  console.log('Hyperliquid deterministic market-data -> trigger -> agent-wake test passed.');
+  assert((await runtime.getTimelineStore().getByAgent(agent.id)).some((entry) => entry.type === 'TRACKER'), 'BAR_UPDATE fired NEW_BAR and woke the agent');
+  assert(trackers.listEventsForTracker(tracker.id).length > 0, 'the tracker reported an observation');
+  console.log('Hyperliquid deterministic market-data -> tracker -> agent-wake test passed.');
 }
 
 /**
@@ -263,7 +288,7 @@ export function runHyperliquidDiscoveryNormalizationTest(): void {
 }
 
 if (import.meta.main) {
-  await runHyperliquidTriggerIntegrationTest();
+  await runHyperliquidTrackerIntegrationTest();
   runHyperliquidExecutionEconomicsTest();
   runHyperliquidDiscoveryNormalizationTest();
   await runHyperliquidExecutionTests();

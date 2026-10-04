@@ -44,7 +44,7 @@ export const technicalAnalysisSkill: AgentSkill = {
 };
 
 export const riskManagementSkill: AgentSkill = {
-  id: 'risk-management',
+  id: 'risk-discipline',
   name: 'Risk Management',
   description: 'Enforces hard drawdown budgets, exposure ceilings, and safe maximum loss calculations.',
   instructions: `

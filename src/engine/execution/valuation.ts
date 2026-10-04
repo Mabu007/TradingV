@@ -3,7 +3,7 @@ import { InstrumentLookup, InstrumentMetadata } from '../../types/instruments';
 /**
  * Valuation core.
  *
- * Every monetary number in TradingVibe is derived here so that P&L,
+ * Every monetary number in TradingGOATs is derived here so that P&L,
  * risk, exposure, and margin use one model for Forex, commodities, and
  * indices alike.
  *

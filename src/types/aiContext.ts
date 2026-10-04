@@ -1,4 +1,4 @@
-export type MainTab = 'quotes' | 'bots' | 'trades' | 'history' | 'settings';
+export type MainTab = 'goat' | 'quotes' | 'trades' | 'history' | 'settings';
 
 export interface AIContext {
   currentTab: MainTab;

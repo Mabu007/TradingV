@@ -313,37 +313,37 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/80 backdrop-blur-xs p-0 sm:p-4 animate-in fade-in duration-150">
-      <div className="w-full max-w-md bg-[#0c1322] border border-[#1e293b] rounded-t-2xl sm:rounded-2xl overflow-hidden shadow-2xl flex flex-col">
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-overlay backdrop-blur-xs p-0 sm:p-4 animate-in fade-in duration-150">
+      <div className="w-full max-w-md bg-surface border border-line rounded-t-2xl sm:rounded-2xl overflow-hidden shadow-2xl flex flex-col">
 
         {/* Mobile drag handle */}
-        <div className="w-12 h-1.5 bg-slate-700/60 rounded-full mx-auto mt-2.5 sm:hidden" />
+        <div className="w-12 h-1.5 bg-line-strong/60 rounded-full mx-auto mt-2.5 sm:hidden" />
 
         {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b border-[#1e293b] bg-[#0f172a]">
+        <div className="flex items-center justify-between p-4 border-b border-line bg-surface-2">
           <div>
-            <h3 className="text-base font-bold text-white font-mono flex items-center gap-2">
+            <h3 className="text-base font-bold text-ink font-mono flex items-center gap-2">
               <span>{market.symbol}</span>
 
-              <span className="text-xs text-slate-400 font-sans font-normal">
+              <span className="text-xs text-ink-3 font-sans font-normal">
                 {metadata.displayName}
               </span>
             </h3>
 
-            <div className="text-xs text-slate-400 font-mono mt-1 flex items-center gap-2">
+            <div className="text-xs text-ink-3 font-mono mt-1 flex items-center gap-2">
               <span>
                 Market Execution
               </span>
 
-              <span className="text-slate-600">
+              <span className="text-ink-4">
                 ·
               </span>
 
               <span
                 className={
                   hasValidQuote
-                    ? 'text-emerald-400'
-                    : 'text-slate-500'
+                    ? 'text-pos'
+                    : 'text-ink-4'
                 }
               >
                 {hasValidQuote
@@ -355,7 +355,7 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
 
           <button
             onClick={onClose}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-[#1e293b] transition-colors"
+            className="p-1.5 rounded-lg text-ink-3 hover:text-ink hover:bg-line-strong transition-colors"
           >
             <X className="w-5 h-5" />
           </button>
@@ -366,39 +366,39 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
           <div className="grid grid-cols-2 gap-2">
 
             {/* Bid */}
-            <div className="p-3 rounded-xl bg-[#090f1a] border border-[#1e293b]">
+            <div className="p-3 rounded-xl bg-surface-3 border border-line">
               <div className="flex items-center justify-between">
-                <span className="text-[10px] text-slate-500 font-medium">
+                <span className="text-[10px] text-ink-4 font-medium">
                   BID
                 </span>
 
                 {side === 'SELL' && (
-                  <span className="text-[9px] text-rose-400 font-bold">
+                  <span className="text-[9px] text-neg font-bold">
                     SELL PRICE
                   </span>
                 )}
               </div>
 
-              <div className="text-lg font-bold font-mono text-white mt-1">
+              <div className="text-lg font-bold font-mono text-ink mt-1">
                 {formatPrice(quote?.bid)}
               </div>
             </div>
 
             {/* Ask */}
-            <div className="p-3 rounded-xl bg-[#090f1a] border border-[#1e293b]">
+            <div className="p-3 rounded-xl bg-surface-3 border border-line">
               <div className="flex items-center justify-between">
-                <span className="text-[10px] text-slate-500 font-medium">
+                <span className="text-[10px] text-ink-4 font-medium">
                   ASK
                 </span>
 
                 {side === 'BUY' && (
-                  <span className="text-[9px] text-emerald-400 font-bold">
+                  <span className="text-[9px] text-pos font-bold">
                     BUY PRICE
                   </span>
                 )}
               </div>
 
-              <div className="text-lg font-bold font-mono text-white mt-1">
+              <div className="text-lg font-bold font-mono text-ink mt-1">
                 {formatPrice(quote?.ask)}
               </div>
             </div>
@@ -415,7 +415,7 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
                 }`}
               />
 
-              <span className="text-[10px] text-slate-500">
+              <span className="text-[10px] text-ink-4">
                 {hasValidQuote
                   ? 'Live market data'
                   : 'Live market data unavailable'}
@@ -423,7 +423,7 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
             </div>
 
             {quote?.timestamp && (
-              <span className="text-[10px] text-slate-600 font-mono">
+              <span className="text-[10px] text-ink-4 font-mono">
                 {formatTimestamp(
                   quote.timestamp
                 )}
@@ -436,15 +436,15 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
         <div className="p-4 space-y-4">
 
           {/* Side Selector */}
-          <div className="grid grid-cols-2 gap-2 p-1 bg-[#090f1a] rounded-xl border border-[#1e293b]">
+          <div className="grid grid-cols-2 gap-2 p-1 bg-surface-3 rounded-xl border border-line">
 
             <button
               type="button"
               onClick={() => setSide('BUY')}
               className={`py-3 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all ${
                 side === 'BUY'
-                  ? 'bg-emerald-600 text-white shadow-md shadow-emerald-950'
-                  : 'text-slate-400 hover:text-white'
+                  ? 'bg-emerald-600 text-ink shadow-md shadow-emerald-950'
+                  : 'text-ink-3 hover:text-ink'
               }`}
             >
               <ArrowUpRight className="w-4 h-4" />
@@ -465,8 +465,8 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
               onClick={() => setSide('SELL')}
               className={`py-3 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all ${
                 side === 'SELL'
-                  ? 'bg-rose-600 text-white shadow-md shadow-rose-950'
-                  : 'text-slate-400 hover:text-white'
+                  ? 'bg-neg-strong text-ink shadow-md shadow-rose-950'
+                  : 'text-ink-3 hover:text-ink'
               }`}
             >
               <ArrowDownRight className="w-4 h-4" />
@@ -484,17 +484,17 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
           </div>
 
           {/* Entry Price */}
-          <div className="p-3 rounded-xl bg-[#0f172a] border border-[#1e293b]">
+          <div className="p-3 rounded-xl bg-surface-2 border border-line">
             <div className="flex items-center justify-between">
-              <span className="text-xs text-slate-400">
+              <span className="text-xs text-ink-3">
                 Estimated Entry
               </span>
 
               <span
                 className={`text-sm font-bold font-mono ${
                   side === 'BUY'
-                    ? 'text-emerald-400'
-                    : 'text-rose-400'
+                    ? 'text-pos'
+                    : 'text-neg'
                 }`}
               >
                 {formatPrice(entryPrice ?? undefined)}
@@ -504,14 +504,14 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
 
           {/* Volume */}
           <div>
-            <div className="flex items-center justify-between text-xs text-slate-400 mb-1.5">
+            <div className="flex items-center justify-between text-xs text-ink-3 mb-1.5">
               <span>
                 {isForex
                   ? 'Trade Volume'
                   : 'Position Size'}
               </span>
 
-              <span className="font-mono text-slate-300 font-semibold">
+              <span className="font-mono text-ink-2 font-semibold">
                 {isForex && lotsLabel !== undefined
                   ? `${lotsLabel.toFixed(2)} Lots · `
                   : ''}
@@ -530,8 +530,8 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
                       }
                       className={`flex-1 py-2 rounded-lg text-xs font-mono font-semibold transition-all border ${
                         lots === value
-                          ? 'bg-sky-500/20 border-sky-500 text-sky-400'
-                          : 'bg-[#0f172a] border-[#1e293b] text-slate-400 hover:text-white'
+                          ? 'bg-accent/20 border-accent text-accent'
+                          : 'bg-surface-2 border-line text-ink-3 hover:text-ink'
                       }`}
                     >
                       {value}
@@ -546,8 +546,8 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
                       }
                       className={`flex-1 py-2 rounded-lg text-xs font-mono font-semibold transition-all border ${
                         volume === value
-                          ? 'bg-sky-500/20 border-sky-500 text-sky-400'
-                          : 'bg-[#0f172a] border-[#1e293b] text-slate-400 hover:text-white'
+                          ? 'bg-accent/20 border-accent text-accent'
+                          : 'bg-surface-2 border-line text-ink-3 hover:text-ink'
                       }`}
                     >
                       {value}
@@ -557,7 +557,7 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
 
             {/* Size feedback */}
             {!sizeCheck.valid && (
-              <div className="text-[11px] text-amber-400">
+              <div className="text-[11px] text-warn">
                 {sizeCheck.reason}
               </div>
             )}
@@ -567,10 +567,10 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
           <div className="grid grid-cols-2 gap-3 text-xs">
 
             {/* Stop Loss */}
-            <div className="p-3 rounded-xl bg-[#0f172a] border border-[#1e293b]">
-              <label className="text-slate-400 block mb-1.5 font-medium">
+            <div className="p-3 rounded-xl bg-surface-2 border border-line">
+              <label className="text-ink-3 block mb-1.5 font-medium">
                 Stop Loss{' '}
-                <span className="text-slate-600">
+                <span className="text-ink-4">
                   ({pipSize !== undefined ? 'Pips' : 'Price'})
                 </span>
               </label>
@@ -583,22 +583,22 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
                 onChange={(e) =>
                   setSlDistance(e.target.value)
                 }
-                className="w-full bg-[#080d16] border border-[#1e293b] rounded-lg px-2.5 py-1.5 font-mono text-rose-400 font-semibold text-sm focus:outline-none focus:border-rose-500"
+                className="w-full bg-bg-alt border border-line rounded-lg px-2.5 py-1.5 font-mono text-neg font-semibold text-sm focus:outline-none focus:border-neg/50"
               />
 
-              <span className="text-[10px] text-slate-400 font-mono mt-1 block">
+              <span className="text-[10px] text-ink-3 font-mono mt-1 block">
                 Target:{' '}
-                <span className="text-rose-300">
+                <span className="text-neg">
                   {formatPrice(stopLoss)}
                 </span>
               </span>
             </div>
 
             {/* Take Profit */}
-            <div className="p-3 rounded-xl bg-[#0f172a] border border-[#1e293b]">
-              <label className="text-slate-400 block mb-1.5 font-medium">
+            <div className="p-3 rounded-xl bg-surface-2 border border-line">
+              <label className="text-ink-3 block mb-1.5 font-medium">
                 Take Profit{' '}
-                <span className="text-slate-600">
+                <span className="text-ink-4">
                   ({pipSize !== undefined ? 'Pips' : 'Price'})
                 </span>
               </label>
@@ -611,12 +611,12 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
                 onChange={(e) =>
                   setTpDistance(e.target.value)
                 }
-                className="w-full bg-[#080d16] border border-[#1e293b] rounded-lg px-2.5 py-1.5 font-mono text-emerald-400 font-semibold text-sm focus:outline-none focus:border-emerald-500"
+                className="w-full bg-bg-alt border border-line rounded-lg px-2.5 py-1.5 font-mono text-pos font-semibold text-sm focus:outline-none focus:border-emerald-500"
               />
 
-              <span className="text-[10px] text-slate-400 font-mono mt-1 block">
+              <span className="text-[10px] text-ink-3 font-mono mt-1 block">
                 Target:{' '}
-                <span className="text-emerald-300">
+                <span className="text-pos">
                   {formatPrice(takeProfit)}
                 </span>
               </span>
@@ -625,12 +625,12 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
 
           {/* No live quote warning */}
           {!hasValidQuote && (
-            <div className="p-3 rounded-xl bg-amber-500/5 border border-amber-500/20">
-              <div className="text-xs text-amber-400 font-semibold">
+            <div className="p-3 rounded-xl bg-amber-500/5 border border-warn/40">
+              <div className="text-xs text-warn font-semibold">
                 Waiting for live market data
               </div>
 
-              <div className="text-[11px] text-slate-500 mt-1">
+              <div className="text-[11px] text-ink-4 mt-1">
                 An order cannot be submitted until a
                 current Hyperliquid bid/ask quote is
                 available.
@@ -640,16 +640,16 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
         </div>
 
         {/* Submit */}
-        <div className="p-4 border-t border-[#1e293b] bg-[#0f172a]">
+        <div className="p-4 border-t border-line bg-surface-2">
           <button
             onClick={handleExecute}
             disabled={!canExecute}
-            className={`w-full py-3.5 rounded-xl font-bold text-sm text-white transition-all shadow-lg flex items-center justify-center gap-2 ${
+            className={`w-full py-3.5 rounded-xl font-bold text-sm text-ink transition-all shadow-lg flex items-center justify-center gap-2 ${
               !canExecute
-                ? 'bg-slate-800 text-slate-500 cursor-not-allowed shadow-none'
+                ? 'bg-surface-3 text-ink-4 cursor-not-allowed shadow-none'
                 : side === 'BUY'
                   ? 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-950 active:scale-[0.98]'
-                  : 'bg-rose-600 hover:bg-rose-500 shadow-rose-950 active:scale-[0.98]'
+                  : 'bg-neg-strong hover:bg-neg-strong shadow-rose-950 active:scale-[0.98]'
             }`}
           >
             <Zap className="w-4 h-4 fill-current" />
@@ -669,11 +669,11 @@ export const TradeOrderModal: React.FC<TradeOrderModalProps> = ({
               className="mt-3 rounded-xl border border-amber-500/25 bg-amber-500/5 p-3"
               role="alert"
             >
-              <div className="text-xs font-semibold text-amber-300">
+              <div className="text-xs font-semibold text-warn">
                 Order not placed
               </div>
 
-              <div className="mt-1 text-[11px] text-slate-300">
+              <div className="mt-1 text-[11px] text-ink-2">
                 {submitError}
               </div>
             </div>

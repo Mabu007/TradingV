@@ -94,7 +94,7 @@ export function downloadTradesCSV(trades: Trade[], metadata?: CSVExportMetadata)
   const symbolTag = metadata?.symbol ? `_${metadata.symbol}` : '';
   const tfTag = metadata?.timeframe ? `_${metadata.timeframe}` : '';
   const dateStr = new Date().toISOString().split('T')[0];
-  const filename = `tradingvibes_backtest_trades${symbolTag}${tfTag}_${dateStr}.csv`;
+  const filename = `tradinggoats_backtest_trades${symbolTag}${tfTag}_${dateStr}.csv`;
 
   link.setAttribute('href', url);
   link.setAttribute('download', filename);

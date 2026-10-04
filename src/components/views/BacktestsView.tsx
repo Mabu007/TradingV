@@ -45,13 +45,13 @@ export const BacktestsView: React.FC<BacktestsViewProps> = ({
   };
 
   return (
-    <div className="flex-1 h-full overflow-y-auto p-6 bg-[#090d14] text-slate-200">
+    <div className="flex-1 h-full overflow-y-auto p-6 bg-bg-bg-alt text-ink-2">
       <div className="max-w-6xl mx-auto space-y-6">
         {/* Header */}
-        <div className="flex items-center justify-between pb-4 border-b border-[#1e293b]">
+        <div className="flex items-center justify-between pb-4 border-b border-line">
           <div>
             <h1 className="text-xl font-bold text-white tracking-tight">Backtesting Workspace</h1>
-            <p className="text-xs text-slate-400 mt-0.5">
+            <p className="text-xs text-ink-3 mt-0.5">
               Simulate strategy performance across historical candles. Spread, slippage and commission are modelling assumptions, not live Hyperliquid fees.
             </p>
           </div>
@@ -59,7 +59,7 @@ export const BacktestsView: React.FC<BacktestsViewProps> = ({
           {lastBacktestResult && (
             <button
               onClick={onOpenInIDE}
-              className="flex items-center gap-1 text-xs text-sky-400 hover:text-sky-300 font-medium"
+              className="flex items-center gap-1 text-xs text-sky-400 hover:text-accent-ink font-medium"
             >
               <span>Inspect on Chart &rarr;</span>
             </button>
@@ -67,15 +67,15 @@ export const BacktestsView: React.FC<BacktestsViewProps> = ({
         </div>
 
         {/* Configuration Form */}
-        <div className="bg-[#0c121e] border border-[#1e293b] rounded-lg p-5 shadow-xs">
+        <div className="bg-bg-surface border border-line rounded-lg p-5 shadow-xs">
           <form onSubmit={handleRun} className="space-y-4">
             <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4 text-xs">
               <div>
-                <label className="block text-slate-300 font-medium mb-1">Target Strategy</label>
+                <label className="block text-ink-2 font-medium mb-1">Target Strategy</label>
                 <select
                   value={selectedStrategyId}
                   onChange={(e) => onSelectStrategy(e.target.value)}
-                  className="w-full bg-[#131c2e] text-white border border-[#1e293b] rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-medium"
+                  className="w-full bg-bg-surface-3 text-white border border-line rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-medium"
                 >
                   {strategies.map((s) => (
                     <option key={s.id} value={s.id}>
@@ -86,11 +86,11 @@ export const BacktestsView: React.FC<BacktestsViewProps> = ({
               </div>
 
               <div>
-                <label className="block text-slate-300 font-medium mb-1">Market Symbol</label>
+                <label className="block text-ink-2 font-medium mb-1">Market Symbol</label>
                 <select
                   value={symbol}
                   onChange={(e) => setSymbol(e.target.value)}
-                  className="w-full bg-[#131c2e] text-white border border-[#1e293b] rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-mono"
+                  className="w-full bg-bg-surface-3 text-white border border-line rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-mono"
                 >
                   {SUPPORTED_SYMBOLS.map((s) => (
                     <option key={s.symbol} value={s.symbol}>
@@ -101,11 +101,11 @@ export const BacktestsView: React.FC<BacktestsViewProps> = ({
               </div>
 
               <div>
-                <label className="block text-slate-300 font-medium mb-1">Timeframe</label>
+                <label className="block text-ink-2 font-medium mb-1">Timeframe</label>
                 <select
                   value={timeframe}
                   onChange={(e) => setTimeframe(e.target.value as Timeframe)}
-                  className="w-full bg-[#131c2e] text-white border border-[#1e293b] rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-mono"
+                  className="w-full bg-bg-surface-3 text-white border border-line rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-mono"
                 >
                   <option value="1m">1m (Scalping)</option>
                   <option value="5m">5m (Intraday)</option>
@@ -117,7 +117,7 @@ export const BacktestsView: React.FC<BacktestsViewProps> = ({
               </div>
 
               <div>
-                <label className="block text-slate-300 font-medium mb-1">Historical Depth (Bars)</label>
+                <label className="block text-ink-2 font-medium mb-1">Historical Depth (Bars)</label>
                 <input
                   type="number"
                   min={50}
@@ -125,12 +125,12 @@ export const BacktestsView: React.FC<BacktestsViewProps> = ({
                   step={50}
                   value={barCount}
                   onChange={(e) => setBarCount(Number(e.target.value))}
-                  className="w-full bg-[#131c2e] text-white border border-[#1e293b] rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-mono tabular-nums"
+                  className="w-full bg-bg-surface-3 text-white border border-line rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-mono tabular-nums"
                 />
               </div>
 
               <div>
-                <label className="block text-slate-300 font-medium mb-1">Initial Balance ($)</label>
+                <label className="block text-ink-2 font-medium mb-1">Initial Balance ($)</label>
                 <input
                   type="number"
                   min={100}
@@ -138,12 +138,12 @@ export const BacktestsView: React.FC<BacktestsViewProps> = ({
                   step={1000}
                   value={initialBalance}
                   onChange={(e) => setInitialBalance(Number(e.target.value))}
-                  className="w-full bg-[#131c2e] text-white border border-[#1e293b] rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-mono tabular-nums"
+                  className="w-full bg-bg-surface-3 text-white border border-line rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-mono tabular-nums"
                 />
               </div>
 
               <div>
-                <label className="block text-slate-300 font-medium mb-1">Simulated Spread (pips)</label>
+                <label className="block text-ink-2 font-medium mb-1">Simulated Spread (pips)</label>
                 <input
                   type="number"
                   min={0}
@@ -151,12 +151,12 @@ export const BacktestsView: React.FC<BacktestsViewProps> = ({
                   step={0.1}
                   value={spreadPips}
                   onChange={(e) => setSpreadPips(Number(e.target.value))}
-                  className="w-full bg-[#131c2e] text-white border border-[#1e293b] rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-mono tabular-nums"
+                  className="w-full bg-bg-surface-3 text-white border border-line rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-mono tabular-nums"
                 />
               </div>
 
               <div>
-                <label className="block text-slate-300 font-medium mb-1">
+                <label className="block text-ink-2 font-medium mb-1">
                   Commission ($ / standard lot)
                 </label>
                 <input
@@ -166,12 +166,12 @@ export const BacktestsView: React.FC<BacktestsViewProps> = ({
                   step={0.5}
                   value={commissionPerLot}
                   onChange={(e) => setCommissionPerLot(Number(e.target.value))}
-                  className="w-full bg-[#131c2e] text-white border border-[#1e293b] rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-mono tabular-nums"
+                  className="w-full bg-bg-surface-3 text-white border border-line rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-mono tabular-nums"
                 />
               </div>
 
               <div>
-                <label className="block text-slate-300 font-medium mb-1">Avg Slippage (pips)</label>
+                <label className="block text-ink-2 font-medium mb-1">Avg Slippage (pips)</label>
                 <input
                   type="number"
                   min={0}
@@ -179,14 +179,14 @@ export const BacktestsView: React.FC<BacktestsViewProps> = ({
                   step={0.1}
                   value={slippagePips}
                   onChange={(e) => setSlippagePips(Number(e.target.value))}
-                  className="w-full bg-[#131c2e] text-white border border-[#1e293b] rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-mono tabular-nums"
+                  className="w-full bg-bg-surface-3 text-white border border-line rounded px-3 py-1.5 focus:outline-none focus:border-sky-500 font-mono tabular-nums"
                 />
               </div>
             </div>
 
-            <div className="flex items-center justify-between pt-3 border-t border-[#1e293b]">
-              <div className="flex items-center gap-2 text-[11px] text-slate-400">
-                <AlertCircle className="w-3.5 h-3.5 text-slate-400" />
+            <div className="flex items-center justify-between pt-3 border-t border-line">
+              <div className="flex items-center gap-2 text-[11px] text-ink-3">
+                <AlertCircle className="w-3.5 h-3.5 text-ink-3" />
                 <span>Zero-lookahead execution with tick-level stop-loss & take-profit detection</span>
               </div>
 
@@ -211,8 +211,8 @@ export const BacktestsView: React.FC<BacktestsViewProps> = ({
 
             {/* Metrics Grid */}
             <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 text-xs">
-              <div className="bg-[#0c121e] border border-[#1e293b] rounded-lg p-3">
-                <div className="text-[10px] text-slate-400 uppercase font-sans">Net Profit</div>
+              <div className="bg-bg-surface border border-line rounded-lg p-3">
+                <div className="text-[10px] text-ink-3 uppercase font-sans">Net Profit</div>
                 <div
                   className={`text-base font-bold font-mono tabular-nums mt-0.5 ${
                     lastBacktestResult.netProfit >= 0 ? 'text-emerald-400' : 'text-rose-400'
@@ -220,72 +220,72 @@ export const BacktestsView: React.FC<BacktestsViewProps> = ({
                 >
                   {lastBacktestResult.netProfit >= 0 ? '+' : ''}${lastBacktestResult.netProfit.toLocaleString()}
                 </div>
-                <div className="text-[11px] text-slate-400 font-mono">
+                <div className="text-[11px] text-ink-3 font-mono">
                   {lastBacktestResult.netProfitPercent >= 0 ? '+' : ''}
                   {lastBacktestResult.netProfitPercent}%
                 </div>
               </div>
 
-              <div className="bg-[#0c121e] border border-[#1e293b] rounded-lg p-3">
-                <div className="text-[10px] text-slate-400 uppercase font-sans">Win Rate</div>
+              <div className="bg-bg-surface border border-line rounded-lg p-3">
+                <div className="text-[10px] text-ink-3 uppercase font-sans">Win Rate</div>
                 <div className="text-base font-bold text-white font-mono tabular-nums mt-0.5">
                   {lastBacktestResult.winRate}%
                 </div>
-                <div className="text-[11px] text-slate-400 font-mono">
+                <div className="text-[11px] text-ink-3 font-mono">
                   {lastBacktestResult.winningTrades}W / {lastBacktestResult.losingTrades}L
                 </div>
               </div>
 
-              <div className="bg-[#0c121e] border border-[#1e293b] rounded-lg p-3">
-                <div className="text-[10px] text-slate-400 uppercase font-sans">Profit Factor</div>
+              <div className="bg-bg-surface border border-line rounded-lg p-3">
+                <div className="text-[10px] text-ink-3 uppercase font-sans">Profit Factor</div>
                 <div className="text-base font-bold text-white font-mono tabular-nums mt-0.5">
                   {lastBacktestResult.profitFactor}
                 </div>
-                <div className="text-[11px] text-slate-400 font-mono">Gross Gain / Loss</div>
+                <div className="text-[11px] text-ink-3 font-mono">Gross Gain / Loss</div>
               </div>
 
-              <div className="bg-[#0c121e] border border-[#1e293b] rounded-lg p-3">
-                <div className="text-[10px] text-slate-400 uppercase font-sans">Max Drawdown</div>
+              <div className="bg-bg-surface border border-line rounded-lg p-3">
+                <div className="text-[10px] text-ink-3 uppercase font-sans">Max Drawdown</div>
                 <div className="text-base font-bold text-rose-400 font-mono tabular-nums mt-0.5">
                   -${lastBacktestResult.maxDrawdown.toLocaleString()}
                 </div>
-                <div className="text-[11px] text-slate-400 font-mono">
+                <div className="text-[11px] text-ink-3 font-mono">
                   -{lastBacktestResult.maxDrawdownPercent}%
                 </div>
               </div>
 
-              <div className="bg-[#0c121e] border border-[#1e293b] rounded-lg p-3">
-                <div className="text-[10px] text-slate-400 uppercase font-sans">Total Trades</div>
+              <div className="bg-bg-surface border border-line rounded-lg p-3">
+                <div className="text-[10px] text-ink-3 uppercase font-sans">Total Trades</div>
                 <div className="text-base font-bold text-white font-mono tabular-nums mt-0.5">
                   {lastBacktestResult.totalTrades}
                 </div>
-                <div className="text-[11px] text-slate-400 font-mono">
+                <div className="text-[11px] text-ink-3 font-mono">
                   Avg ${lastBacktestResult.averageTradeProfit}
                 </div>
               </div>
 
-              <div className="bg-[#0c121e] border border-[#1e293b] rounded-lg p-3">
-                <div className="text-[10px] text-slate-400 uppercase font-sans">Sharpe Ratio</div>
+              <div className="bg-bg-surface border border-line rounded-lg p-3">
+                <div className="text-[10px] text-ink-3 uppercase font-sans">Sharpe Ratio</div>
                 <div className="text-base font-bold text-sky-400 font-mono tabular-nums mt-0.5">
                   {lastBacktestResult.sharpeRatio}
                 </div>
-                <div className="text-[11px] text-slate-400 font-mono">Risk-Adjusted</div>
+                <div className="text-[11px] text-ink-3 font-mono">Risk-Adjusted</div>
               </div>
 
-              <div className="bg-[#0c121e] border border-[#1e293b] rounded-lg p-3">
-                <div className="text-[10px] text-slate-400 uppercase font-sans">Ending Equity</div>
+              <div className="bg-bg-surface border border-line rounded-lg p-3">
+                <div className="text-[10px] text-ink-3 uppercase font-sans">Ending Equity</div>
                 <div className="text-base font-bold text-white font-mono tabular-nums mt-0.5">
                   ${lastBacktestResult.finalEquity.toLocaleString()}
                 </div>
-                <div className="text-[11px] text-slate-400 font-mono">
+                <div className="text-[11px] text-ink-3 font-mono">
                   Init ${lastBacktestResult.initialBalance.toLocaleString()}
                 </div>
               </div>
             </div>
 
             {/* Backtest Disclaimer Notice */}
-            <div className="p-3 bg-[#111927] border border-[#1e293b] rounded-lg text-xs text-slate-400 leading-relaxed">
-              <strong className="text-slate-200">Simulation Transparency Notice:</strong> Historical backtest
+            <div className="p-3 bg-bg-surface-3 border border-line rounded-lg text-xs text-ink-3 leading-relaxed">
+              <strong className="text-ink-2">Simulation Transparency Notice:</strong> Historical backtest
               performance does not guarantee future financial results. Backtests model deterministic historical
               price movement; actual live trading entails liquidity variance, broker execution latency, and unpredictable
               macroeconomic slippage.

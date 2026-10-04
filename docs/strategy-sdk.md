@@ -1,4 +1,4 @@
-# TradingVibe Strategy SDK Reference
+# TradingGOATs Strategy SDK Reference
 
 Strategies are implemented in TypeScript as default exported asynchronous functions:
 

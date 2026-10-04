@@ -1,6 +1,6 @@
 # State Management Architecture
 
-This document defines state ownership, reactive stores, and real-time update boundaries in **TradingVibe**.
+This document defines state ownership, reactive stores, and real-time update boundaries in **TradingGOATs**.
 
 ---
 

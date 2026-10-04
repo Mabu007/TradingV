@@ -21,18 +21,18 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   public componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-    console.error('TradingVibe caught a runtime error:', error, errorInfo);
+    console.error('TradingGOATs caught a runtime error:', error, errorInfo);
   }
 
   public render() {
     if (this.state.hasError) {
       return (
-        <div className="flex flex-col items-center justify-center h-screen w-screen bg-[#090d14] text-slate-200 p-6 text-center">
+        <div className="flex flex-col items-center justify-center h-screen w-screen bg-bg-bg-alt text-ink-2 p-6 text-center">
           <div className="p-3 rounded-full bg-rose-950/70 border border-rose-800/50 text-rose-400 mb-4">
             <AlertOctagon className="w-8 h-8" />
           </div>
-          <h1 className="text-lg font-bold text-white mb-2">TradingVibe Runtime Intercept</h1>
-          <p className="text-xs text-slate-400 max-w-md mb-4 font-mono">
+          <h1 className="text-lg font-bold text-white mb-2">TradingGOATs Runtime Intercept</h1>
+          <p className="text-xs text-ink-3 max-w-md mb-4 font-mono">
             {this.state.error?.message || 'An unexpected execution issue was prevented.'}
           </p>
           <button

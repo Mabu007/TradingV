@@ -1,16 +1,16 @@
 # Navigation & Routing Architecture
 
-This document specifies the routing and state-driven navigation model in **TradingVibe**.
+This document specifies the routing and state-driven navigation model in **TradingGOATs**.
 
 ---
 
 ## 1. Navigation Paradigm
 
-TradingVibe uses a **state-driven client-side navigation model** optimized for single-page mobile applications. This avoids slow full-page browser reloads, preserves WebSocket streaming connections without re-handshaking, and guarantees lightning-fast transition animations.
+TradingGOATs uses a **state-driven client-side navigation model** optimized for single-page mobile applications. This avoids slow full-page browser reloads, preserves WebSocket streaming connections without re-handshaking, and guarantees lightning-fast transition animations.
 
 ```mermaid
 graph TD
-    Root[TradingVibe App Shell]
+    Root[TradingGOATs App Shell]
 
     subgraph Primary Destinations [Primary Tabs (5)]
         Tab_Trades[Trades (Default Landing)]

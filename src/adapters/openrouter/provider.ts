@@ -1,44 +1,81 @@
-import { AIMessage, AIProviderConfig, AIResponse, IAIProvider } from './types';
+import {
+  AIChatContext,
+  AIMessage,
+  AIProviderConfig,
+  AIProviderError,
+  AIResponse,
+  IAIProvider,
+  ModelCatalogue,
+  OpenRouterModel,
+} from './types';
+import { chatCompletionsUrl } from './endpoints';
+import {
+  classifyProviderFailure,
+  diagnostics,
+  networkFailure,
+} from './errors';
+import {
+  DEFAULT_MODEL_ID,
+  clearModelCatalogueCache,
+  currentModelCatalogue,
+  fetchModelCatalogue,
+  isModelAvailable,
+  pickDefaultModel,
+} from './catalogue';
+
+/**
+ * Sentinels the UI already branches on, kept stable.
+ *
+ * They appear in `content` so the existing copilot keeps working, and
+ * deliberately carry nothing else. An earlier version appended the
+ * provider's own error text to the sentinel, which meant provider payload
+ * travelled through the same channel as model output — into agent
+ * reasoning and into the timeline, where it is indistinguishable from
+ * something the model said. The text now travels in `error`.
+ */
+export const KEY_REQUIRED = 'OPENROUTER_API_KEY_REQUIRED';
+export const REQUEST_FAILED = 'OPENROUTER_REQUEST_FAILED';
+
+export { redactSecrets } from './redact';
+
+/**
+ * Whether a string is plausibly an OpenRouter key.
+ *
+ * Shape, not length. A length check alone accepts a pasted sentence, and
+ * "has a key" is the question the whole UI turns on: a key that is present
+ * but wrong should be reported as wrong before a request is made, not
+ * discovered as a 401 later.
+ */
+export function looksLikeApiKey(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (trimmed.length < 20) return false;
+  if (/\s/.test(trimmed)) return false;
+  if (!/^[A-Za-z0-9._-]+$/.test(trimmed)) return false;
+  return true;
+}
 
 const STORAGE_KEY = 'tradingvibe_openrouter_config';
 
-export const POPULAR_MODELS = [
-  {
-    id: 'inclusionai/ling-3.0-flash-fin:free',
-    name: 'Ling 3.0 Flash (Free)',
-  },
-  {
-    id: 'anthropic/claude-3.5-sonnet',
-    name: 'Claude 3.5 Sonnet',
-  },
-  {
-    id: 'deepseek/deepseek-chat',
-    name: 'DeepSeek V3',
-  },
-  {
-    id: 'openai/gpt-4o',
-    name: 'OpenAI GPT-4o',
-  },
-  {
-    id: 'meta-llama/llama-3.3-70b-instruct',
-    name: 'Llama 3.3 70B',
-  },
-  {
-    id: 'google/gemini-2.0-flash-001',
-    name: 'Gemini 2.0 Flash',
-  },
-];
-
+/**
+ * The shipped default.
+ *
+ * Not a hand-picked favourite: it is a free, text-capable model that
+ * supports tool calling and structured output, because that is the request
+ * format the GOAT runtime sends. It is still validated against the live
+ * catalogue at startup (see `reconcileModel`) so a model that disappears
+ * does not take the product down with it.
+ */
 export const DEFAULT_AI_CONFIG: AIProviderConfig = {
   apiKey: '',
-  model: 'inclusionai/ling-3.0-flash-fin:free',
-  siteUrl: 'https://tradingvibe.local',
-  siteName: 'TradingVibe',
+  model: DEFAULT_MODEL_ID,
+  siteUrl: 'https://tradinggoats.local',
+  siteName: 'TradingGOATs',
 };
 
-const SYSTEM_PROMPT = `You are TradingVibe AI, an expert quantitative trading engineer and autonomous trading-agent reasoning system.
+const SYSTEM_PROMPT = `You are TradingGOATs AI, an expert quantitative trading engineer and autonomous trading-agent reasoning system.
 
-TradingVibe agents operate on deployed trading instruments selected outside the bot definition. The bot itself is asset-agnostic.
+GOAT agents operate on the market their deployment is bound to. The GOAT itself is asset-agnostic.
 
 The agent may receive:
 - Current market quote
@@ -48,12 +85,12 @@ The agent may receive:
 - Account state
 - Open positions
 - Orders
-- Trigger information
+- Tracker information
 - Available skills
 - Available capabilities
 - Previous tool results
 
-The agent must reason only from information actually provided by the TradingVibe runtime.
+The agent must reason only from information actually provided by the TradingGOATs runtime.
 
 IMPORTANT RULES:
 
@@ -63,9 +100,9 @@ IMPORTANT RULES:
 4. Never use placeholder market values.
 5. If the available information is insufficient to make a responsible decision, return WAIT.
 6. A trading decision must include a concrete stop loss.
-7. Respect the bot's risk policy, capabilities, and execution policy.
+7. Respect the GOAT's risk policy, capabilities, and deployment permissions.
 8. Do not bypass risk controls.
-9. Do not claim an order was executed. The TradingVibe runtime performs execution and reports the result separately.
+9. Do not claim an order was executed. The TradingGOATs runtime performs execution and reports the result separately.
 10. The AI does not have access to signing credentials or exchange credentials.
 11. Do not provide financial-advice language. You are operating as a trading-system reasoning component.
 12. Prefer WAIT when evidence is ambiguous or conflicting.
@@ -79,7 +116,7 @@ ANALYZE
 Use when additional analysis through an available capability is required before deciding.
 
 OPEN_POSITION
-Use only when the available evidence supports a trade and the bot's capabilities and policies permit trading.
+Use only when the available evidence supports a trade and the GOAT's capabilities and policies permit it.
 
 MODIFY_POSITION
 Use when an existing position requires a stop-loss or take-profit modification.
@@ -91,12 +128,7 @@ Return a single valid JSON object matching the requested decision schema.
 Do not wrap the JSON in markdown.
 Do not add explanatory text outside the JSON.`;
 
-interface OpenRouterContext {
-  currentCode?: string;
-  symbol?: string;
-  timeframe?: string;
-  model?: string;
-}
+type OpenRouterContext = AIChatContext;
 
 export class OpenRouterProvider implements IAIProvider {
   private config: AIProviderConfig;
@@ -105,35 +137,79 @@ export class OpenRouterProvider implements IAIProvider {
     this.config = this.loadConfig();
   }
 
+  /**
+   * Reads persisted configuration, validating every field.
+   *
+   * A blind spread of whatever is in local storage means a stale shape from
+   * an older build, a hand-edited value, or a half-written record can put
+   * an object where a string belongs — and then `hasApiKey()` reads a
+   * truthy object as a valid key. Field by field, each with the type it is
+   * supposed to have, is what makes the rest of this class able to assume
+   * its config is well formed.
+   */
   loadConfig(): AIProviderConfig {
+    const config: AIProviderConfig = { ...DEFAULT_AI_CONFIG };
+
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
 
       if (saved) {
-        const parsed = JSON.parse(saved);
+        const parsed: unknown = JSON.parse(saved);
 
-        return {
-          ...DEFAULT_AI_CONFIG,
-          ...parsed,
-        };
+        if (isRecord(parsed)) {
+          if (typeof parsed.apiKey === 'string') config.apiKey = parsed.apiKey;
+          if (typeof parsed.model === 'string' && parsed.model.trim()) {
+            config.model = parsed.model.trim();
+          }
+          if (typeof parsed.siteUrl === 'string') config.siteUrl = parsed.siteUrl;
+          if (typeof parsed.siteName === 'string') config.siteName = parsed.siteName;
+          if (typeof parsed.lastWorkingModel === 'string' && parsed.lastWorkingModel.trim()) {
+            config.lastWorkingModel = parsed.lastWorkingModel.trim();
+          }
+        }
       }
     } catch {
       // Invalid or unavailable local storage should not prevent the app from loading.
     }
 
-    return {
-      ...DEFAULT_AI_CONFIG,
-    };
+    return config;
   }
 
+  /** Merges only the fields that were supplied, and only of the right type. */
   saveConfig(newConfig: Partial<AIProviderConfig>): void {
-    this.config = {
-      ...this.config,
-      ...newConfig,
-    };
+    const merged: AIProviderConfig = { ...this.config };
+
+    if (typeof newConfig.apiKey === 'string') merged.apiKey = newConfig.apiKey;
+    if (typeof newConfig.model === 'string' && newConfig.model.trim()) {
+      merged.model = newConfig.model.trim();
+    }
+    if (typeof newConfig.siteUrl === 'string') merged.siteUrl = newConfig.siteUrl;
+    if (typeof newConfig.siteName === 'string') merged.siteName = newConfig.siteName;
+    if (typeof newConfig.lastWorkingModel === 'string' && newConfig.lastWorkingModel.trim()) {
+      merged.lastWorkingModel = newConfig.lastWorkingModel.trim();
+    }
+
+    this.config = merged;
 
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.config));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+    } catch {
+      // Configuration remains available in memory for the current session.
+    }
+  }
+
+  /**
+   * Forgets the credential.
+   *
+   * Removing a BYO key is a thing a user does for a reason — a shared
+   * machine, a key they think leaked — so it has to actually remove it
+   * from disk and not only from memory.
+   */
+  clearApiKey(): void {
+    this.config = { ...this.config, apiKey: '' };
+
+    try {
+      localStorage.removeItem(STORAGE_KEY);
     } catch {
       // Configuration remains available in memory for the current session.
     }
@@ -146,10 +222,89 @@ export class OpenRouterProvider implements IAIProvider {
   }
 
   hasApiKey(): boolean {
-    return Boolean(
-      this.config.apiKey &&
-        this.config.apiKey.trim().length > 10,
-    );
+    return looksLikeApiKey(this.config.apiKey);
+  }
+
+  // -------------------------------------------------------------------------
+  // Model catalogue
+  // -------------------------------------------------------------------------
+
+  /**
+   * The models OpenRouter currently offers.
+   *
+   * Fetched rather than listed, because a listed set of ids goes stale and
+   * a stale id is a 404 on every request. Never throws: an unreachable
+   * catalogue degrades to a small built-in list so the app stays usable.
+   */
+  async listModels(options?: { force?: boolean }): Promise<ModelCatalogue> {
+    return fetchModelCatalogue(options);
+  }
+
+  /** The catalogue already in hand, if one has been fetched. */
+  knownModels(): ModelCatalogue | undefined {
+    return currentModelCatalogue();
+  }
+
+  refreshModels(): Promise<ModelCatalogue> {
+    clearModelCatalogueCache();
+    return fetchModelCatalogue({ force: true });
+  }
+
+  /** Select a model, without touching anything else in the configuration. */
+  setModel(modelId: string): void {
+    const trimmed = modelId.trim();
+    if (trimmed) this.saveConfig({ model: trimmed });
+  }
+
+  /**
+   * Check a persisted model against the live catalogue.
+   *
+   * Returns whether the selection is still offered. It deliberately does
+   * *not* change the selection: silently switching a user's model is worse
+   * than telling them it is gone, because then the answer they get back is
+   * not from the model they chose.
+   */
+  async isSelectedModelAvailable(): Promise<boolean> {
+    const catalogue = await this.listModels();
+    return isModelAvailable(catalogue.models, this.config.model);
+  }
+
+  /**
+   * A model that is currently listed, preferring the current selection.
+   *
+   * Used at startup so a default which has been retired stops being
+   * requested. Returns the id to use; never null, because the fallback list
+   * always has something in it.
+   */
+  async reconcileModel(): Promise<string> {
+    const catalogue = await this.listModels();
+    const previous = this.config.model;
+    if (isModelAvailable(catalogue.models, previous)) {
+      return previous;
+    }
+    const replacement = pickDefaultModel(catalogue.models);
+    if (replacement && replacement !== previous) {
+      this.setModel(replacement);
+      console.info(
+        `OpenRouter model "${previous}" is no longer offered. Using "${replacement}".`,
+      );
+    }
+    return this.config.model;
+  }
+
+  /**
+   * Send one short prompt to one model, to find out whether it works.
+   *
+   * A user who is about to trust a model with a GOAT needs to know before
+   * they deploy it, and a model picker is the only place that question
+   * makes sense. It costs one cheap completion, which is why it is an
+   * action and not something that happens for all fifty models.
+   */
+  async testModel(modelId: string): Promise<AIResponse> {
+    return this.chat([{ role: 'user', content: 'Reply with the single word: ready' }], {
+      model: modelId,
+      systemPrompt: 'You are a connectivity check. Reply with one short word.',
+    });
   }
 
   async chat(
@@ -158,7 +313,11 @@ export class OpenRouterProvider implements IAIProvider {
   ): Promise<AIResponse> {
     if (!this.hasApiKey()) {
       return {
-        content: 'OPENROUTER_API_KEY_REQUIRED',
+        content: KEY_REQUIRED,
+        error: {
+          code: 'KEY_REQUIRED',
+          message: 'Connect an OpenRouter API key to use AI features.',
+        },
       };
     }
 
@@ -171,10 +330,18 @@ export class OpenRouterProvider implements IAIProvider {
   ): Promise<AIResponse> {
     const contextPrefix = this.buildContextPrefix(context);
 
+    /*
+     * The copilot supplies its own product prompt. The agent runtime does
+     * not, and keeps the trading-decision prompt above unchanged.
+     */
+    const systemPrompt = context?.systemPrompt?.trim()
+      ? context.systemPrompt.trim()
+      : SYSTEM_PROMPT;
+
     const payloadMessages = [
       {
         role: 'system' as const,
-        content: SYSTEM_PROMPT + contextPrefix,
+        content: systemPrompt + contextPrefix,
       },
       ...messages.map((message) => ({
         role: message.role,
@@ -188,58 +355,83 @@ export class OpenRouterProvider implements IAIProvider {
       DEFAULT_AI_CONFIG.model;
 
     try {
-      const response = await fetch(
-        'https://openrouter.ai/api/v1/chat/completions',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${this.config.apiKey.trim()}`,
-            'HTTP-Referer':
-              this.config.siteUrl || 'https://tradingvibe.local',
-            'X-Title':
-              this.config.siteName || 'TradingVibe',
-          },
-          body: JSON.stringify({
-            model,
-            messages: payloadMessages,
-            temperature: 0.2,
-          }),
+      /*
+       * One URL, built in one place. The previous 404 was a duplicated
+       * path; the exact string this resolves to is asserted in the tests
+       * and must stay
+       * `https://openrouter.ai/api/v1/chat/completions`.
+       */
+      const response = await fetch(chatCompletionsUrl(), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          // BYO key: sent from the user's browser straight to OpenRouter.
+          // TradingGOATs never proxies or logs it.
+          Authorization: `Bearer ${this.config.apiKey.trim()}`,
+          'HTTP-Referer':
+            this.config.siteUrl || 'https://tradinggoats.local',
+          'X-Title':
+            this.config.siteName || 'TradingGOATs',
         },
-      );
+        body: JSON.stringify({
+          model,
+          messages: payloadMessages,
+          temperature: 0.2,
+        }),
+      });
 
       if (!response.ok) {
-        const errorText = await response.text();
-
-        throw new Error(
-          `OpenRouter HTTP ${response.status}: ${errorText}`,
+        /*
+         * The body is read to classify the failure and then thrown away.
+         * A provider error page can echo the credential that was sent to
+         * it, and there is no version of surfacing it that is safe. The
+         * status, plus the fixed set of phrases that separate "no such
+         * model" from "no such endpoint", is all that is needed.
+         */
+        const body = await response.text().catch(() => undefined);
+        const error: AIProviderError = classifyProviderFailure(
+          response.status,
+          body,
+          model,
         );
+
+        // Status, class and model id. Never the body, never the credential.
+        console.warn(diagnostics(error, model));
+
+        return {
+          content: REQUEST_FAILED,
+          error,
+        };
       }
 
-      const json = await response.json();
+      const json: unknown = await response.json().catch(() => undefined);
 
-      const content =
-        json?.choices?.[0]?.message?.content;
+      const content = readContent(json);
 
       if (typeof content !== 'string' || !content.trim()) {
-        throw new Error(
-          'OpenRouter returned an empty response.',
-        );
+        return {
+          content: REQUEST_FAILED,
+          error: {
+            code: 'EMPTY_RESPONSE',
+            message: 'The model returned an empty response. Try again.',
+          },
+        };
       }
+
+      /*
+       * A model that answered is a model this key can use. Remembered so
+       * the picker can offer "last known working" without making the user
+       * discover it by failing first.
+       */
+      if (model === this.config.model) this.saveConfig({ lastWorkingModel: model });
 
       return {
         content: content.trim(),
       };
     } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : 'Unknown OpenRouter error';
-
-      console.error('OpenRouter request failed:', error);
-
       return {
-        content: `OPENROUTER_REQUEST_FAILED:${message}`,
+        content: REQUEST_FAILED,
+        error: networkFailure(error),
       };
     }
   }
@@ -265,6 +457,10 @@ export class OpenRouterProvider implements IAIProvider {
       );
     }
 
+    if (context.contextPrefix) {
+      sections.push(context.contextPrefix);
+    }
+
     if (context.currentCode) {
       sections.push(
         `Active strategy code:\n${context.currentCode}`,
@@ -275,8 +471,24 @@ export class OpenRouterProvider implements IAIProvider {
       return '';
     }
 
-    return `\n\nTRADINGVIBE RUNTIME CONTEXT:\n${sections.join('\n')}`;
+    return `\n\nTRADINGGOATS RUNTIME CONTEXT:\n${sections.join('\n')}`;
   }
 }
 
 export const openRouterProvider = new OpenRouterProvider();
+/** Narrow an unknown value to a plain record. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Pull the assistant text out of a response without trusting its shape. */
+function readContent(json: unknown): unknown {
+  if (!isRecord(json)) return undefined;
+  const choices = json['choices'];
+  if (!Array.isArray(choices) || choices.length === 0) return undefined;
+  const first = choices[0];
+  if (!isRecord(first)) return undefined;
+  const message = first['message'];
+  if (!isRecord(message)) return undefined;
+  return message['content'];
+}

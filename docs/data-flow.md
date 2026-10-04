@@ -1,6 +1,6 @@
 # Data Flow Architecture
 
-How data moves through **TradingVibe**: Hyperliquid market data, order
+How data moves through **TradingGOATs**: Hyperliquid market data, order
 execution, agent activity, and user-AI interaction.
 
 ---
@@ -98,7 +98,7 @@ Safeguards:
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Trigger as TriggerEngine
+    participant Tracker as TrackerRuntime
     participant RT as AgentRuntime
     participant Obs as Observation builder
     participant Model as OpenRouter (BYO key)
@@ -106,7 +106,7 @@ sequenceDiagram
     participant Risk as RiskManager
     participant Env as DemoEnvironment -> Demo adapter
 
-    Trigger->>RT: wake (NEW_BAR, POSITION_OPEN, ...)
+    Tracker->>RT: wake (NEW_BAR, POSITION_OPEN, ...)
     RT->>Obs: quote, bars, account, positions, capabilities
     Obs->>RT: AgentObservation (real market data only)
     RT->>Model: thought + tool call / decision
@@ -116,7 +116,7 @@ sequenceDiagram
     alt Approved
         RT->>Env: placeMarketOrder / modifyPosition / closePosition
         Env-->>RT: execution result (or structured rejection)
-        RT->>Trigger: timeline events
+        RT->>Tracker: timeline events
     else Rejected
         RT-->>RT: record rejection + category in the timeline
     end

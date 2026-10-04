@@ -229,9 +229,100 @@ export const marketGetSessionCapability: AgentCapability<
   },
 };
 
+/**
+ * What the venue publishes about a market beyond price and candles.
+ *
+ * This is the capability that makes research open rather than a fixed list of
+ * five price-shaped fields. Funding, open interest and volume decide whether
+ * a breakout has anything behind it, and an agent that cannot ask cannot
+ * reason about them — so it asks here rather than guessing.
+ *
+ * The honesty rule is the whole design: a fact the venue does not publish
+ * comes back in `unavailable` with a reason, never as a zero. A GOAT told
+ * "this market has no funding" plans around it; a GOAT told `fundingRate: 0`
+ * concludes funding is neutral, which is a different and wrong claim.
+ */
+const marketGetContextCapability: AgentCapability = {
+  id: 'market.getContext',
+  name: 'Get Market Context',
+  description:
+    'Reads what the venue publishes beyond price and candles: funding rate, open interest, 24h volume, mark price and 24h change. Reports honestly when the venue publishes none of it.',
+  category: 'market',
+  inputSchema: {},
+  outputSchema: {
+    fundingRate: { type: 'number' },
+    fundingAnnualPercent: { type: 'number' },
+    openInterest: { type: 'number' },
+    dayVolume: { type: 'number' },
+    markPrice: { type: 'number' },
+    change24hPercent: { type: 'number' },
+    unavailable: { type: 'array' },
+  },
+  async execute(_, context) {
+    const symbol = context.symbol || '';
+    const unavailable: string[] = [];
+
+    if (typeof context.env.getMarketContext !== 'function') {
+      return {
+        unavailable: ['This environment publishes no market context beyond price and candles.'],
+        source: 'none',
+      };
+    }
+
+    let facts;
+    try {
+      facts = await context.env.getMarketContext(symbol);
+    } catch (error) {
+      // A failed read is a missing fact, and is reported as one. Returning
+      // zeros here would be the single most damaging thing this file could
+      // do: every downstream judgement would look measured and be invented.
+      return {
+        unavailable: [
+          `The venue did not return market context for ${symbol || 'this market'}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ],
+        source: 'error',
+      };
+    }
+
+    for (const reason of facts.unavailable ?? []) unavailable.push(reason);
+
+    const annualise = (rate: number): number => {
+      const hours = facts.fundingIntervalHours ?? 1;
+      const periodsPerYear = (365 * 24) / hours;
+      return rate * periodsPerYear * 100;
+    };
+
+    if (typeof facts.fundingRate !== 'number' || !Number.isFinite(facts.fundingRate)) {
+      unavailable.push(`No funding rate is published for ${symbol || 'this market'}.`);
+    }
+
+    return {
+      ...(typeof facts.fundingRate === 'number' ? { fundingRate: facts.fundingRate } : {}),
+      ...(typeof facts.fundingRate === 'number'
+        ? { fundingAnnualPercent: annualise(facts.fundingRate) }
+        : {}),
+      ...(typeof facts.fundingIntervalHours === 'number'
+        ? { fundingIntervalHours: facts.fundingIntervalHours }
+        : {}),
+      ...(typeof facts.openInterest === 'number' ? { openInterest: facts.openInterest } : {}),
+      ...(typeof facts.dayVolume === 'number' ? { dayVolume: facts.dayVolume } : {}),
+      ...(typeof facts.markPrice === 'number' ? { markPrice: facts.markPrice } : {}),
+      ...(typeof facts.oraclePrice === 'number' ? { oraclePrice: facts.oraclePrice } : {}),
+      ...(typeof facts.change24hPercent === 'number'
+        ? { change24hPercent: facts.change24hPercent }
+        : {}),
+      ...(unavailable.length > 0 ? { unavailable } : {}),
+      ...(facts.source ? { source: facts.source } : {}),
+    };
+  },
+};
+
 export const MARKET_CAPABILITIES = [
   marketGetQuoteCapability,
   marketGetBarsCapability,
   marketGetSpreadCapability,
   marketGetSessionCapability,
+  marketGetContextCapability,
 ];

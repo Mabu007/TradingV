@@ -6,7 +6,7 @@ export const ordersMarketCapability: AgentCapability<
 > = {
   id: 'orders.market',
   name: 'Place Market Order',
-  description: 'Submits an immediate market execution order routed through the TradingVibe Risk Engine.',
+  description: 'Submits an immediate market execution order routed through the TradingGOATs Risk Engine.',
   category: 'execution',
   inputSchema: {
     symbol: { type: 'string', required: true },

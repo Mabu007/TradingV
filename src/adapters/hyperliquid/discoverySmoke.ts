@@ -2,7 +2,7 @@ import { HyperliquidMarketDataAdapter } from './marketData';
 import { AssetClass } from '../../types/instruments';
 
 const classes: AssetClass[] = ['FOREX', 'COMMODITY', 'INDEX'];
-const adapter = new HyperliquidMarketDataAdapter('mainnet');
+const adapter = new HyperliquidMarketDataAdapter('MAINNET');
 const instruments = await adapter.getInstruments(classes);
 
 for (const assetClass of classes) {

@@ -1,0 +1,55 @@
+# Cloudflare Workers configuration for the TradingVibe watcher tier.
+#
+# The Durable Object is bound as a namespace so the Worker can address one
+# instance per deployment. The id is derived from (userId, botId,
+# deploymentId), so the same deployment always reaches the same object
+# and a retried deploy updates it rather than creating a second watcher.
+
+name = "tradingvibe-watchers"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Secrets are NOT set here. Set them with:
+#   wrangler secret put AUTH_TOKEN
+#   wrangler secret put MARKET_FEED_TOKEN
+#
+# Both are required for the service to accept traffic, and the code fails
+# closed without them: an unauthenticated market feed would let anyone
+# wake anyone's bot.
+
+[vars]
+# The Python condition engine. Public HTTP, no credentials.
+ENGINE_URL = "http://127.0.0.1:8099"
+# Comma-separated browser origins allowed to call the API. Never "*".
+ALLOWED_ORIGINS = "http://localhost:3000"
+
+# One binding per class. A namespace binding names a single `class_name`,
+# so with one binding the runtime instantiates that class for *every* id -
+# which means the index objects' methods are simply absent and every call
+# fails with "the RPC receiver does not implement the method".
+[[durable_objects.bindings]]
+name = "WATCHERS"
+class_name = "WatcherObject"
+
+[[durable_objects.bindings]]
+name = "REGISTRY"
+class_name = "UserRegistryObject"
+
+[[durable_objects.bindings]]
+name = "MARKET_INDEX"
+class_name = "MarketIndexObject"
+
+# Per-caller request budget. Without this the Watcher's own cooldowns
+# are the only limits, and those do not apply until a watcher exists.
+[[durable_objects.bindings]]
+name = "RATE_LIMITS"
+class_name = "RateLimitObject"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["WatcherObject", "UserRegistryObject", "MarketIndexObject", "RateLimitObject"]
+
+[observability]
+enabled = true
+head_sampling_rate = 1

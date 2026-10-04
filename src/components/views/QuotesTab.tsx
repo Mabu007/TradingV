@@ -224,14 +224,14 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
     );
 
     return (
-      <div className="flex-1 flex flex-col h-full bg-[#080d16] overflow-y-auto pb-24 md:pb-8">
+      <div className="flex-1 flex flex-col h-full bg-bg-alt overflow-y-auto pb-24 md:pb-8">
 
         {/* Header */}
-        <div className="sticky top-0 z-20 bg-[#080d16]/95 backdrop-blur-md border-b border-[#1e293b] p-3 flex items-center justify-between">
+        <div className="sticky top-0 z-20 bg-bg-alt/95 backdrop-blur-md border-b border-line p-3 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <button
               onClick={() => setSelectedMarket(null)}
-              className="p-1.5 rounded-xl text-slate-300 hover:text-white hover:bg-[#1e293b] transition-colors"
+              className="p-1.5 rounded-xl text-ink-2 hover:text-ink hover:bg-line-strong transition-colors"
               title="Back to Quotes"
             >
               <ArrowLeft className="w-5 h-5" />
@@ -239,7 +239,7 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
 
             <div>
               <div className="flex items-center gap-2">
-                <h1 className="text-base font-bold text-white font-mono">
+                <h1 className="text-base font-bold text-ink font-mono">
                   {selectedMarket.symbol}
                 </h1>
 
@@ -247,26 +247,26 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
                   onClick={(e) =>
                     toggleFavorite(selectedMarket.symbol, e)
                   }
-                  className="text-slate-500 hover:text-amber-400 transition-colors"
+                  className="text-ink-4 hover:text-warn transition-colors"
                 >
                   <Star
                     className={`w-4 h-4 ${
                       favorites.includes(selectedMarket.symbol)
-                        ? 'fill-amber-400 text-amber-400'
+                        ? 'fill-amber-400 text-warn'
                         : ''
                     }`}
                   />
                 </button>
               </div>
 
-              <div className="text-xs text-slate-400">
+              <div className="text-xs text-ink-3">
                 {selectedMarket.displayName}
               </div>
             </div>
           </div>
 
           <div className="text-right">
-            <div className="text-lg font-bold font-mono text-white tracking-tight">
+            <div className="text-lg font-bold font-mono text-ink tracking-tight">
               {quote
                 ? formatPrice(
                     (quote.bid + quote.ask) / 2,
@@ -277,19 +277,22 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
 
             <div
               className={`text-xs font-semibold font-mono ${
-                isPositive
-                  ? 'text-emerald-400'
-                  : 'text-rose-400'
+                !Number.isFinite(selectedMarket.change24h)
+                  ? 'text-ink-3'
+                  : isPositive
+                    ? 'text-pos'
+                    : 'text-neg'
               }`}
             >
-              {isPositive ? '+' : ''}
-              {selectedMarket.change24h.toFixed(2)}%
+              {Number.isFinite(selectedMarket.change24h)
+                ? `${isPositive ? '+' : ''}${selectedMarket.change24h.toFixed(2)}%`
+                : '—'}
             </div>
           </div>
         </div>
 
         {/* Timeframe */}
-        <div className="px-3 py-2 border-b border-[#1e293b] flex items-center justify-between gap-1 overflow-x-auto bg-[#0a101d]">
+        <div className="px-3 py-2 border-b border-line flex items-center justify-between gap-1 overflow-x-auto bg-surface-2">
           <div className="flex items-center gap-1">
             {timeframes.map((tf) => (
               <button
@@ -297,8 +300,8 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
                 onClick={() => onTimeframeChange(tf)}
                 className={`px-2.5 py-1 rounded-lg text-xs font-mono font-medium transition-all ${
                   currentTimeframe === tf
-                    ? 'bg-sky-600 text-white font-bold'
-                    : 'text-slate-400 hover:text-white hover:bg-[#162032]'
+                    ? 'bg-accent-strong text-ink font-bold'
+                    : 'text-ink-3 hover:text-ink hover:bg-surface-3'
                 }`}
               >
                 {tf}
@@ -312,8 +315,8 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
             }
             className={`px-2 py-1 rounded-lg text-[11px] font-mono transition-colors border ${
               showIndicators
-                ? 'bg-sky-500/15 border-sky-500/40 text-sky-300'
-                : 'bg-[#111927] border-[#1e293b] text-slate-400'
+                ? 'bg-accent-soft border-accent/40 text-accent-ink'
+                : 'bg-surface-3 border-line text-ink-3'
             }`}
           >
             SMA {showIndicators ? 'ON' : 'OFF'}
@@ -321,7 +324,7 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
         </div>
 
         {/* Chart */}
-        <div className="w-full h-72 sm:h-96 relative border-b border-[#1e293b] bg-[#090d14]">
+        <div className="w-full h-72 sm:h-96 relative border-b border-line bg-bg-alt">
           <TradingChart
             symbol={selectedMarket.symbol}
             timeframe={currentTimeframe}
@@ -358,13 +361,13 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
                 }`}
               />
 
-              <span className="text-[11px] text-slate-400 font-medium">
+              <span className="text-[11px] text-ink-3 font-medium">
                 {formatQuoteAge(prices.timestamp)}
               </span>
             </div>
 
             {quote && (
-              <span className="text-[10px] text-slate-600 font-mono">
+              <span className="text-[10px] text-ink-4 font-mono">
                 {new Date(quote.timestamp).toLocaleTimeString()}
               </span>
             )}
@@ -372,12 +375,12 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
 
           {/* Real Bid / Ask */}
           <div className="grid grid-cols-2 gap-2 text-center">
-            <div className="p-3 rounded-xl bg-[#0e1726] border border-[#1e293b]">
-              <div className="text-[11px] text-slate-400 font-sans">
+            <div className="p-3 rounded-xl bg-surface-3 border border-line">
+              <div className="text-[11px] text-ink-3 font-sans">
                 BID
               </div>
 
-              <div className="text-lg font-bold font-mono text-white mt-0.5">
+              <div className="text-lg font-bold font-mono text-ink mt-0.5">
                 {formatPrice(
                   prices.bid,
                   selectedMarket.pricePrecision ?? 2
@@ -385,12 +388,12 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
               </div>
             </div>
 
-            <div className="p-3 rounded-xl bg-[#0e1726] border border-[#1e293b]">
-              <div className="text-[11px] text-slate-400 font-sans">
+            <div className="p-3 rounded-xl bg-surface-3 border border-line">
+              <div className="text-[11px] text-ink-3 font-sans">
                 ASK
               </div>
 
-              <div className="text-lg font-bold font-mono text-white mt-0.5">
+              <div className="text-lg font-bold font-mono text-ink mt-0.5">
                 {formatPrice(
                   prices.ask,
                   selectedMarket.pricePrecision ?? 2
@@ -402,12 +405,12 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
           {/* Quick Metrics */}
           <div className="grid grid-cols-3 gap-2 text-xs font-mono">
 
-            <div className="p-2.5 rounded-xl bg-[#0b1220] border border-[#1e293b]">
-              <span className="text-[10px] text-slate-400 block">
+            <div className="p-2.5 rounded-xl bg-surface border border-line">
+              <span className="text-[10px] text-ink-3 block">
                 Spread
               </span>
 
-              <span className="text-slate-200 font-semibold">
+              <span className="text-ink-2 font-semibold">
                 {formatSpread(
                   selectedMarket,
                   prices.spread
@@ -415,12 +418,12 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
               </span>
             </div>
 
-            <div className="p-2.5 rounded-xl bg-[#0b1220] border border-[#1e293b]">
-              <span className="text-[10px] text-slate-400 block">
+            <div className="p-2.5 rounded-xl bg-surface border border-line">
+              <span className="text-[10px] text-ink-3 block">
                 24h High
               </span>
 
-              <span className="text-slate-200 font-semibold">
+              <span className="text-ink-2 font-semibold">
                 {Number.isFinite(selectedMarket.high24h)
                   ? selectedMarket.high24h.toFixed(
                       selectedMarket.pricePrecision ?? 2
@@ -429,12 +432,12 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
               </span>
             </div>
 
-            <div className="p-2.5 rounded-xl bg-[#0b1220] border border-[#1e293b]">
-              <span className="text-[10px] text-slate-400 block">
+            <div className="p-2.5 rounded-xl bg-surface border border-line">
+              <span className="text-[10px] text-ink-3 block">
                 24h Low
               </span>
 
-              <span className="text-slate-200 font-semibold">
+              <span className="text-ink-2 font-semibold">
                 {Number.isFinite(selectedMarket.low24h)
                   ? selectedMarket.low24h.toFixed(
                       selectedMarket.pricePrecision ?? 2
@@ -446,15 +449,15 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
 
           {/* Active Positions */}
           {marketPositions.length > 0 && (
-            <div className="p-3 rounded-xl bg-sky-950/20 border border-sky-800/30">
-              <div className="text-xs font-semibold text-sky-400 mb-1">
+            <div className="p-3 rounded-xl bg-accent-soft border border-accent/30/30">
+              <div className="text-xs font-semibold text-accent mb-1">
                 {marketPositions.length}{' '}
                 Active Position
                 {marketPositions.length !== 1 ? 's' : ''}{' '}
                 on {selectedMarket.symbol}
               </div>
 
-              <div className="text-xs text-slate-300 font-mono">
+              <div className="text-xs text-ink-2 font-mono">
                 Total Unrealized:{' '}
                 <span
                   className={`font-bold ${
@@ -463,8 +466,8 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
                         sum + position.unrealizedPnL,
                       0
                     ) >= 0
-                      ? 'text-emerald-400'
-                      : 'text-rose-400'
+                      ? 'text-pos'
+                      : 'text-neg'
                   }`}
                 >
                   $
@@ -487,8 +490,8 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
               disabled={!quote}
               className={`w-full py-4 rounded-xl font-bold text-base transition-all shadow-xl active:scale-[0.98] flex items-center justify-center gap-2 ${
                 quote
-                  ? 'bg-sky-600 hover:bg-sky-500 text-white shadow-sky-950'
-                  : 'bg-slate-800 text-slate-500 cursor-not-allowed shadow-none'
+                  ? 'bg-accent-strong hover:bg-accent text-ink shadow-sky-950'
+                  : 'bg-surface-3 text-ink-4 cursor-not-allowed shadow-none'
               }`}
             >
               <Zap className="w-5 h-5 fill-current" />
@@ -502,9 +505,20 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
           </div>
         </div>
 
-        {/* Order Modal */}
+        {/*
+          Order Modal.
+
+          `quote` is not optional in practice. Without it the modal's
+          `canExecute` is permanently false and the submit button reads
+          "Waiting for Live Quote" forever, so no manual order could ever
+          be placed from the UI. The live quote is already in scope here,
+          so the ticket receives the same one the screen is displaying
+          rather than a value it has to re-fetch and possibly disagree
+          with.
+        */}
         <TradeOrderModal
           market={selectedMarket}
+          quote={quote}
           isOpen={showOrderModal}
           onClose={() => setShowOrderModal(false)}
           onExecuteOrder={onExecuteOrder}
@@ -522,7 +536,7 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
       {/* Search */}
       <div className="flex items-center gap-2">
         <div className="flex-1 relative">
-          <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+          <Search className="w-4 h-4 text-ink-3 absolute left-3.5 top-1/2 -translate-y-1/2" />
 
           <input
             type="text"
@@ -531,7 +545,7 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
               setSearchQuery(e.target.value)
             }
             placeholder="Search markets (e.g. EUR, Gold, JPY)..."
-            className="w-full bg-[#0c1322] border border-[#1e293b] rounded-xl pl-10 pr-4 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-sky-500"
+            className="w-full bg-surface border border-line rounded-xl pl-10 pr-4 py-2.5 text-xs text-ink placeholder-ink-4 focus:outline-none focus:border-accent"
           />
         </div>
 
@@ -541,8 +555,8 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
           }
           className={`p-2.5 rounded-xl border transition-all ${
             showFavoritesOnly
-              ? 'bg-amber-500/20 border-amber-500/50 text-amber-400'
-              : 'bg-[#0c1322] border-[#1e293b] text-slate-400 hover:text-white'
+              ? 'bg-amber-500/20 border-amber-500/50 text-warn'
+              : 'bg-surface border-line text-ink-3 hover:text-ink'
           }`}
           title="Filter Favorites"
         >
@@ -557,7 +571,7 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
       </div>
 
       {/* Header */}
-      <div className="flex items-center justify-between text-[11px] text-slate-400 px-2 font-medium">
+      <div className="flex items-center justify-between text-[11px] text-ink-3 px-2 font-medium">
         <span>Instrument</span>
 
         <div className="flex items-center gap-6">
@@ -582,7 +596,7 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
               {(index === 0 ||
                 filteredSymbols[index - 1]?.assetClass !==
                   item.assetClass) && (
-                <div className="pt-3 px-1 text-[11px] font-bold uppercase tracking-wider text-sky-300">
+                <div className="pt-3 px-1 text-[11px] font-bold uppercase tracking-wider text-accent-ink">
                   {item.assetClass || 'Markets'}
                 </div>
               )}
@@ -593,7 +607,7 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
                   setSelectedMarket(item);
                   onSelectSymbol(item.symbol);
                 }}
-                className="min-h-[64px] p-3.5 rounded-2xl bg-[#0b1220] border border-[#1e293b] hover:border-slate-600 active:scale-[0.99] transition-all cursor-pointer flex items-center justify-between shadow-xs select-none"
+                className="min-h-[64px] p-3.5 rounded-2xl bg-surface border border-line hover:border-line-strong active:scale-[0.99] transition-all cursor-pointer flex items-center justify-between shadow-xs select-none"
               >
 
                 {/* Left */}
@@ -603,29 +617,29 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
                     onClick={(e) =>
                       toggleFavorite(item.symbol, e)
                     }
-                    className="p-1 rounded-lg text-slate-600 hover:text-amber-400 transition-colors shrink-0"
+                    className="p-1 rounded-lg text-ink-4 hover:text-warn transition-colors shrink-0"
                   >
                     <Star
                       className={`w-4 h-4 ${
                         isFav
-                          ? 'fill-amber-400 text-amber-400'
-                          : 'text-slate-600'
+                          ? 'fill-amber-400 text-warn'
+                          : 'text-ink-4'
                       }`}
                     />
                   </button>
 
                   <div className="min-w-0">
-                    <div className="text-base font-bold text-white font-mono flex items-center gap-2">
+                    <div className="text-base font-bold text-ink font-mono flex items-center gap-2">
                       <span>{item.symbol}</span>
 
                       {quote && (
-                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 font-sans font-medium">
+                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-pos-soft border border-pos/40 text-pos font-sans font-medium">
                           LIVE
                         </span>
                       )}
                     </div>
 
-                    <div className="text-xs text-slate-400 truncate max-w-[140px] sm:max-w-none">
+                    <div className="text-xs text-ink-3 truncate max-w-[140px] sm:max-w-none">
                       {item.displayName}
                     </div>
                   </div>
@@ -636,8 +650,8 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
 
                   {/* Real Bid / Ask */}
                   <div className="text-right font-mono text-xs">
-                    <div className="text-slate-200 font-semibold flex items-center justify-end gap-1">
-                      <span className="text-[10px] text-slate-500 font-sans">
+                    <div className="text-ink-2 font-semibold flex items-center justify-end gap-1">
+                      <span className="text-[10px] text-ink-4 font-sans">
                         Bid
                       </span>
 
@@ -649,8 +663,8 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
                       </span>
                     </div>
 
-                    <div className="text-slate-400 text-[11px] flex items-center justify-end gap-1">
-                      <span className="text-[10px] text-slate-500 font-sans">
+                    <div className="text-ink-3 text-[11px] flex items-center justify-end gap-1">
+                      <span className="text-[10px] text-ink-4 font-sans">
                         Ask
                       </span>
 
@@ -666,9 +680,11 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
                   {/* 24h */}
                   <div
                     className={`min-w-[64px] text-center px-2 py-1.5 rounded-xl text-xs font-bold font-mono tracking-tight ${
-                      isPositive
-                        ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
-                        : 'bg-rose-500/15 text-rose-400 border border-rose-500/30'
+                      !Number.isFinite(item.change24h)
+                        ? 'bg-surface-2 text-ink-3 border border-line'
+                        : isPositive
+                          ? 'bg-pos-soft text-pos border border-pos/40'
+                          : 'bg-neg-strong/15 text-neg border border-neg/50/30'
                     }`}
                   >
                     {isPositive ? '+' : ''}
@@ -686,7 +702,7 @@ export const QuotesTab: React.FC<QuotesTabProps> = ({
         })}
 
         {filteredSymbols.length === 0 && (
-          <div className="p-8 text-center rounded-2xl bg-[#090f1a] border border-[#1e293b] text-slate-400 text-xs">
+          <div className="p-8 text-center rounded-2xl bg-surface-3 border border-line text-ink-3 text-xs">
             No instruments match "{searchQuery}".
           </div>
         )}

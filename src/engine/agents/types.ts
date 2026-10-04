@@ -39,6 +39,17 @@ export interface AgentPolicy {
   allowedSymbols: string[];      // e.g. ['EUR/USD']
   allowedSessions?: string[];    // e.g. ['LONDON', 'NEW_YORK', 'ASIAN', 'ALL']
   allowTrading: boolean;         // Master trading switch
+  /**
+   * Order types this deployment may ever submit, whatever `allowTrading`
+   * currently says.
+   *
+   * Carried separately from `allowTrading` for the same reason
+   * `allowTrading` is carried separately from the ability to research: a
+   * SHADOW deployment has both of these populated and `allowTrading: false`,
+   * and reporting "no order types" for it would misdescribe a deployment
+   * that is fully capable of proposing a plan and simulating it.
+   */
+  allowedOrderTypes?: Array<'MARKET' | 'LIMIT' | 'STOP'>;
 }
 
 /**
@@ -88,18 +99,69 @@ export interface AgentCapability<TInput = unknown, TOutput = unknown> {
  * The agent runtime reads them through this interface and never needs to
  * know which provider is behind it.
  */
+/**
+ * The non-price facts about a market, when the venue publishes them.
+ *
+ * Every field is optional and every miss carries a reason. A GOAT told
+ * "funding unavailable for this market" can plan around it; a GOAT told a
+ * plausible-looking zero cannot, and will happily build a thesis on a
+ * liquidity assumption that was never measured.
+ */
+export interface MarketFacts {
+  symbol: string;
+  /** Hourly funding rate as a fraction, e.g. 0.0000125 for 0.00125%/h. */
+  fundingRate?: number;
+  /** Annualised funding rate as a percentage, when derivable. */
+  fundingAnnualPercent?: number;
+  /** Venue-published funding interval in hours, usually 1. */
+  fundingIntervalHours?: number;
+  /** Open interest in the venue's own units. */
+  openInterest?: number;
+  /** 24h notional volume. */
+  dayVolume?: number;
+  /** Reference price used for funding and liquidation. */
+  markPrice?: number;
+  oraclePrice?: number;
+  /** 24h change as a percentage. */
+  change24hPercent?: number;
+  /** Why a requested fact is absent. Shown to the user, never invented over. */
+  unavailable?: string[];
+  /** What the venue actually published, for a reader who wants to check. */
+  source?: string;
+}
+
 export interface ITradingEnvironment {
   mode: TradingEnvironmentMode;
   getMarketQuote(symbol: string): Promise<NormalizedQuote>;
   getMarketBars(symbol: string, timeframe: string, count: number): Promise<Bar[]>;
   /** Canonical instrument metadata, when the environment can provide it. */
   getInstruments?(): Promise<InstrumentMetadata[]>;
+  /**
+   * What the venue publishes about a market beyond price and candles.
+   *
+   * Optional, and optional per field, on purpose. Funding, open interest and
+   * volume are the difference between a research agent and a price reader,
+   * and they are not available everywhere — a spot market has no funding, and
+   * some venues publish none of it. So the shape is a bag of optional facts
+   * and a reason when a fact is missing, rather than a fixed schema the agent
+   * has to pretend it filled in.
+   */
+  getMarketContext?(symbol: string): Promise<MarketFacts>;
+  /**
+   * The account snapshot.
+   *
+   * `dailyPnL` is realised plus unrealised profit and loss for the current
+   * trading day. It is not open P&L: a loss that has been closed must
+   * still count, or a daily-loss limit can never fire.
+   */
   getAccountState(): Promise<{
     balance: number;
     equity: number;
     margin: number;
     freeMargin: number;
     dailyPnL: number | null;
+    /** Realised-only component of `dailyPnL`, kept for diagnosis. */
+    realisedSessionPnL?: number;
     drawdownPercent: number | null;
   }>;
   getPositions(symbol?: string): Promise<Position[]>;
@@ -130,6 +192,26 @@ export interface AgentObservation {
     recentBars?: Bar[];
     spread?: number;
     session?: string;
+    /**
+     * The other resolutions this pass read.
+     *
+     * Context, setup and trigger are rarely the same resolution, and a GOAT
+     * that can only see one cannot check a 15m setup against the 1h structure
+     * it claims to agree with. Keyed by timeframe so the model can tell which
+     * reading is which rather than receiving a merged number it has to guess
+     * the resolution of.
+     */
+    timeframeReads?: Array<{
+      timeframe: string;
+      /** Context or setup: which job this reading was gathered for. */
+      role?: string;
+      candleCount?: number;
+      firstTime?: number;
+      lastTime?: number;
+      indicators?: Record<string, unknown>;
+      structure?: Record<string, unknown>;
+      limitations?: string[];
+    }>;
   };
   account: {
     balance: number;
@@ -205,6 +287,24 @@ export interface AgentActionValidationResult {
 /**
  * Agent Wake Condition Events
  */
+/**
+ * Every timeframe an agent may read or watch.
+ *
+ * One place, because the answer was previously spelled three different ways —
+ * the agent's single `timeframe`, its `timeframes`, and "any supported
+ * timeframe" — and the disagreement between them was the hard-coded 15m
+ * assumption. Prefer the declared set; fall back to the single resolution;
+ * fall back again to nothing, which callers read as unrestricted.
+ */
+export function agentTimeframes(agent: {
+  timeframes?: string[];
+  timeframe?: string;
+}): string[] {
+  if (agent.timeframes && agent.timeframes.length > 0) return [...agent.timeframes];
+  if (agent.timeframe) return [agent.timeframe];
+  return [];
+}
+
 export type AgentWakeEventType =
   | 'NEW_BAR'
   | 'PRICE_THRESHOLD'
@@ -217,15 +317,16 @@ export type AgentWakeEventType =
   | 'ORDER_REJECTED'
   | 'RISK_STATE_CHANGED'
   | 'TIMER_TICK'
-  | 'MANUAL_TRIGGER'
-  | 'TRIGGER_FIRED';
+  | 'MANUAL_WAKE'
+  | 'TRACKER_OBSERVED';
 
 export interface AgentWakeEvent {
   type: AgentWakeEventType;
   symbol?: string;
   data?: unknown;
   timestamp: number;
-  trigger?: unknown;
+  /** The tracker that woke the agent, when the wake came from one. */
+  tracker?: unknown;
 }
 
 /**
@@ -277,10 +378,25 @@ export interface TradingAgent {
   preferredEnvironment: TradingEnvironmentMode;
   symbols: string[];
   timeframe?: string;
+  /**
+   * Every timeframe this agent may read and watch, when it works across more
+   * than one.
+   *
+   * A single `timeframe` forced every analysis onto one resolution: a GOAT
+   * asked for a breakout could not read the 1h structure the breakout would
+   * have to agree with, and the registry rejected any tracker that named a
+   * different one. Timeframe choice is a reasoning decision — context,
+   * setup and trigger are usually not the same resolution — so it belongs to
+   * the agent's reasoning, with this as the menu it may choose from.
+   *
+   * `timeframe` remains the primary resolution, for prompts and for callers
+   * that want one.
+   */
+  timeframes?: string[];
   enabled: boolean;
   createdAt: number;
   updatedAt: number;
   ai?: { provider: 'openrouter'; model: string };
-  botId?: string;
+  goatId?: string;
   deploymentId?: string;
 }

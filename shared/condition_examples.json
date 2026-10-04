@@ -1,0 +1,700 @@
+{
+ "schemaVersion": 1,
+ "note": "Canonical condition trees and their expected three-state results. Run by `server/tests/test_contract.py` in Python and by `src/engine/conditions/conditionParity.ts` in the browser suite. A disagreement between the two is a bug in one language, not a preference.",
+ "contexts": {
+  "gold15mFlat": {
+   "symbol": "xyz:GOLD",
+   "series": {
+    "15m": "gold_15m_flat"
+   }
+  },
+  "gold15mDowntrend": {
+   "symbol": "xyz:GOLD",
+   "series": {
+    "15m": "gold_15m_downtrend"
+   }
+  },
+  "gold15mShort": {
+   "symbol": "xyz:GOLD",
+   "series": {
+    "15m": "gold_15m_short"
+   }
+  },
+  "gold15mUptrend": {
+   "symbol": "xyz:GOLD",
+   "series": {
+    "15m": "gold_15m_uptrend"
+   }
+  },
+  "gold15mSpike": {
+   "symbol": "xyz:GOLD",
+   "series": {
+    "15m": "gold_15m_spike"
+   }
+  },
+  "gold15mAndEur1h": {
+   "symbol": "xyz:GOLD",
+   "series": {
+    "15m": "gold_15m_flat",
+    "1h": "eur_1h_flat"
+   }
+  }
+ },
+ "examples": [
+  {
+   "id": "price-above",
+   "name": "Price is above a level",
+   "context": "gold15mFlat",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "Price above",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "AND",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "PRICE_LEVEL",
+       "timeframe": "15m",
+       "direction": "ABOVE",
+       "level": 2300
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "TRUE"
+   }
+  },
+  {
+   "id": "price-below",
+   "name": "Price is below a level",
+   "context": "gold15mFlat",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "Price below",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "AND",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "PRICE_LEVEL",
+       "timeframe": "15m",
+       "direction": "BELOW",
+       "level": 2300
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "FALSE"
+   }
+  },
+  {
+   "id": "rsi-oversold",
+   "name": "RSI is oversold",
+   "context": "gold15mDowntrend",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "RSI oversold",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "AND",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "INDICATOR_THRESHOLD",
+       "timeframe": "15m",
+       "indicator": "RSI",
+       "period": 14,
+       "operator": "LT",
+       "value": 50
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "TRUE"
+   }
+  },
+  {
+   "id": "rsi-warmup-unknown",
+   "name": "RSI without enough history is UNKNOWN",
+   "context": "gold15mShort",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "RSI needs warmup",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "AND",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "INDICATOR_THRESHOLD",
+       "timeframe": "15m",
+       "indicator": "RSI",
+       "period": 14,
+       "operator": "LT",
+       "value": 30
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "UNKNOWN"
+   }
+  },
+  {
+   "id": "and-group",
+   "name": "AND needs every child",
+   "context": "gold15mFlat",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "AND group",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "AND",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "PRICE_LEVEL",
+       "timeframe": "15m",
+       "direction": "ABOVE",
+       "level": 2300
+      },
+      {
+       "id": "c2",
+       "kind": "PRICE_LEVEL",
+       "timeframe": "15m",
+       "direction": "ABOVE",
+       "level": 2400
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "FALSE"
+   }
+  },
+  {
+   "id": "or-group",
+   "name": "OR needs only one child",
+   "context": "gold15mFlat",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "OR group",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "OR",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "PRICE_LEVEL",
+       "timeframe": "15m",
+       "direction": "ABOVE",
+       "level": 2400
+      },
+      {
+       "id": "c2",
+       "kind": "PRICE_LEVEL",
+       "timeframe": "15m",
+       "direction": "ABOVE",
+       "level": 2300
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "TRUE"
+   }
+  },
+  {
+   "id": "not-group",
+   "name": "NOT inverts a false child",
+   "context": "gold15mFlat",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "NOT group",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "NOT",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "PRICE_LEVEL",
+       "timeframe": "15m",
+       "direction": "ABOVE",
+       "level": 2400
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "TRUE"
+   }
+  },
+  {
+   "id": "nested-groups",
+   "name": "Nested groups resolve",
+   "context": "gold15mFlat",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "Nested",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "OR",
+     "children": [
+      {
+       "id": "g2",
+       "kind": "GROUP",
+       "operator": "AND",
+       "children": [
+        {
+         "id": "c1",
+         "kind": "PRICE_LEVEL",
+         "timeframe": "15m",
+         "direction": "ABOVE",
+         "level": 2400
+        },
+        {
+         "id": "c2",
+         "kind": "PRICE_LEVEL",
+         "timeframe": "15m",
+         "direction": "ABOVE",
+         "level": 2500
+        }
+       ]
+      },
+      {
+       "id": "g3",
+       "kind": "GROUP",
+       "operator": "AND",
+       "children": [
+        {
+         "id": "c3",
+         "kind": "PRICE_LEVEL",
+         "timeframe": "15m",
+         "direction": "ABOVE",
+         "level": 2300
+        },
+        {
+         "id": "c4",
+         "kind": "PRICE_LEVEL",
+         "timeframe": "15m",
+         "direction": "BELOW",
+         "level": 2500
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "TRUE"
+   }
+  },
+  {
+   "id": "unknown-blocks-and",
+   "name": "An UNKNOWN child makes AND UNKNOWN, never TRUE",
+   "context": "gold15mShort",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "Unknown blocks AND",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "AND",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "PRICE_LEVEL",
+       "timeframe": "15m",
+       "direction": "ABOVE",
+       "level": 1
+      },
+      {
+       "id": "c2",
+       "kind": "INDICATOR_THRESHOLD",
+       "timeframe": "15m",
+       "indicator": "RSI",
+       "period": 14,
+       "operator": "LT",
+       "value": 30
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "UNKNOWN"
+   }
+  },
+  {
+   "id": "math-distance",
+   "name": "ATR-normalised distance from an EMA",
+   "context": "gold15mFlat",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "Distance from EMA",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "AND",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "MATH_EXPR",
+       "timeframe": "15m",
+       "expression": "abs(close - EMA(50)) / ATR(14)",
+       "operator": "GT",
+       "value": 0
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "TRUE"
+   }
+  },
+  {
+   "id": "price-times-multiple",
+   "name": "Price is above an EMA scaled by a factor",
+   "context": "gold15mSpike",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "Price above scaled EMA",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "AND",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "MATH_EXPR",
+       "timeframe": "15m",
+       "expression": "close > EMA(20) * 1.01",
+       "operator": "EQ",
+       "value": 1
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "TRUE"
+   },
+   "note": "The spike fixture ends more than 1% above its own EMA(20), so the arithmetic is genuinely true rather than rounded into being true."
+  },
+  {
+   "id": "pattern-breakout",
+   "name": "Breakout is a boolean condition",
+   "context": "gold15mUptrend",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "Breakout",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "AND",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "PATTERN",
+       "timeframe": "15m",
+       "pattern": "BREAKOUT_ABOVE_HIGH",
+       "lookback": 20
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "TRUE"
+   }
+  },
+  {
+   "id": "price-action-wick",
+   "name": "Lower wick dominance",
+   "context": "gold15mDowntrend",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "Long lower wick",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "AND",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "PRICE_ACTION",
+       "timeframe": "15m",
+       "measure": "LOWER_WICK_PERCENT",
+       "operator": "GT",
+       "value": 0
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "TRUE"
+   }
+  },
+  {
+   "id": "indicator-compare",
+   "name": "Two indicators compared",
+   "context": "gold15mUptrend",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "EMA stack",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "AND",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "INDICATOR_COMPARE",
+       "timeframe": "15m",
+       "left": {
+        "indicator": "EMA",
+        "period": 20
+       },
+       "right": {
+        "indicator": "EMA",
+        "period": 50
+       },
+       "operator": "GT"
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "TRUE"
+   }
+  },
+  {
+   "id": "multi-timeframe",
+   "name": "15m RSI is above the same indicator on 1h",
+   "context": "gold15mAndEur1h",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "15m RSI leads 1h RSI",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "AND",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "INDICATOR_COMPARE",
+       "timeframe": "15m",
+       "operator": "GT",
+       "left": {
+        "indicator": "RSI",
+        "period": 14,
+        "timeframe": "15m"
+       },
+       "right": {
+        "indicator": "RSI",
+        "period": 14,
+        "timeframe": "1h"
+       }
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "TRUE"
+   },
+   "note": "Both timeframes are loaded, so the comparison resolves. Contrast with missing-timeframe-is-unknown."
+  },
+  {
+   "id": "missing-timeframe-is-unknown",
+   "name": "A timeframe that was not loaded is UNKNOWN, not FALSE",
+   "context": "gold15mFlat",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "Needs 1h, only 15m loaded",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "AND",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "INDICATOR_THRESHOLD",
+       "timeframe": "1h",
+       "indicator": "EMA",
+       "operator": "GT",
+       "value": 1000.0
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "UNKNOWN"
+   }
+  },
+  {
+   "id": "or-with-unknown-and-true-is-true",
+   "name": "A definite TRUE outranks UNKNOWN inside an OR",
+   "context": "gold15mSpike",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "One true branch is enough",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "OR",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "PRICE_LEVEL",
+       "timeframe": "15m",
+       "direction": "ABOVE",
+       "level": 100.0
+      },
+      {
+       "id": "c2",
+       "kind": "INDICATOR_THRESHOLD",
+       "timeframe": "1h",
+       "indicator": "EMA",
+       "operator": "GT",
+       "value": 999999.0
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "TRUE"
+   },
+   "note": "The 1h branch is UNKNOWN because 1h was not loaded, but the 15m branch is definitely true."
+  },
+  {
+   "id": "or-of-only-unknown-and-false-is-unknown",
+   "name": "UNKNOWN is not the same as FALSE inside an OR",
+   "context": "gold15mFlat",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "Nothing is true, one branch unknown",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "OR",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "PRICE_LEVEL",
+       "timeframe": "15m",
+       "direction": "ABOVE",
+       "level": 999999.0
+      },
+      {
+       "id": "c2",
+       "kind": "INDICATOR_THRESHOLD",
+       "timeframe": "1h",
+       "indicator": "EMA",
+       "operator": "GT",
+       "value": 1000.0
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "UNKNOWN"
+   },
+   "note": "Collapsing UNKNOWN to FALSE here would silently widen a bot's wake conditions."
+  },
+  {
+   "id": "disabled-leaf-does-not-affect-the-group",
+   "name": "Turning a condition off cannot turn a false bot on",
+   "context": "gold15mFlat",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "Disabled branch is skipped",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "AND",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "PRICE_LEVEL",
+       "timeframe": "15m",
+       "direction": "ABOVE",
+       "level": 100.0
+      },
+      {
+       "id": "c2",
+       "kind": "PRICE_LEVEL",
+       "timeframe": "15m",
+       "direction": "ABOVE",
+       "level": 999999.0,
+       "enabled": false
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "TRUE"
+   },
+   "note": "A disabled condition is not a FALSE condition. It is simply not part of the bot."
+  },
+  {
+   "id": "swing-pattern-on-an-oscillating-market",
+   "name": "A noisy market has measurable structure",
+   "context": "gold15mFlat",
+   "tree": {
+    "schemaVersion": 1,
+    "name": "Double bottom",
+    "then": "WAKE_AI",
+    "root": {
+     "id": "g1",
+     "kind": "GROUP",
+     "operator": "AND",
+     "children": [
+      {
+       "id": "c1",
+       "kind": "PATTERN",
+       "timeframe": "15m",
+       "pattern": "DOUBLE_BOTTOM",
+       "swingLookback": 2,
+       "tolerancePercent": 5.0,
+       "minSeparationBars": 2
+      }
+     ]
+    }
+   },
+   "expect": {
+    "status": "TRUE"
+   },
+   "note": "The fixture oscillates, so it has real swing points and the pattern resolves rather than reporting UNKNOWN."
+  }
+ ],
+ "contextNote": "A context names the committed OHLCV fixtures to load, per timeframe. Both the Python and the TypeScript suite build the identical context from this file, so neither side can quietly test against different data."
+}

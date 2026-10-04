@@ -1,0 +1,1514 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tradingvibe.app/schema/condition-tree/v1.json",
+  "title": "TradingVibe canonical condition tree",
+  "description": "The single condition language shared by the TradingVibe web app and the Python condition engine. There is exactly one condition model: the web app builds and displays it, the Python engine evaluates it. Neither side defines its own.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "then",
+    "root"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "const": 1,
+      "description": "Bumped only for a breaking change. The Python engine refuses any version it does not implement."
+    },
+    "name": {
+      "type": "string",
+      "maxLength": 120
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 500
+    },
+    "market": {
+      "type": "string",
+      "maxLength": 64,
+      "description": "Canonical app symbol. Resolved to a provider symbol server-side."
+    },
+    "enabled": {
+      "type": "boolean",
+      "description": "Pausing a tracker stops it being watched and stops it waking the AI. It is distinct from disabling a single condition, which removes that condition from the tree. Defaults to true."
+    },
+    "timeframe": {
+      "$ref": "#/$defs/timeframe"
+    },
+    "then": {
+      "const": "WAKE_AI",
+      "description": "The only permitted THEN. A condition tree wakes the AI. It never places, sizes, or approves an order. This is a closed enum on purpose."
+    },
+    "cooldownMs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 86400000
+    },
+    "minEvaluationIntervalMs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 86400000
+    },
+    "maxWakesPerHour": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 60
+    },
+    "maxWakesPerDay": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1440
+    },
+    "requireTradeableMarket": {
+      "type": "boolean"
+    },
+    "root": {
+      "$ref": "#/$defs/node"
+    }
+  },
+  "$defs": {
+    "timeframe": {
+      "type": "string",
+      "enum": [
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "4h",
+        "1d"
+      ]
+    },
+    "number": {
+      "type": "number",
+      "description": "Finite. NaN and Infinity are rejected by the engine, not silently coerced."
+    },
+    "indicator": {
+      "type": "string",
+      "enum": [
+        "SMA",
+        "EMA",
+        "WMA",
+        "VWAP",
+        "MACD",
+        "ADX",
+        "PLUS_DI",
+        "MINUS_DI",
+        "PSAR",
+        "RSI",
+        "STOCHASTIC",
+        "STOCHASTIC_K",
+        "WILLIAMS_R",
+        "ROC",
+        "MOMENTUM",
+        "ATR",
+        "BOLLINGER_UPPER",
+        "BOLLINGER_MIDDLE",
+        "BOLLINGER_LOWER",
+        "BOLLINGER_WIDTH",
+        "STDDEV",
+        "HISTORICAL_VOLATILITY",
+        "VOLUME_SMA",
+        "VOLUME_CHANGE",
+        "OBV",
+        "VOLUME_RATIO"
+      ]
+    },
+    "operator": {
+      "type": "string",
+      "enum": [
+        "GT",
+        "GTE",
+        "LT",
+        "LTE",
+        "EQ",
+        "NEQ",
+        "CROSS_ABOVE",
+        "CROSS_BELOW",
+        "RISING",
+        "FALLING"
+      ]
+    },
+    "direction": {
+      "type": "string",
+      "enum": [
+        "ABOVE",
+        "BELOW"
+      ]
+    },
+    "node": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/group"
+        },
+        {
+          "$ref": "#/$defs/priceLevel"
+        },
+        {
+          "$ref": "#/$defs/priceCross"
+        },
+        {
+          "$ref": "#/$defs/spread"
+        },
+        {
+          "$ref": "#/$defs/indicatorThreshold"
+        },
+        {
+          "$ref": "#/$defs/indicatorCompare"
+        },
+        {
+          "$ref": "#/$defs/momentumBand"
+        },
+        {
+          "$ref": "#/$defs/trendDirection"
+        },
+        {
+          "$ref": "#/$defs/adxStrength"
+        },
+        {
+          "$ref": "#/$defs/volatility"
+        },
+        {
+          "$ref": "#/$defs/volatilityCompare"
+        },
+        {
+          "$ref": "#/$defs/volume"
+        },
+        {
+          "$ref": "#/$defs/priceAction"
+        },
+        {
+          "$ref": "#/$defs/consecutive"
+        },
+        {
+          "$ref": "#/$defs/structure"
+        },
+        {
+          "$ref": "#/$defs/pattern"
+        },
+        {
+          "$ref": "#/$defs/mathExpr"
+        },
+        {
+          "$ref": "#/$defs/breakout"
+        },
+        {
+          "$ref": "#/$defs/time"
+        },
+        {
+          "$ref": "#/$defs/session"
+        },
+        {
+          "$ref": "#/$defs/proximity"
+        },
+        {
+          "$ref": "#/$defs/position"
+        },
+        {
+          "$ref": "#/$defs/account"
+        },
+        {
+          "$ref": "#/$defs/risk"
+        },
+        {
+          "$ref": "#/$defs/event"
+        }
+      ]
+    },
+    "group": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "operator",
+        "children"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "GROUP"
+        },
+        "operator": {
+          "type": "string",
+          "enum": [
+            "AND",
+            "OR",
+            "NOT"
+          ]
+        },
+        "children": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/node"
+          }
+        }
+      }
+    },
+    "priceLevel": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "direction",
+        "level"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "PRICE_LEVEL"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "direction": {
+          "$ref": "#/$defs/direction"
+        },
+        "level": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "priceCross": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "direction",
+        "level"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "PRICE_CROSS"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "direction": {
+          "$ref": "#/$defs/direction"
+        },
+        "level": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "indicatorThreshold": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "indicator",
+        "operator",
+        "value"
+      ],
+      "additionalProperties": false,
+      "description": "An indicator compared against a constant, e.g. RSI(14) < 30.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "INDICATOR_THRESHOLD"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "indicator": {
+          "$ref": "#/$defs/indicator"
+        },
+        "period": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "fastPeriod": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "slowPeriod": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "signalPeriod": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "component": {
+          "type": "string",
+          "enum": [
+            "macd",
+            "signal",
+            "histogram"
+          ]
+        },
+        "lengthDeviation": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 10
+        },
+        "stdDevMultiple": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 10
+        },
+        "lookback": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 1000
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        },
+        "value": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "indicatorCompare": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "left",
+        "operator",
+        "right"
+      ],
+      "additionalProperties": false,
+      "description": "Two indicators compared, e.g. EMA(20) crosses above EMA(50).",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "INDICATOR_COMPARE"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "left": {
+          "$ref": "#/$defs/indicatorSide"
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        },
+        "right": {
+          "$ref": "#/$defs/indicatorSide"
+        }
+      }
+    },
+    "indicatorSide": {
+      "type": "object",
+      "required": [
+        "indicator"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "indicator": {
+          "$ref": "#/$defs/indicator"
+        },
+        "period": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "fastPeriod": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "slowPeriod": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "signalPeriod": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "component": {
+          "type": "string",
+          "enum": [
+            "macd",
+            "signal",
+            "histogram"
+          ]
+        },
+        "lengthDeviation": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 10
+        },
+        "stdDevMultiple": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 10
+        },
+        "lookback": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 1000
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        }
+      }
+    },
+    "breakout": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "direction"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "BREAKOUT"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "direction": {
+          "$ref": "#/$defs/direction"
+        },
+        "lookbackBars": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 1000
+        },
+        "level": {
+          "$ref": "#/$defs/number"
+        },
+        "requireVolumeConfirmation": {
+          "type": "boolean"
+        },
+        "volumeMultiplier": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        }
+      }
+    },
+    "volatility": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "measure",
+        "operator",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "VOLATILITY"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "measure": {
+          "type": "string",
+          "enum": [
+            "ATR",
+            "STDDEV",
+            "HISTORICAL_VOLATILITY",
+            "BOLLINGER_WIDTH",
+            "RANGE"
+          ]
+        },
+        "period": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "lookback": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 1000
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        },
+        "value": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "spread": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "operator",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "SPREAD"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        },
+        "value": {
+          "$ref": "#/$defs/number"
+        },
+        "unit": {
+          "type": "string",
+          "enum": [
+            "PRICE",
+            "PERCENT"
+          ]
+        }
+      }
+    },
+    "proximity": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "level"
+      ],
+      "additionalProperties": false,
+      "description": "Distance from a position's protective or profit level. Pip and tick thresholds are only measured when the instrument's metadata declares that size.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "PROXIMITY"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "level": {
+          "type": "string",
+          "enum": [
+            "stopLoss",
+            "takeProfit"
+          ]
+        },
+        "withinPrice": {
+          "$ref": "#/$defs/number"
+        },
+        "withinPips": {
+          "$ref": "#/$defs/number"
+        },
+        "withinTicks": {
+          "$ref": "#/$defs/number"
+        },
+        "withinPercent": {
+          "$ref": "#/$defs/number"
+        },
+        "withinValue": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "priceAction": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "measure",
+        "operator",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "PRICE_ACTION"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "measure": {
+          "type": "string",
+          "enum": [
+            "BULLISH_CANDLE",
+            "BEARISH_CANDLE",
+            "BODY_PERCENT",
+            "BODY_SIZE",
+            "BODY_TO_RANGE",
+            "UPPER_WICK",
+            "LOWER_WICK",
+            "UPPER_WICK_PERCENT",
+            "LOWER_WICK_PERCENT",
+            "RANGE",
+            "CLOSE_POSITION",
+            "CONSECUTIVE_UP",
+            "CONSECUTIVE_DOWN",
+            "HIGHER_HIGH",
+            "LOWER_HIGH",
+            "HIGHER_LOW",
+            "LOWER_LOW",
+            "HIGHER_CLOSE",
+            "LOWER_CLOSE",
+            "DISTANCE_FROM_HIGH",
+            "DISTANCE_FROM_LOW",
+            "DISTANCE_FROM_SMA",
+            "DISTANCE_FROM_EMA",
+            "PERCENT_CHANGE",
+            "ABSOLUTE_CHANGE",
+            "TRUE_RANGE"
+          ]
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200
+        },
+        "period": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "lookback": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 1000
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        },
+        "value": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "pattern": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "pattern"
+      ],
+      "additionalProperties": false,
+      "description": "Deterministic chart patterns. Each has a documented detection rule; none relies on visual judgement.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "PATTERN"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "pattern": {
+          "type": "string",
+          "enum": [
+            "BREAKOUT_ABOVE_HIGH",
+            "BREAKOUT_BELOW_LOW",
+            "SUPPORT_TEST",
+            "RESISTANCE_TEST",
+            "DOUBLE_TOP",
+            "DOUBLE_BOTTOM",
+            "HIGHER_HIGH_HIGHER_LOW",
+            "LOWER_HIGH_LOWER_LOW",
+            "TRIANGLE",
+            "CHANNEL_UP",
+            "CHANNEL_DOWN",
+            "VOLATILITY_CONTRACTION",
+            "SWING_HIGH",
+            "SWING_LOW"
+          ]
+        },
+        "lookback": {
+          "type": "integer",
+          "minimum": 3,
+          "maximum": 500
+        },
+        "tolerancePercent": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 20
+        },
+        "minSeparationBars": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200
+        },
+        "swingLookback": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 100
+        },
+        "volumeMultiplier": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        }
+      }
+    },
+    "mathExpr": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "expression",
+        "operator",
+        "value"
+      ],
+      "additionalProperties": false,
+      "description": "A bounded mathematical expression over whitelisted operands. The expression is parsed into a whitelisted AST by the engine; it is never evaluated as Python source.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "MATH_EXPR"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "expression": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        },
+        "value": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "time": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "measure",
+        "operator"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "TIME"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "measure": {
+          "type": "string",
+          "enum": [
+            "HOUR_OF_DAY",
+            "DAY_OF_WEEK",
+            "BARS_SINCE_SESSION_OPEN",
+            "MINUTES_INTO_BAR"
+          ]
+        },
+        "timezone": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        },
+        "value": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "session": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "boundary"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "SESSION"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "boundary": {
+          "type": "string",
+          "enum": [
+            "START",
+            "END",
+            "WITHIN"
+          ]
+        },
+        "sessionId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "timezone": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "startsAtMinute": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1439
+        },
+        "endsAtMinute": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1440
+        }
+      }
+    },
+    "position": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "measure",
+        "operator"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "POSITION"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "measure": {
+          "type": "string",
+          "enum": [
+            "HAS_POSITION",
+            "POSITION_COUNT",
+            "PNL",
+            "PNL_PERCENT",
+            "DISTANCE_TO_STOP",
+            "DISTANCE_TO_TARGET",
+            "SIZE",
+            "HELD_BARS"
+          ]
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        },
+        "value": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "account": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "measure",
+        "operator"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "ACCOUNT"
+        },
+        "measure": {
+          "type": "string",
+          "enum": [
+            "EQUITY",
+            "BALANCE",
+            "FREE_MARGIN",
+            "MARGIN_USED",
+            "MARGIN_RATIO",
+            "EXPOSURE",
+            "EXPOSURE_RATIO"
+          ]
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        },
+        "value": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "measure",
+        "operator"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "RISK"
+        },
+        "measure": {
+          "type": "string",
+          "enum": [
+            "DRAWDOWN_PERCENT",
+            "DAILY_LOSS",
+            "KILL_SWITCH",
+            "EXPOSURE_LIMIT_RATIO",
+            "ORDERS_LAST_MINUTE",
+            "STATE"
+          ]
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        },
+        "value": {
+          "$ref": "#/$defs/number"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "NORMAL",
+            "DRAWDOWN_GUARD",
+            "EXPOSURE_LIMITED",
+            "KILL_SWITCH"
+          ]
+        }
+      }
+    },
+    "event": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "event"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "EVENT"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "event": {
+          "type": "string",
+          "enum": [
+            "POSITION_OPENED",
+            "POSITION_CLOSED",
+            "POSITION_UPDATED",
+            "ORDER_FILLED",
+            "NEW_BAR"
+          ]
+        }
+      }
+    },
+    "momentumBand": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "oscillator",
+        "lower",
+        "upper"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "MOMENTUM_BAND"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "oscillator": {
+          "$ref": "#/$defs/indicator"
+        },
+        "period": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "lower": {
+          "$ref": "#/$defs/number"
+        },
+        "upper": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "trendDirection": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "operator"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "TREND_DIRECTION"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "indicator": {
+          "$ref": "#/$defs/indicator"
+        },
+        "period": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "lookback": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        }
+      }
+    },
+    "adxStrength": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "operator",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "ADX_STRENGTH"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "period": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        },
+        "value": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "volatilityCompare": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "fast",
+        "slow",
+        "operator"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "VOLATILITY_COMPARE"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "fast": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "slow": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        }
+      }
+    },
+    "volume": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "measure",
+        "operator",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "VOLUME"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "measure": {
+          "type": "string",
+          "enum": [
+            "VOLUME_SMA",
+            "VOLUME_CHANGE",
+            "VOLUME_RATIO"
+          ]
+        },
+        "period": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        },
+        "value": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "consecutive": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "direction",
+        "count"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "CONSECUTIVE"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "UP",
+            "DOWN"
+          ]
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        }
+      }
+    },
+    "structure": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "structure",
+        "operator"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "STRUCTURE"
+        },
+        "timeframe": {
+          "$ref": "#/$defs/timeframe"
+        },
+        "structure": {
+          "type": "string",
+          "enum": [
+            "UPTREND",
+            "DOWNTREND"
+          ]
+        },
+        "lookback": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 100
+        },
+        "operator": {
+          "$ref": "#/$defs/operator"
+        }
+      }
+    }
+  }
+}

@@ -1,6 +1,14 @@
 import { eventBus } from '../../types/events';
 import { Bar, Quote, Timeframe } from '../../types/trading';
+import type { MarketFacts } from '../../engine/agents/types';
 import { MarketDataProvider } from '../marketData';
+import {
+  configuredVenue,
+  parseVenueEnvironment,
+  venueFor,
+  type Venue,
+  type VenueEnvironment,
+} from '../../config/venue';
 import { fromHyperliquidCandle, normalizeSymbol, quoteFromBook, toHyperliquidInterval, classifyAsset, instrumentMetadata, marketAvailability, marketSymbol, tradingInstrument, uniqueSymbolLabels } from './normalizer';
 import {
   AssetClass,
@@ -10,8 +18,37 @@ import {
   TradingInstrument,
 } from '../../types/instruments';
 
-type StatusListener = (status: 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'RECONNECTING' | 'ERROR') => void;
-type HyperliquidNetwork = 'mainnet' | 'testnet';
+/**
+ * What the venue connection is doing.
+ *
+ * `STALE` is the important one. A socket can be open and receiving
+ * nothing, and a UI that only distinguishes connected from disconnected
+ * will happily keep showing a last-known price as though it were live.
+ * Staleness is a state, not an absence, precisely so it can be shown.
+ */
+export type MarketDataStatus =
+  | 'DISCONNECTED'
+  | 'CONNECTING'
+  | 'CONNECTED'
+  | 'RECONNECTING'
+  | 'STALE'
+  | 'ERROR';
+
+type StatusListener = (status: MarketDataStatus) => void;
+
+/**
+ * How long a connection may be silent before it is called stale.
+ *
+ * Well inside any interval the venue publishes on for the markets this
+ * product trades, and well outside a normal network hiccup. A quote
+ * older than this is not shown as a current price.
+ */
+export const STALE_AFTER_MS = 30_000;
+
+/** Reconnect backoff. Bounded, because a silent infinite retry is a hang. */
+export const RECONNECT_BASE_MS = 500;
+export const RECONNECT_MAX_MS = 15_000;
+const MAX_RECONNECT_ATTEMPTS = 8;
 
 /**
  * Info-endpoint transport.
@@ -21,19 +58,42 @@ type HyperliquidNetwork = 'mainnet' | 'testnet';
  * without a network round trip. Production always uses the live
  * transport.
  */
+/**
+ * How long a published funding figure is treated as current.
+ *
+ * Hyperliquid funds hourly, so a minute is well inside the window in which
+ * the number is still the number.
+ */
+const CONTEXT_TTL_MS = 60_000;
+
 export interface HyperliquidTransport {
   request(body: Record<string, unknown>): Promise<unknown>;
 }
 
 export interface HyperliquidCandle { t: number; T: number; s: string; i: string; o: string; c: string; h: string; l: string; v: string; n: number }
 interface HyperliquidAsset { name: string; szDecimals: number; isDelisted?: boolean; maxLeverage?: number; }
-interface HyperliquidAssetCtx { midPx?: string; markPx?: string; oraclePx?: string; prevDayPx?: string; }
+/*
+ * The per-asset context the venue publishes.
+ *
+ * `funding`, `openInterest` and `dayNtlVlm` are the non-price facts that
+ * decide whether a move has anything behind it. They are all optional here
+ * because the venue omits them for assets that do not have them, and that
+ * omission is a real answer rather than a missing feature: a spot index has
+ * no funding, and reporting one would be inventing it.
+ */
+interface HyperliquidAssetCtx {
+  midPx?: string;
+  markPx?: string;
+  oraclePx?: string;
+  prevDayPx?: string;
+  funding?: string;
+  openInterest?: string;
+  dayNtlVlm?: string;
+}
 interface HyperliquidDex { name: string; fullName?: string; }
 
 export class HyperliquidMarketDataAdapter implements MarketDataProvider {
-  private restUrl: string;
-  private wsUrl: string;
-  private network: HyperliquidNetwork;
+  private venue: Venue;
   private socket?: WebSocket;
   private connected = false;
   private statusListeners = new Set<StatusListener>();
@@ -43,21 +103,51 @@ export class HyperliquidMarketDataAdapter implements MarketDataProvider {
   private lastBars = new Map<string, Bar>();
   private subscriptions = new Map<string, Record<string, unknown>>();
   private instruments?: TradingInstrument[];
+  /**
+   * The last venue context row, held briefly.
+   *
+   * Funding is quoted on a schedule and this is read per reasoning step, so a
+   * short memo keeps a burst of reads from turning into a burst of round
+   * trips without making the answer stale enough to mislead.
+   */
+  private contextCache?: { coin: string; at: number; ctx: HyperliquidAssetCtx | undefined };
   private instrumentByProviderSymbol = new Map<string, TradingInstrument>();
   private discoveryPromise?: Promise<TradingInstrument[]>;
+  /** Wall clock of the last message the venue actually sent us. */
+  private lastMessageAt?: number;
+  /** Last venue sequence accepted per (market, timeframe). */
+  private lastSequence = new Map<string, number>();
+  /** Last venue close timestamp accepted per (market, timeframe). */
+  private lastCandleTime = new Map<string, number>();
+  private reconnectAttempts = 0;
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
+  /** Set when the caller asked to disconnect, so a close is not retried. */
+  private closingIntentionally = false;
+  /**
+   * Incremented by every deliberate disconnect.
+   *
+   * A deliberate disconnect has to invalidate an attempt that is *already
+   * in flight*, not just one that has not been scheduled yet. Without a
+   * token, a connect that was awaiting its socket when `disconnect()`
+   * landed still completes, and the user is left with a socket they
+   * asked to close — plus a status change they did not cause. Every
+   * callback captured by an attempt carries the token it started with and
+   * does nothing if it is stale, which makes "this attempt is over" a
+   * checkable fact rather than a hope about ordering.
+   */
+  private connectionEpoch = 0;
 
   constructor(
-    network: HyperliquidNetwork = (import.meta.env.VITE_HYPERLIQUID_NETWORK === 'testnet' ? 'testnet' : 'mainnet'),
+    environment: VenueEnvironment = configuredVenue().environment,
     private readonly transport: HyperliquidTransport = {
       request: async (body: Record<string, unknown>) => {
-        const response = await fetch(
-          `https://${network === 'mainnet' ? 'api.hyperliquid.xyz' : 'api.hyperliquid-testnet.xyz'}/info`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          },
-        );
+        // The URL comes from the resolved venue, so a caller cannot hand
+        // this transport a host that belongs to the other environment.
+        const response = await fetch(venueFor(environment).restInfoUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
 
         if (!response.ok) {
           throw new Error(
@@ -69,17 +159,40 @@ export class HyperliquidMarketDataAdapter implements MarketDataProvider {
       },
     },
   ) {
-    this.network = network;
-    const host = network === 'mainnet' ? 'api.hyperliquid.xyz' : 'api.hyperliquid-testnet.xyz';
-    this.restUrl = `https://${host}/info`; this.wsUrl = `wss://${host}/ws`;
+    this.venue = venueFor(environment);
   }
 
-  async setNetwork(network: HyperliquidNetwork): Promise<void> {
-    if (network === this.network) return;
-    await this.disconnect(); this.network = network;
-    const host = network === 'mainnet' ? 'api.hyperliquid.xyz' : 'api.hyperliquid-testnet.xyz';
-    this.restUrl = `https://${host}/info`; this.wsUrl = `wss://${host}/ws`;
-    this.instruments = undefined; this.discoveryPromise = undefined; this.instrumentByProviderSymbol.clear();
+  /**
+   * Move to the other environment.
+   *
+   * The whole point of it being one method rather than a field: every
+   * piece of environment-derived state is dropped together — the socket,
+   * the subscriptions' venue binding, the discovery memo and the sequence
+   * memories — so a client cannot come back from a network switch
+   * carrying candles from the venue it left.
+   */
+  async setEnvironment(environment: VenueEnvironment): Promise<void> {
+    if (environment === this.venue.environment) return;
+    await this.disconnect();
+    this.venue = venueFor(environment);
+    this.instruments = undefined;
+    this.discoveryPromise = undefined;
+    this.instrumentByProviderSymbol.clear();
+    this.lastSequence.clear();
+    this.lastCandleTime.clear();
+    this.lastQuotes.clear();
+    this.lastBars.clear();
+    this.lastMessageAt = undefined;
+  }
+
+  /** The environment this client is bound to. Never inferred by a caller. */
+  get environment(): VenueEnvironment {
+    return this.venue.environment;
+  }
+
+  /** The live venue, for diagnostics and the audit trail. */
+  get venueConfig(): Venue {
+    return this.venue;
   }
 
   /**
@@ -90,6 +203,109 @@ export class HyperliquidMarketDataAdapter implements MarketDataProvider {
    * an invented value; it is still reachable through
    * {@link getMarketStatus}.
    */
+  /**
+   * What the venue publishes about a market beyond price and candles.
+   *
+   * Reads the same `metaAndAssetCtxs` payload the instrument discovery
+   * already fetches, memoised for the short window in which it stays true,
+   * because funding changes on a schedule and this is called per reasoning
+   * step rather than per tick.
+   *
+   * A field the venue does not publish is reported in `unavailable` with a
+   * reason. It is never filled in with a zero: a GOAT told funding is zero
+   * concludes funding is neutral, and a GOAT told there is no funding on this
+   * market plans around that. Those are different claims and only one is true.
+   */
+  async getMarketContext(symbol: string): Promise<MarketFacts> {
+    const unavailable: string[] = [];
+
+    if (!this.instruments && !normalizeSymbol(symbol).includes(':')) await this.getInstruments();
+    /*
+     * Resolved through the adapter's own symbol matching rather than a second,
+     * weaker version of it. The first attempt here compared the raw symbol and
+     * a `providerSymbol` suffix, which matched nothing: the app's canonical
+     * form is `EURUSD` while this venue publishes `EUR/USD` as `xyz:EUR`, so
+     * every instrument came back "not a market this venue serves" and the
+     * feature reported itself unavailable while being perfectly capable.
+     */
+    const found = this.findDiscovered(this.instruments, symbol);
+    const coin = found
+      ? found.providerSymbol.split(':').pop() ?? found.providerSymbol
+      : normalizeSymbol(symbol);
+
+    const now = Date.now();
+    if (this.contextCache && this.contextCache.coin === coin && now - this.contextCache.at < CONTEXT_TTL_MS) {
+      return this.readContext(symbol, coin, this.contextCache.ctx, unavailable);
+    }
+
+    if (!found) {
+      return {
+        symbol,
+        unavailable: [`${symbol} is not a market this venue serves.`],
+        source: 'hyperliquid:metaAndAssetCtxs',
+      };
+    }
+
+    /*
+     * Read from discovery's own snapshot.
+     *
+     * This used to issue its own `metaAndAssetCtxs` with no `dex`, which
+     * returns only the default dex — the perp universe, containing BTC and
+     * ETH. Every instrument this product actually trades lives on a HIP-3
+     * namespace, and those universes list their assets fully qualified
+     * (`xyz:EUR`). So the lookup matched nothing and every symbol came back
+     * "the venue published no context row". Reusing the rows discovery already
+     * paid for fixes both mistakes at once.
+     */
+    const context = this.contextByProviderSymbol.get(found.providerSymbol.toLowerCase())
+      ?? this.contextByProviderSymbol.get(found.providerSymbol);
+    this.contextCache = { coin, at: now, ctx: context };
+    return this.readContext(symbol, coin, context, unavailable);
+  }
+
+  /** Turn one venue context row into the facts a GOAT may reason over. */
+  private readContext(
+    symbol: string,
+    coin: string,
+    context: HyperliquidAssetCtx | undefined,
+    unavailable: string[],
+  ): MarketFacts {
+    if (!context) {
+      return {
+        symbol,
+        unavailable: [`The venue published no context row for ${symbol}.`],
+        source: 'hyperliquid:metaAndAssetCtxs',
+      };
+    }
+
+    const number = (value: string | undefined): number | undefined => {
+      if (value === undefined) return undefined;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : undefined;
+    };
+
+    const funding = number(context.funding);
+    const mark = number(context.markPx);
+    const previous = number(context.prevDayPx);
+    if (funding === undefined) {
+      unavailable.push(`No funding rate is published for ${symbol}.`);
+    }
+
+    return {
+      symbol,
+      ...(funding !== undefined ? { fundingRate: funding, fundingIntervalHours: 1 } : {}),
+      ...(number(context.openInterest) !== undefined ? { openInterest: number(context.openInterest) } : {}),
+      ...(number(context.dayNtlVlm) !== undefined ? { dayVolume: number(context.dayNtlVlm) } : {}),
+      ...(mark !== undefined ? { markPrice: mark } : {}),
+      ...(number(context.oraclePx) !== undefined ? { oraclePrice: number(context.oraclePx) } : {}),
+      ...(mark !== undefined && previous !== undefined && previous !== 0
+        ? { change24hPercent: ((mark - previous) / previous) * 100 }
+        : {}),
+      ...(unavailable.length > 0 ? { unavailable } : {}),
+      source: 'hyperliquid:metaAndAssetCtxs',
+    };
+  }
+
   async getInstruments(assetClasses: AssetClass[] = ['FOREX', 'COMMODITY', 'INDEX']): Promise<TradingInstrument[]> {
     const discovered = await this.discoverOnce();
 
@@ -140,14 +356,59 @@ export class HyperliquidMarketDataAdapter implements MarketDataProvider {
         };
   }
 
+  /**
+   * Memoised discovery, retried after a failure.
+   *
+   * The in-flight promise is shared so concurrent callers make one request
+   * rather than a stampede. It is cleared on rejection, because a cached
+   * rejected promise is permanent: one offline blip or one 429 left the
+   * app with no instruments, no quotes, and no orders for the rest of the
+   * session, with no way back short of a page reload.
+   */
   private async discoverOnce(): Promise<TradingInstrument[]> {
     if (this.instruments) return this.instruments;
-    if (!this.discoveryPromise) this.discoveryPromise = this.discoverInstruments();
+    if (!this.discoveryPromise) {
+      const attempt = this.discoverInstruments();
+      this.discoveryPromise = attempt;
+      // Clearing on failure means the next caller retries. Clearing on
+      // success is unnecessary (`this.instruments` short-circuits) but
+      // keeps the memo from holding a large array alive twice.
+      attempt.catch(() => {
+        if (this.discoveryPromise === attempt) this.discoveryPromise = undefined;
+      });
+    }
     return this.discoveryPromise;
   }
 
   onStatusChange(listener: StatusListener): () => void { this.statusListeners.add(listener); return () => this.statusListeners.delete(listener); }
-  getConnectionState() { return { isConnected: this.connected, environment: 'DEMO', pingMs: 0 }; }
+
+  /**
+   * What the connection is doing, honestly.
+   *
+   * `isConnected` alone is a lie in the case that matters: a socket that
+   * opened and then went quiet is open, connected, and not receiving
+   * anything. So the state is derived from the last message as well as
+   * the socket, and `STALE` is reported for the window where a price on
+   * screen is a price from the past.
+   */
+  getConnectionState() {
+    const lastMessageAt = this.lastMessageAt;
+    const stale =
+      this.connected &&
+      lastMessageAt !== undefined &&
+      Date.now() - lastMessageAt > STALE_AFTER_MS;
+    return {
+      isConnected: this.connected,
+      /** True when the venue has sent nothing for longer than it should. */
+      isStale: Boolean(stale),
+      environment: this.venue.environment,
+      venue: this.venue.host,
+      lastMessageAt,
+      /** Milliseconds since the last venue message, or undefined if none. */
+      silenceMs: lastMessageAt === undefined ? undefined : Date.now() - lastMessageAt,
+      reconnectAttempts: this.reconnectAttempts,
+    };
+  }
 
   /** Feeds a captured provider candle through the production normalization/event path. */
   ingestCandleFixture(candle: HyperliquidCandle): void { this.handleMessage(JSON.stringify({ channel: 'candle', data: candle })); }
@@ -156,19 +417,95 @@ export class HyperliquidMarketDataAdapter implements MarketDataProvider {
 
   async connect(): Promise<void> {
     if (this.connected || (this.socket && this.socket.readyState === WebSocket.CONNECTING) || typeof WebSocket === 'undefined') return;
+    this.closingIntentionally = false;
+    const epoch = this.connectionEpoch;
     this.emitStatus('CONNECTING');
     await new Promise<void>((resolve) => {
-      const socket = new WebSocket(this.wsUrl);
+      const socket = new WebSocket(this.venue.websocketUrl);
       this.socket = socket;
-      const timeout = setTimeout(() => { if (!this.connected) { socket.close(); this.emitStatus('ERROR'); } resolve(); }, 5000);
-      socket.onopen = () => { clearTimeout(timeout); this.connected = true; this.emitStatus('CONNECTED'); this.resubscribe(); resolve(); };
-      socket.onmessage = (message) => this.handleMessage(message.data);
-      socket.onerror = () => { if (!this.connected) this.emitStatus('ERROR'); };
-      socket.onclose = () => { this.connected = false; this.emitStatus('DISCONNECTED'); };
+      const timeout = setTimeout(() => {
+        // A deliberate disconnect during the handshake makes this timer
+        // irrelevant. Without the epoch check it would fire later and
+        // report an error for a connection the user closed on purpose.
+        if (epoch !== this.connectionEpoch) return;
+        if (!this.connected) { socket.close(); this.emitStatus('ERROR'); }
+        resolve();
+      }, 5000);
+      socket.onopen = () => {
+        clearTimeout(timeout);
+        if (epoch !== this.connectionEpoch) { socket.close(); resolve(); return; }
+        this.connected = true;
+        this.reconnectAttempts = 0;
+        this.lastMessageAt = Date.now();
+        this.emitStatus('CONNECTED');
+        // A reconnect that forgets its subscriptions is a reconnect that
+        // silently stops delivering quotes, which looks identical to a
+        // quiet market.
+        this.resubscribe();
+        resolve();
+      };
+      socket.onmessage = (message) => {
+        // A socket from a superseded attempt must not deliver into the
+        // current one. Two live sockets interleaving messages is how a
+        // chart ends up with bars from two environments on it.
+        if (epoch !== this.connectionEpoch) return;
+        this.handleMessage(message.data);
+      };
+      socket.onerror = () => { if (epoch === this.connectionEpoch && !this.connected) this.emitStatus('ERROR'); };
+      socket.onclose = () => {
+        // A superseded attempt's socket is not the current connection,
+        // so its close is not a disconnect worth reporting.
+        if (epoch !== this.connectionEpoch) return;
+        this.connected = false;
+        this.socket = undefined;
+        if (this.closingIntentionally) {
+          this.emitStatus('DISCONNECTED');
+          return;
+        }
+        this.scheduleReconnect();
+      };
     });
   }
 
-  async disconnect(): Promise<void> { this.socket?.close(); this.socket = undefined; this.connected = false; this.emitStatus('DISCONNECTED'); }
+  /**
+   * Reconnect with bounded backoff.
+   *
+   * Bounded on purpose. A venue that is down should present as down; an
+   * unbounded retry loop presents as "connecting" forever, which is a
+   * state a user cannot act on and a developer cannot diagnose.
+   */
+  private scheduleReconnect(): void {
+    if (this.closingIntentionally) return;
+    if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      this.emitStatus('ERROR');
+      return;
+    }
+    this.reconnectAttempts += 1;
+    this.emitStatus('RECONNECTING');
+    const delay = Math.min(RECONNECT_BASE_MS * 2 ** (this.reconnectAttempts - 1), RECONNECT_MAX_MS);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      void this.connect();
+    }, delay);
+  }
+
+  async disconnect(): Promise<void> {
+    this.closingIntentionally = true;
+    // Invalidate any attempt in flight before touching the socket, so its
+    // callbacks are already stale by the time `close()` runs them.
+    this.connectionEpoch += 1;
+    if (this.reconnectTimer !== undefined) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+    this.reconnectAttempts = 0;
+    const socket = this.socket;
+    this.socket = undefined;
+    this.connected = false;
+    this.lastMessageAt = undefined;
+    this.emitStatus('DISCONNECTED');
+    socket?.close();
+  }
 
   async getQuote(symbol: string): Promise<Quote> {
     if (!this.instruments && !normalizeSymbol(symbol).includes(':')) await this.getInstruments();
@@ -227,8 +564,27 @@ export class HyperliquidMarketDataAdapter implements MarketDataProvider {
     return this.transport.request(body);
   }
 
+  /**
+   * One venue message, guarded.
+   *
+   * Three things happen here that did not happen before, and all three
+   * exist because a websocket is not a stream in order:
+   *
+   *  - **Staleness is published.** Every accepted message restarts the
+   *    silence clock, so the connection state can be honest about a feed
+   *    that has gone quiet while the socket is still open.
+   *  - **Duplicates and reordering are refused.** The venue sends a
+   *    per-candle sequence and a close timestamp; a message that is not
+   *    newer than the last accepted one for that market and timeframe is
+   *    dropped rather than normalised into a bar update. Without this a
+   *    reconnect that replays its tail moves the chart backwards.
+   *  - **Nothing is invented.** A message that does not parse, or that
+   *    carries no usable price, produces no event at all rather than a
+   *    plausible one.
+   */
   private handleMessage(raw: string): void {
     let message: { channel?: string; data?: unknown }; try { message = JSON.parse(raw); } catch { return; }
+    this.lastMessageAt = Date.now();
     if (message.channel === 'l2Book') {
       const data = message.data as { coin?: string; levels?: Array<Array<{ px: string }>> };
       const providerSymbol = normalizeSymbol(data.coin || ''); const bid = Number(data.levels?.[0]?.[0]?.px); const ask = Number(data.levels?.[1]?.[0]?.px);
@@ -236,11 +592,64 @@ export class HyperliquidMarketDataAdapter implements MarketDataProvider {
       const symbol = this.resolveDisplaySymbol(providerSymbol); const quote = quoteFromBook(symbol, bid, ask); this.lastQuotes.set(providerSymbol, quote); this.quoteSubscribers.get(providerSymbol)?.forEach((callback) => callback(quote)); eventBus.emit({ type: 'MARKET_QUOTE', data: quote });
     }
     if (message.channel === 'candle') {
-      const rawCandle = message.data as HyperliquidCandle; const providerSymbol = normalizeSymbol(rawCandle.s); const bar = fromHyperliquidCandle(rawCandle); const key = `${providerSymbol}:${rawCandle.i}`;
-      const isClosed = Date.now() >= rawCandle.T; this.lastBars.set(key, bar); this.barSubscribers.get(key)?.forEach((callback) => callback(bar, isClosed));
+      const rawCandle = message.data as HyperliquidCandle;
+      if (!rawCandle || typeof rawCandle.s !== 'string' || typeof rawCandle.i !== 'string') return;
+      const providerSymbol = normalizeSymbol(rawCandle.s);
+      if (!providerSymbol) return;
+      const key = `${providerSymbol}:${rawCandle.i}`;
+
+      if (!this.acceptCandle(key, rawCandle)) return;
+
+      const bar = fromHyperliquidCandle(rawCandle);
+      const isClosed = Date.now() >= rawCandle.T;
+      this.lastBars.set(key, bar);
+      this.barSubscribers.get(key)?.forEach((callback) => callback(bar, isClosed));
       eventBus.emit({ type: 'BAR_UPDATE', symbol: this.resolveDisplaySymbol(providerSymbol), timeframe: rawCandle.i, bar, isClosed });
     }
   }
+
+  /**
+   * Whether a candle is newer than the last one accepted for its key.
+   *
+   * The venue sequence is authoritative where the venue provides one.
+   * Where it does not, the close timestamp is used, because a candle that
+   * reports a time at or before the last accepted one is by definition not
+   * news. Clock skew between the venue and the browser is tolerated by
+   * comparing sequences when they exist and timestamps only when they do
+   * not.
+   */
+  private acceptCandle(key: string, candle: HyperliquidCandle): boolean {
+    const sequence = typeof candle.n === 'number' ? candle.n : undefined;
+    const lastSequence = this.lastSequence.get(key);
+    if (sequence !== undefined && lastSequence !== undefined) {
+      if (sequence <= lastSequence) return false;
+      this.lastSequence.set(key, sequence);
+      if (Number.isFinite(candle.T)) this.lastCandleTime.set(key, candle.T);
+      return true;
+    }
+
+    const lastTime = this.lastCandleTime.get(key);
+    if (lastTime !== undefined && Number.isFinite(candle.T)) {
+      if (candle.T < lastTime) return false;
+      this.lastCandleTime.set(key, candle.T);
+      if (sequence !== undefined) this.lastSequence.set(key, sequence);
+      return true;
+    }
+
+    if (sequence !== undefined) this.lastSequence.set(key, sequence);
+    if (Number.isFinite(candle.T)) this.lastCandleTime.set(key, candle.T);
+    return true;
+  }
+
+  /**
+   * Context rows captured during discovery, keyed by provider symbol.
+   *
+   * Discovery already fetches `metaAndAssetCtxs` for the default dex *and*
+   * every HIP-3 namespace, and the funding, open interest and volume it needs
+   * are in that same payload. This map keeps them, so reading market context
+   * costs no extra request and cannot drift from the prices quoted beside it.
+   */
+  private readonly contextByProviderSymbol = new Map<string, HyperliquidAssetCtx>();
 
   private async discoverInstruments(): Promise<TradingInstrument[]> {
     const [defaultMeta, dexes] = await Promise.all([
@@ -250,7 +659,7 @@ export class HyperliquidMarketDataAdapter implements MarketDataProvider {
     const metas: Array<{ dex?: string; meta: { universe: HyperliquidAsset[] }; contexts: HyperliquidAssetCtx[] }> = [{ meta: defaultMeta[0], contexts: defaultMeta[1] }];
     const discoveredPrices = new Map<
       string,
-      { price: number; availability: { availability: 'TRADEABLE' | 'UNAVAILABLE'; reason?: string } }
+      { price: number; availability: { availability: 'TRADEABLE' | 'UNAVAILABLE'; reason?: string }; previousDayPrice: number }
     >();
     const namedDexes = dexes.filter((dex): dex is HyperliquidDex => Boolean(dex?.name));
     const dexResults = await Promise.all(namedDexes.map(async (dex) => {
@@ -269,6 +678,7 @@ export class HyperliquidMarketDataAdapter implements MarketDataProvider {
         const providerSymbol = normalizeSymbol(asset.name);
         const assetClass = classifyAsset(providerSymbol);
         const context = contexts[index];
+        if (context) this.contextByProviderSymbol.set(providerSymbol, context);
 
         // The product universe is sourced from deployed HIP-3 namespaces;
         // default-DEX assets are not treated as FX, commodity, or index
@@ -300,9 +710,18 @@ export class HyperliquidMarketDataAdapter implements MarketDataProvider {
           maxLeverage: typeof asset.maxLeverage === 'number' && asset.maxLeverage > 0 ? asset.maxLeverage : undefined,
         }));
 
+        /*
+         * The venue publishes its own 24h-ago reference price with every
+         * asset context. It is the only honest basis for a 24h change:
+         * deriving one from candles loaded so far would measure the
+         * window that happens to be cached, not 24 hours.
+         */
+        const previousDayPrice = Number(context?.prevDayPx);
+
         discoveredPrices.set(providerSymbol, {
           price,
           availability,
+          previousDayPrice,
         });
       });
     }
@@ -317,17 +736,18 @@ export class HyperliquidMarketDataAdapter implements MarketDataProvider {
     for (const metadata of discoveredMetadata) {
       const symbol = uniqueSymbols.get(metadata.providerSymbol) ?? metadata.symbol;
       const resolved: InstrumentMetadata = { ...metadata, symbol };
-      const { price, availability } =
+      const { price, availability, previousDayPrice } =
         discoveredPrices.get(resolved.providerSymbol) ?? {
           price: Number.NaN,
           availability: marketAvailability(Number.NaN),
+          previousDayPrice: Number.NaN,
         };
 
       const instrument = tradingInstrument(
         resolved,
         SUPPORTED_TIMEFRAMES,
         availability.availability === 'TRADEABLE'
-          ? marketSymbol(resolved, price)
+          ? marketSymbol(resolved, price, previousDayPrice)
           : undefined,
       );
 

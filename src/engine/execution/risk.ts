@@ -35,19 +35,70 @@ export class RiskManager {
   private limits: RiskLimits;
   private recentOrderTimestamps: number[] = [];
   private currentDailyPnL: number = 0;
+  /**
+   * The UTC day the realised figure belongs to.
+   *
+   * "Daily loss" has to mean a day, not a process lifetime. Without this
+   * the figure could only ever grow until the tab was closed, so the
+   * limit would either never fire or would keep firing into the next
+   * day. The rollover is checked on write and on read rather than by a
+   * timer, so there is no interval to leak and no dependence on when
+   * the process happens to be busy.
+   */
+  private currentDailyPnLUtcDay: number = RiskManager.utcDay(Date.now());
 
   constructor(initialLimits: Partial<RiskLimits> = {}) {
     this.limits = { ...DEFAULT_RISK_LIMITS, ...initialLimits };
+  }
+
+  /** The UTC calendar day a timestamp belongs to. */
+  private static utcDay(timestamp: number): number {
+    return Math.floor(timestamp / 86_400_000);
+  }
+
+  /** Roll the realised figure over when the UTC day has changed. */
+  private rollDailyPnLIfNeeded(now: number = Date.now()): void {
+    const today = RiskManager.utcDay(now);
+    if (today !== this.currentDailyPnLUtcDay) {
+      this.currentDailyPnL = 0;
+      this.currentDailyPnLUtcDay = today;
+    }
   }
 
   getLimits(): RiskLimits {
     return { ...this.limits };
   }
 
+  /**
+   * Whether trading is halted.
+   *
+   * This is the read API, so the interface cannot show a different
+   * answer than the gate. The bug this replaces had the interface
+   * holding its own copy of the flag, which meant a halt engaged
+   * anywhere other than that one handler was invisible on screen while
+   * orders were being rejected.
+   */
+  isKillSwitchActive(): boolean {
+    return this.limits.killSwitchActive;
+  }
+
+  /** Realised P&L booked so far in the current UTC day. */
+  realisedToday(now: number = Date.now()): number {
+    this.rollDailyPnLIfNeeded(now);
+    return this.currentDailyPnL;
+  }
+
   updateLimits(newLimits: Partial<RiskLimits>): void {
     this.limits = { ...this.limits, ...newLimits };
   }
 
+  /**
+   * The one way the kill switch is engaged or released.
+   *
+   * `updateLimits` can still set the flag for tests and for restoring a
+   * persisted halt, which is why the interface reads through here rather
+   * than caching a copy.
+   */
   setKillSwitch(active: boolean): void {
     this.limits.killSwitchActive = active;
     eventBus.emit({
@@ -60,12 +111,23 @@ export class RiskManager {
     });
   }
 
+  /**
+   * Book realised P&L against today's loss limit.
+   *
+   * Called by the execution adapter at the moment a close is settled.
+   * It was never called, so `currentDailyPnL` stayed at its initial zero
+   * and the daily-loss branch read `0 <= -maxDailyLoss`, which is never
+   * true: the limit could not fire at all, no matter how much was lost.
+   */
   recordPnL(pnlChange: number): void {
+    if (!Number.isFinite(pnlChange)) return;
+    this.rollDailyPnLIfNeeded();
     this.currentDailyPnL += pnlChange;
   }
 
   resetDailyLoss(): void {
     this.currentDailyPnL = 0;
+    this.currentDailyPnLUtcDay = RiskManager.utcDay(Date.now());
   }
 
   /**
@@ -81,6 +143,7 @@ export class RiskManager {
     context?: RiskValuationContext,
   ): { valid: boolean; reason?: string; rejection?: ExecutionRejection } {
     const now = Date.now();
+    this.rollDailyPnLIfNeeded(now);
 
     // 1. Kill Switch Check
     if (this.limits.killSwitchActive) {

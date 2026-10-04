@@ -1,5 +1,5 @@
 /**
- * TradingVibe Domain Models & Trading Context Types
+ * TradingGOATs Domain Models & Trading Context Types
  * Core abstractions shared across Backtest, Demo, and Live environments.
  */
 
@@ -15,7 +15,7 @@ export type OrderStatus = 'PENDING' | 'FILLED' | 'REJECTED' | 'CANCELLED';
 
 export type ExecutionMode = 'BACKTEST' | 'DEMO' | 'LIVE';
 
-export type BotStatus = 'RUNNING' | 'PAUSED' | 'STOPPED' | 'ERROR';
+export type GoatStatus = 'RUNNING' | 'PAUSED' | 'STOPPED' | 'ERROR';
 
 export interface Bar {
   time: number; // Unix timestamp in seconds
@@ -52,6 +52,15 @@ export interface MarketOrderRequest {
   stopLoss?: number;
   takeProfit?: number;
   comment?: string;
+  /**
+   * A stable identifier for *this decision to trade*, not for this attempt.
+   *
+   * Every retry of a submission — a user clicking again, a reconnecting
+   * client re-sending, an agent waking twice on the same evidence — must
+   * carry the same value. Without it, "did this already go through?" cannot
+   * be answered, and the only safe-looking answer is to send it again.
+   */
+  idempotencyKey?: string;
 }
 
 export interface LimitOrderRequest extends MarketOrderRequest {
@@ -88,8 +97,8 @@ export interface Position {
   timestamp: number;
   swap?: number;
   commission?: number;
-  botId?: string;
-  botName?: string;
+  goatId?: string;
+  goatName?: string;
 }
 
 export interface Trade {
@@ -107,8 +116,8 @@ export interface Trade {
   returnPercent: number;
   commission: number;
   exitReason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'SIGNAL_CLOSE' | 'MANUAL';
-  botId?: string;
-  botName?: string;
+  goatId?: string;
+  goatName?: string;
 }
 
 export interface BarsRequest {
@@ -277,7 +286,7 @@ export interface Strategy {
   updatedAt: number;
 }
 
-export interface Bot {
+export interface Goat {
   id: string;
   name: string;
   strategyId: string;
@@ -285,7 +294,7 @@ export interface Bot {
   symbol: string;
   timeframe: Timeframe;
   mode: ExecutionMode;
-  status: BotStatus;
+  status: GoatStatus;
   lastSignal?: string;
   lastActivity: number;
   positionsCount: number;
@@ -295,13 +304,13 @@ export interface Bot {
 
 export interface Deployment {
   id: string;
-  botId: string;
-  botName: string;
+  goatId: string;
+  goatName: string;
   strategyName: string;
   symbol: string;
   timeframe: Timeframe;
   mode: ExecutionMode;
-  status: BotStatus;
+  status: GoatStatus;
   uptimeSeconds: number;
   lastTickTime: number;
   tradesCount: number;

@@ -1,6 +1,8 @@
 {
-  "name": "TradingVibe — Trading & Bot Platform for Hyperliquid",
-  "description": "Mobile-first trading and bot platform for Hyperliquid HIP-3 markets: trade Forex, commodities and indices with live quotes, backtesting, and an AI agent runtime under deterministic risk controls.",
+  "name": "TradingGOATs \u2014 Goal-Driven Trading Agents",
+  "description": "Goal-driven trading agents for Hyperliquid HIP-3 markets: write a goal, your GOAT forms theses, watches for evidence with deterministic trackers, and you choose the market and mode it runs in. Forex, commodities and indices under deterministic risk controls.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

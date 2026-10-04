@@ -847,9 +847,117 @@ export async function runHyperliquidExecutionTests(): Promise<void> {
   await testOrderSizeGuard();
   await testMixedAssetExposure();
   await testMarginUsesPublishedLeverage();
+  await testSubmissionIdempotency();
 
   console.log(
     'Hyperliquid execution lifecycle, sizing and exposure tests passed.',
+  );
+}
+
+/**
+ * A repeated submission is one order.
+ *
+ * The scenario is the one that costs money: an agent wakes twice on the
+ * same evidence, or a client retries a request whose answer never arrived,
+ * and the second submission opens a second position. A decision to trade
+ * therefore carries a key, and the key is answered once.
+ */
+async function testSubmissionIdempotency(): Promise<void> {
+  const { adapter } = buildAdapter([
+    ['Gold', 4140, 4141],
+    ['EUR/USD', 1.085, 1.0852],
+  ]);
+
+  const decision = {
+    symbol: 'Gold',
+    side: 'BUY' as const,
+    volume: 1,
+    idempotencyKey: 'wake-42:evidence-7',
+  };
+
+  const first = await adapter.placeMarketOrder(decision);
+  assert(first.success, 'the first submission is accepted');
+  assert(first.duplicate !== true, 'the first submission is not marked a duplicate');
+
+  const retry = await adapter.placeMarketOrder(decision);
+  assert(
+    retry.orderId === first.orderId,
+    'a retried submission returns the original order rather than a new one',
+  );
+  assert(
+    retry.duplicate === true,
+    'a retried submission is reported as a repeat so a caller can tell',
+  );
+  assert(
+    (await adapter.getPositions()).length === 1,
+    'a retried submission does not open a second position',
+  );
+
+  // A different decision is a different key, and is not swallowed.
+  const other = await adapter.placeMarketOrder({
+    ...decision,
+    idempotencyKey: 'wake-43:evidence-1',
+    side: 'SELL',
+  });
+  assert(other.success, 'a different decision with its own key still trades');
+  assert(
+    other.orderId !== first.orderId,
+    'a different decision produces a different order',
+  );
+
+  /*
+   * A key reused for different content is a bug in the caller, and the
+   * dangerous failure mode is answering it with the earlier order — which
+   * would report success for something that was never sent.
+   */
+  const misused = await adapter.placeMarketOrder({
+    ...decision,
+    volume: 2,
+  });
+  assert(!misused.success, 'a key reused for a different order is refused');
+  assert(
+    misused.rejection?.category === 'INVALID_ORDER',
+    'a misused idempotency key is refused as an invalid order',
+  );
+  assert(
+    (await adapter.getPositions()).length === 2,
+    'a refused submission does not change the book',
+  );
+
+  /*
+   * A rejected submission is remembered as a rejection. Otherwise a retry
+   * re-validates against a price that has since moved, and the answer to
+   * "did my order go through?" would depend on when it was asked.
+   */
+  const rejected = await adapter.placeMarketOrder({
+    symbol: 'EUR/USD',
+    side: 'BUY',
+    volume: 0.05,
+    idempotencyKey: 'wake-44:too-small',
+  });
+  assert(!rejected.success, 'a size below the venue minimum is rejected');
+
+  const rejectedRetry = await adapter.placeMarketOrder({
+    symbol: 'EUR/USD',
+    side: 'BUY',
+    volume: 0.05,
+    idempotencyKey: 'wake-44:too-small',
+  });
+  assert(
+    rejectedRetry.rejection?.category === rejected.rejection?.category,
+    'a retried rejection is the same rejection, not a fresh verdict',
+  );
+
+  // An unkeyed submission is still allowed: the guard helps, it does not gate.
+  const unkeyed = await adapter.placeMarketOrder({
+    symbol: 'Gold',
+    side: 'BUY',
+    volume: 1,
+  });
+  assert(unkeyed.success, 'a submission without a key is still accepted');
+  assert(
+    unkeyed.duplicate !== true,
+    'a submission without a key is never reported as a duplicate',
   );
 }
 

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 
 import {
   agentRuntime,
@@ -6,42 +6,44 @@ import {
   TradingAgent,
 } from './engine/agents';
 
-import {
-  BotDefinition,
-  Deployment,
-  createDeployment,
-} from './engine/agents/botDefinition';
-
-import {
-  BotBacktestProgress,
-  BotBacktestResult,
-  runBotDefinitionBacktest,
-} from './engine/agents/backtest';
-
 import { AgentTimelineEvent } from './engine/agents/timeline';
 
 import {
-  TriggerEngine,
-  TriggerRegistry,
-  AgentTrigger,
-} from './engine/agents/triggers';
+  TrackerRegistry,
+  TrackerRuntime,
+  Tracker,
+} from './engine/agents/trackers';
 
 import { MobileHeader } from './components/navigation/MobileHeader';
 import { BottomNav } from './components/navigation/BottomNav';
 
 import { TradesTab } from './components/views/TradesTab';
 import { QuotesTab } from './components/views/QuotesTab';
-import { BotsTab } from './components/views/BotsTab';
+import { marketsFromDiscovery } from './components/navigation/marketOptions';
 import { HistoryTab } from './components/views/HistoryTab';
 import { SettingsTab } from './components/views/SettingsTab';
 
 import { FloatingAIAssistant } from './components/ai/FloatingAIAssistant';
 
 import { DocsView } from './components/views/DocsView';
+import { GoatView } from './components/goat';
+import { STARTER_GOATS } from './engine/goat/starterGoats';
+
+const starterGoatContext = () =>
+  STARTER_GOATS.map((goat) => ({
+    id: goat.identity.id,
+    statement: goat.goal.statement,
+    status: 'STARTER',
+    source: goat.source,
+    skills: goat.skills.map((s) => s.id),
+    lastActivity: goat.updatedAt,
+  }));
+import { GoatOrchestrator, createGoatStores } from './engine/goat/orchestrator';
 import { ProfileView } from './components/views/ProfileView';
 
 import { User, userService } from './services/userService';
 import { ConnectionStatus } from './types/quotes';
+import { configuredVenue, type VenueEnvironment } from './config/venue';
 
 import { LiveConfirmModal } from './components/layout/LiveConfirmModal';
 import { HyperliquidSettingsModal } from './components/layout/HyperliquidSettingsModal';
@@ -51,7 +53,7 @@ import { KillSwitchModal } from './components/layout/KillSwitchModal';
 import {
   BacktestResult,
   Bar,
-  Bot,
+  Goat,
   ExecutionMode,
   LogEntry,
   OrderSide,
@@ -65,7 +67,7 @@ import {
 
 import { TradingInstrument } from './types/instruments';
 
-import { MainTab, AIContext } from './types/aiContext';
+import { MainTab } from './types/aiContext';
 import { eventBus } from './types/events';
 
 import { marketDataService } from './services/marketData';
@@ -74,6 +76,15 @@ import { SAMPLE_STRATEGIES } from './services/strategies';
 import { historicalMarketDataProvider } from './engine/backtester/historical';
 
 import { hyperliquidMarketData } from './adapters/hyperliquid/marketData';
+
+import { ACCOUNT_CURRENCY } from './engine/execution/valuation';
+import { riskManager } from './engine/execution/risk';
+
+import { appContextStore } from './services/aiContext/store';
+import { registerGoatContextProvider } from './services/aiContext/goatTools';
+import type { NavigationTarget } from './services/aiContext/navigation';
+import { useWallet } from './services/wallet';
+import type { TrackerConditionContext } from './engine/agents/trackers/conditions';
 import { hyperliquidDemoAdapter } from './adapters/hyperliquid/demo';
 
 import { AIProviderConfig } from './adapters/openrouter/types';
@@ -81,32 +92,155 @@ import { openRouterProvider } from './adapters/openrouter/provider';
 
 
 // ============================================================
-// TRIGGER INFRASTRUCTURE
+// TRACKER INFRASTRUCTURE
 // ============================================================
 
-const triggerRegistry = new TriggerRegistry(
+/**
+ * The registry: which trackers exist, and whose they are.
+ *
+ * The runtime: what watches them. One instance of each, created here
+ * and shared, because a second runtime would be a second observation
+ * path and there is only meant to be one.
+ */
+const trackerRegistry = new TrackerRegistry(
   (agentId) => agentRuntime.getAgent(agentId)
 );
 
-const triggerEngine = new TriggerEngine(
-  triggerRegistry,
+const trackerRuntime = new TrackerRuntime({
+  registry: trackerRegistry,
+  agents: agentRuntime,
+  timeline: agentRuntime.getTimelineStore(),
+});
+
+trackerRuntime.setEnvironment('DEMO');
+
+/**
+ * GOAT — Goal-Oriented Agentic Trader.
+ *
+ * The reasoning layer that sits over the agent runtime and the tracker
+ * runtime. It is created once, alongside them, because a GOAT is not a
+ * separate system: it is the same runtime given a goal instead of an
+ * observation plan, plus the ability to author its own.
+ */
+const demoEnvironmentForGoat = new DemoEnvironment();
+
+const goatOrchestrator = new GoatOrchestrator({
   agentRuntime,
-  agentRuntime.getTimelineStore()
-);
+  trackers: trackerRuntime,
+  env: demoEnvironmentForGoat,
+  stores: createGoatStores('PERSISTENT'),
+});
 
-triggerEngine.setEnvironment('DEMO');
+/*
+ * What the assistant is allowed to reach.
+ *
+ * The assistant answers questions about GOATs from the same mission read
+ * model the screens render, so "what is my GOAT doing?" and the live card
+ * cannot disagree. Registered here rather than imported inside aiContext so
+ * that module holds no engine dependency and can be exercised with a stub.
+ */
+registerGoatContextProvider({
+  missions: () => goatOrchestrator.missions(),
+  mission: (goalId) => goatOrchestrator.mission(goalId),
+  evidenceFor: (goalId, limit) => {
+    const theses = goatOrchestrator.stores.theses.listForGoal(goalId);
+    return theses
+      .flatMap((thesis) => goatOrchestrator.stores.evidence.listForThesis(thesis.id))
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, limit)
+      .map((item) => ({
+        summary: item.summary,
+        polarity: item.polarity,
+        source: item.source,
+        at: item.createdAt,
+      }));
+  },
+  /*
+   * The real feed, straight out of the durable timeline the runtime writes.
+   *
+   * It used to be reconstructed from `mission.lastActivity`, which is one
+   * derived line — so "what happened during the last wake?" could only ever
+   * be answered with a single summary, and a GOAT that had deployed, read
+   * the market, formed a thesis and gone to sleep looked identical to one
+   * that had done nothing.
+   */
+  activityFor: (goalId, limit) =>
+    goatOrchestrator.activityFor(goalId, limit).map((entry) => ({ at: entry.at, text: entry.text })),
+  trackLiveQuote: async (symbol) => {
+    const quote = await hyperliquidMarketData.getQuote(symbol);
+    return {
+      symbol: quote.symbol,
+      bid: quote.bid,
+      ask: quote.ask,
+      // The read was a live REST call, so the assistant can say the price
+      // is current rather than implying a stale snapshot is the same thing.
+      status: 'live',
+    };
+  },
+});
 
-let triggerEngineStarted = false;
+/**
+ * Ask the GOAT tab to re-read the orchestrator.
+ *
+ * The assistant can change a GOAT while the user is on another tab. The
+ * orchestrator's own 2s poll would catch it, so this only makes it immediate.
+ */
+let requestGoatViewRefresh: (() => void) | undefined;
 
-function ensureTriggerEngineStarted() {
-  if (triggerEngineStarted) {
+function goatViewRefresh(): void {
+  requestGoatViewRefresh?.();
+}
+
+let trackerRuntimeStarted = false;
+
+/**
+ * How often the AI context is republished at most.
+ *
+ * Quotes arrive continuously; the assistant cannot read faster than a
+ * person can, and rebuilding the projection on every tick put a long
+ * synchronous handler in the browser's message loop.
+ */
+const CONTEXT_PUBLISH_INTERVAL_MS = 500;
+
+/** Human label for the current screen, used by the AI context. */
+function currentViewLabel(tab: MainTab): string {
+  switch (tab) {
+    case 'goat': return 'GOAT';
+    case 'quotes': return 'Quotes';
+    case 'trades': return 'Trades';
+    case 'history': return 'History';
+    default: return 'Settings';
+  }
+}
+
+/**
+ * Map an AI navigation suggestion onto an application tab.
+ *
+ * Navigation only. There is no mapping from a suggestion to a financial
+ * action, and there never will be.
+ */
+function tabForNavigation(target: NavigationTarget): MainTab | undefined {
+  switch (target) {
+    case 'TRADES': return 'trades';
+    case 'GOATS':
+    case 'CREATE_GOAT': return 'goat';
+    case 'QUOTES': return 'quotes';
+    case 'HISTORY': return 'history';
+    case 'SETTINGS': return 'settings';
+    case 'INSPECT_TRACKERS':
+    case 'INSPECT_THESIS': return 'goat';
+    default: return undefined;
+  }
+}
+
+function ensureTrackerRuntimeStarted() {
+  if (trackerRuntimeStarted) {
     return;
   }
 
-  triggerEngine.start();
-  triggerEngineStarted = true;
+  trackerRuntime.start();
+  trackerRuntimeStarted = true;
 }
-
 
 // ============================================================
 // APP
@@ -118,7 +252,7 @@ function App() {
   // ----------------------------------------------------------
 
   const [currentTab, setCurrentTab] =
-    useState<MainTab>('trades');
+    useState<MainTab>('goat');
 
   const [symbol, setSymbol] =
     useState<string>('');
@@ -196,18 +330,6 @@ function App() {
   const [strategies] =
     useState<Strategy[]>(SAMPLE_STRATEGIES);
 
-  /*
-   * Explorer bots are templates.
-   *
-   * User-owned bots only appear here after the user actually
-   * creates/clones/deploys one.
-   */
-  const [bots, setBots] =
-    useState<Bot[]>([]);
-
-  const [botDefinitions, setBotDefinitions] =
-    useState<BotDefinition[]>([]);
-
   const [backtestResult, setBacktestResult] =
     useState<BacktestResult | null>(null);
 
@@ -234,8 +356,29 @@ function App() {
   const [showProfileView, setShowProfileView] =
     useState(false);
 
+  /*
+   * A mirror of the engine's kill switch, not a second copy of it.
+   *
+   * The engine is the authority: every order is gated on
+   * `riskManager`, including ones the interface never sees. React state
+   * is only re-rendering information, and it is written *from* the
+   * engine after the engine has changed, never independently. A halt
+   * engaged anywhere else -- a restored halt, a limit that tripped --
+   * therefore cannot leave the header saying "trading active" while the
+   * gate is rejecting every order.
+   */
   const [isKillSwitchActive, setIsKillSwitchActive] =
-    useState(false);
+    useState(() => riskManager.isKillSwitchActive());
+
+  /**
+   * Something the user must be told about that is not a transient toast.
+   *
+   * Used by the emergency flatten, which can genuinely fail on one
+   * position while succeeding on the rest. A user who believes every
+   * position closed when one did not is worse off than one who was told.
+   */
+  const [safetyNotice, setSafetyNotice] =
+    useState<string | null>(null);
 
 
   // ----------------------------------------------------------
@@ -244,6 +387,8 @@ function App() {
 
   const [user, setUser] =
     useState<User | null>(null);
+
+  const { state: walletState } = useWallet();
 
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>('CONNECTING');
@@ -255,8 +400,15 @@ function App() {
   // No signing credentials belong in the browser.
   // ----------------------------------------------------------
 
-  const [hyperliquidNetwork, setHyperliquidNetwork] =
-    useState<'testnet' | 'mainnet'>('mainnet');
+  /*
+   * The venue environment, read once from the canonical config and then
+   * carried explicitly. The adapter is the only thing that decides which
+   * hosts a request goes to; this state exists so the UI can state which
+   * environment is live and so a change is applied deliberately.
+   */
+  const [venueEnvironment, setVenueEnvironment] = useState<VenueEnvironment>(
+    () => configuredVenue().environment,
+  );
 
 
   // ----------------------------------------------------------
@@ -268,11 +420,33 @@ function App() {
       openRouterProvider.getConfig()
     );
 
+  /*
+   * Throttle state for the AI context publish below. A ref rather than
+   * state because a render must not be scheduled in order to avoid one.
+   */
+  const contextPublishRef = useRef<{ last: number; timer: number | null }>({
+    last: 0,
+    timer: null,
+  });
+
   const [externalAIPrompt, setExternalAIPrompt] =
     useState<string | null>(null);
 
-  const [aiCustomContext, setAiCustomContext] =
-    useState<any>(null);
+  /*
+   * How many times the assistant has been asked to open.
+   *
+   * A counter rather than a boolean so opening it twice in a row works:
+   * a boolean that is already true would not re-trigger the effect that
+   * opens the panel.
+   */
+  const [aiOpenRequest, setAiOpenRequest] =
+    useState(0);
+
+  /*
+   * Read by the AI context publisher, which must not re-run whenever a
+   * child opens the builder.
+   */
+  const selectedGoatIdRef = useRef<string | undefined>(undefined);
 
 
   // ==========================================================
@@ -303,15 +477,44 @@ function App() {
 
 
   // ==========================================================
-  // START TRIGGER ENGINE
+  // START TRACKER RUNTIME
   // ==========================================================
 
   useEffect(() => {
-    ensureTriggerEngineStarted();
+    ensureTrackerRuntimeStarted();
+
+    /*
+     * Two things have to be true before the product can be used, and both
+     * are about state that outlives the session.
+     *
+     * The configured model is checked against OpenRouter's live catalogue,
+     * because a model that has been retired is a 404 on every request and
+     * the previous build shipped exactly that. The replacement is reported
+     * rather than applied silently to the picker, which keeps the user's
+     * own selection intact until they choose one.
+     *
+     * A GOAT that was deployed but never got to reason — a closed tab
+     * between the two — is started here, so "deploy" is not a promise the
+     * runtime quietly breaks when the page goes.
+     */
+    void (async () => {
+      try {
+        await openRouterProvider.reconcileModel();
+        setOpenRouterConfig(openRouterProvider.getConfig());
+      } catch {
+        // The catalogue is unavailable; the picker falls back and says so.
+      }
+
+      try {
+        await goatOrchestrator.resumeUnstartedGoats();
+      } catch {
+        // A GOAT that cannot be resumed is reported as having no thesis.
+      }
+    })();
 
     return () => {
       /*
-       * The trigger engine is module-level and shared by the app.
+       * The tracker runtime is module-level and shared by the app.
        * Do not dispose it here because React development StrictMode
        * can mount/unmount this component more than once.
        */
@@ -851,747 +1054,18 @@ function App() {
       });
     }
   };
-
-
-
-  // ==========================================================
-  // TOGGLE BOT / AGENT
-  // ==========================================================
-
-  const handleToggleBotStatus = (
-    botId: string
-  ) => {
-    const bot =
-      bots.find(
-        (candidate) =>
-          candidate.id ===
-          botId
-      );
-
-    if (!bot) {
-      return;
-    }
-
-
-    // --------------------------------------------------------
-    // Agent-based bot
-    // --------------------------------------------------------
-
-    if (bot.agentId) {
-      if (
-        bot.status ===
-        'RUNNING'
-      ) {
-        void agentRuntime.stop(
-          bot.agentId
-        );
-
-        setBots((previous) =>
-          previous.map(
-            (candidate) =>
-              candidate.id ===
-              botId
-                ? {
-                    ...candidate,
-
-                    status:
-                      'STOPPED',
-
-                    lastSignal:
-                      'Agent stopped',
-
-                    lastActivity:
-                      Date.now(),
-                  }
-                : candidate
-          )
-        );
-
-        return;
-      }
-
-
-      /*
-       * An AI agent cannot start without the user's
-       * OpenRouter configuration.
-       */
-      if (
-        !requireOpenRouterKey()
-      ) {
-        return;
-      }
-
-      ensureTriggerEngineStarted();
-
-      void agentRuntime.start(
-        bot.agentId
-      );
-
-      setBots((previous) =>
-        previous.map(
-          (candidate) =>
-            candidate.id ===
-            botId
-              ? {
-                  ...candidate,
-
-                  status:
-                    'RUNNING',
-
-                  lastSignal:
-                    'Agent running — waiting for trigger',
-
-                  lastActivity:
-                    Date.now(),
-                }
-              : candidate
-        )
-      );
-
-      return;
-    }
-
-
-    // --------------------------------------------------------
-    // Legacy bot
-    //
-    // Kept for backwards compatibility with existing Bot
-    // objects. New AI bots should use agentId.
-    // --------------------------------------------------------
-
-    setBots((previous) =>
-      previous.map((candidate) => {
-        if (
-          candidate.id !==
-          botId
-        ) {
-          return candidate;
-        }
-
-        const nextStatus =
-          candidate.status ===
-          'RUNNING'
-            ? 'STOPPED'
-            : 'RUNNING';
-
-        return {
-          ...candidate,
-
-          status:
-            nextStatus,
-
-          lastActivity:
-            Date.now(),
-        };
-      })
-    );
-  };
-
-
-  // ==========================================================
-  // CREATE TRADING AGENT
-  // ==========================================================
-
-  const handleCreateBot = (botData: {
-    name: string;
-    symbol: string;
-    timeframe: Timeframe;
-    strategyCode: string;
-    definition?: BotDefinition;
-    deployment?: Deployment;
-  }) => {
-    /*
-     * BotDefinition-based bots are AI agents.
-     *
-     * Do not create/deploy them without an OpenRouter key.
-     */
-    if (
-      botData.definition &&
-      !requireOpenRouterKey()
-    ) {
-      return;
-    }
-
-    const now =
-      Date.now();
-
-    const botId =
-      `bot_${now}`;
-
-    const agentId =
-      `agent_${now}`;
-
-
-    // ========================================================
-    // CANONICAL BOT DEFINITION PATH
-    // ========================================================
-
-    if (botData.definition) {
-      try {
-        const deployment =
-          botData.deployment ||
-          createDeployment(
-            {
-              id:
-                `${botData.definition.identity.id}-${now}`,
-
-              /*
-               * The BotDefinition itself remains asset-agnostic.
-               * The deployment binds it to the selected market.
-               */
-              botId:
-                botData.definition.identity.id,
-
-              marketId:
-                botData.symbol,
-
-              accountId:
-                'paper-account',
-
-              mode:
-                'demo',
-
-              status:
-                'active',
-            },
-            now
-          );
-
-        const demoEnvironment =
-          new DemoEnvironment();
-
-        const instance =
-          agentRuntime.registerBot(
-            botData.definition,
-            deployment,
-            botData.symbol,
-            demoEnvironment
-          );
-
-        triggerRegistry.registerBotTriggers(
-          botData.definition,
-          instance.agent.id,
-          botData.symbol
-        );
-
-        ensureTriggerEngineStarted();
-
-        void agentRuntime.start(
-          instance.agent.id
-        );
-
-        const newBot: Bot = {
-          id:
-            botId,
-
-          name:
-            botData.definition.identity.name,
-
-          strategyId:
-            `bot-definition:${botData.definition.identity.id}`,
-
-          symbol:
-            botData.symbol,
-
-          timeframe:
-            botData.timeframe,
-
-          mode:
-            'DEMO',
-
-          status:
-            'RUNNING',
-
-          lastSignal:
-            'Agent running — waiting for trigger',
-
-          lastActivity:
-            now,
-
-          positionsCount:
-            0,
-
-          totalPnl:
-            0,
-
-          startedAt:
-            now,
-
-          agentId:
-            instance.agent.id,
-        };
-
-        setBots((previous) => [
-          newBot,
-          ...previous,
-        ]);
-
-        setBotDefinitions((previous) => [
-          botData.definition!,
-          ...previous.filter(
-            (definition) =>
-              definition.identity.id !==
-              botData.definition!.identity.id
-          ),
-        ]);
-      } catch (error) {
-        console.error(
-          'Failed to deploy BotDefinition:',
-          error
-        );
-      }
-
-      return;
-    }
-
-
-    // ========================================================
-    // LEGACY / DIRECT AGENT PATH
-    // ========================================================
-
-    const agent: TradingAgent = {
-      id:
-        agentId,
-
-      name:
-        botData.name,
-
-      description:
-        `Trading agent created from the user's strategy request for ${botData.symbol}.`,
-
-      instructions:
-        `
-You are the trading agent "${botData.name}".
-
-Strategy instructions:
-${botData.strategyCode}
-
-Operate only within the configured policy.
-
-Before making any trading decision:
-1. Observe current market conditions.
-2. Use the available market and technical-analysis capabilities.
-3. Check account state and existing positions.
-4. Check risk before opening a position.
-5. If conditions are unclear, WAIT.
-
-Never exceed the configured risk policy.
-Never trade outside the allowed symbol or session.
-Never invent market data.
-Never invent account data.
-Explain the reason for every trading decision.
-        `.trim(),
-
-      skills: [
-        'market-observation',
-        'technical-analysis',
-        'risk-management',
-        'position-sizing',
-        'trade-entry',
-        'trade-management',
-      ],
-
-      capabilities: [
-        'market.getQuote',
-        'market.getBars',
-        'market.getSpread',
-        'market.getSession',
-
-        'indicators.sma',
-        'indicators.ema',
-        'indicators.rsi',
-        'indicators.atr',
-
-        'structure.swingHighs',
-        'structure.swingLows',
-        'structure.supportResistance',
-        'structure.breakout',
-
-        'account.getEquity',
-        'account.getPositions',
-
-        'risk.calculateRisk',
-        'risk.calculateExposure',
-        'risk.calculatePositionSize',
-        'risk.checkTrade',
-
-        'orders.market',
-
-        'positions.modifyStopLoss',
-        'positions.close',
-      ],
-
-      policy: {
-        maxRiskPerTrade:
-          0.01,
-
-        maxDailyLoss:
-          500,
-
-        maxDrawdown:
-          0.05,
-
-        maxOpenPositions:
-          1,
-
-        maxExposure:
-          50000,
-
-        maxOrdersPerMinute:
-          6,
-
-        allowedSymbols: [
-          botData.symbol,
-        ],
-
-        allowedSessions: [
-          'LONDON',
-          'NEW_YORK',
-          'OVERLAP',
-        ],
-
-        allowTrading:
-          true,
-      },
-
-      preferredEnvironment:
-        'DEMO',
-
-      symbols: [
-        botData.symbol,
-      ],
-
-      timeframe:
-        botData.timeframe,
-
-      enabled:
-        true,
-
-      createdAt:
-        now,
-
-      updatedAt:
-        now,
-    };
-
-
-    try {
-      const demoEnvironment =
-        new DemoEnvironment();
-
-      agentRuntime.registerAgent(
-        agent,
-        demoEnvironment
-      );
-
-
-      // ------------------------------------------------------
-      // Default NEW_BAR trigger
-      // ------------------------------------------------------
-
-      const defaultTrigger: AgentTrigger = {
-        id:
-          `trigger_${now}`,
-
-        agentId,
-
-        type:
-          'NEW_BAR',
-
-        enabled:
-          true,
-
-        symbol:
-          botData.symbol,
-
-        timeframe:
-          botData.timeframe,
-
-        config:
-          {},
-
-        priority:
-          10,
-
-        cooldownMs:
-          1000,
-
-        maxFiringsPerMinute:
-          20,
-
-        createdAt:
-          now,
-
-        updatedAt:
-          now,
-      };
-
-      triggerRegistry.register(
-        defaultTrigger
-      );
-
-
-      // ------------------------------------------------------
-      // Create user-owned bot
-      // ------------------------------------------------------
-
-      const newBot: Bot = {
-        id:
-          botId,
-
-        name:
-          botData.name,
-
-        strategyId:
-          `agent_strategy_${now}`,
-
-        symbol:
-          botData.symbol,
-
-        timeframe:
-          botData.timeframe,
-
-        mode:
-          'DEMO',
-
-        status:
-          'STOPPED',
-
-        lastSignal:
-          'Agent ready — start in Demo',
-
-        lastActivity:
-          now,
-
-        positionsCount:
-          0,
-
-        totalPnl:
-          0,
-
-        startedAt:
-          now,
-
-        agentId,
-      };
-
-      setBots((previous) => [
-        newBot,
-        ...previous,
-      ]);
-
-
-      ensureTriggerEngineStarted();
-
-      void agentRuntime.start(
-        agentId
-      );
-
-
-      setBots((previous) =>
-        previous.map((bot) =>
-          bot.id === botId
-            ? {
-                ...bot,
-
-                status:
-                  'RUNNING',
-
-                lastSignal:
-                  'Agent running — waiting for trigger',
-
-                lastActivity:
-                  Date.now(),
-              }
-            : bot
-        )
-      );
-    } catch (error) {
-      console.error(
-        'Failed to create trading agent:',
-        error
-      );
-    }
-  };
-
-
-  // ==========================================================
-  // BOT DEFINITION BACKTEST
-  // ==========================================================
-
-  const handleRunBotBacktest = async (
-    definition: BotDefinition,
-    marketId: string,
-    botTimeframe: string,
-    initialBalance: number,
-    start: number,
-    end: number,
-    onProgress: (
-      progress: BotBacktestProgress
-    ) => void,
-  ): Promise<BotBacktestResult> => {
-    /*
-     * AI backtests must use the user's own OpenRouter key.
-     * There is intentionally no deterministic/fake AI fallback.
-     */
-    if (!requireOpenRouterKey()) {
-      throw new Error(
-        'OpenRouter API key required for AI bot backtesting.'
-      );
-    }
-
-    const timeframeForData =
-      botTimeframe as Timeframe;
-
-
-    // --------------------------------------------------------
-    // Real historical market data
-    // --------------------------------------------------------
-
-    const historical =
-      await historicalMarketDataProvider.getBars({
-        marketId,
-        timeframe:
-          timeframeForData,
-        start,
-        end,
-      });
-
-
-    if (
-      !historical.bars ||
-      historical.bars.length === 0
-    ) {
-      throw new Error(
-        `No historical market data available for ${marketId}.`
-      );
-    }
-
-
-    // --------------------------------------------------------
-    // Backtest deployment
-    // --------------------------------------------------------
-
-    const deployment =
-      createDeployment(
-        {
-          id:
-            `${definition.identity.id}-backtest`,
-
-          botId:
-            definition.identity.id,
-
-          marketId,
-
-          accountId:
-            'paper-account',
-
-          mode:
-            'paper',
-
-          status:
-            'active',
-        }
-      );
-
-
-    // --------------------------------------------------------
-    // Resolve instrument configuration
-    // --------------------------------------------------------
-
-    const instrument =
-      marketDataService.getSymbol(
-        marketId
-      );
-
-    if (!instrument) {
-      throw new Error(
-        `No trading instrument configuration found for ${marketId}.`
-      );
-    }
-
-
-    // --------------------------------------------------------
-    // Run canonical BotDefinition backtest
-    // --------------------------------------------------------
-
-    return runBotDefinitionBacktest({
-      definition,
-
-      deployment,
-
-      /*
-       * Market is bound at deployment/runtime level.
-       * The BotDefinition itself remains asset-agnostic.
-       */
-      runtimeSymbol:
-        marketId,
-
-      timeframe:
-        botTimeframe,
-
-      bars:
-        historical.bars,
-
-      initialBalance,
-
-      /*
-       * Backtest cost model.
-       *
-       * Pips are supplied only for instruments that actually declare
-       * one, so a commodity or index backtest is never sized in Forex
-       * pips. The commission figure is an explicit simulation
-       * assumption, not a Hyperliquid fee.
-       */
-      pipSize:
-        instrument.pipSize,
-
-      spreadPips:
-        instrument.pipSize
-          ? 0.8
-          : 0,
-
-      slippagePips:
-        instrument.pipSize
-          ? 0.2
-          : 0,
-
-      spreadPrice:
-        instrument.pipSize
-          ? undefined
-          : 0,
-
-      commissionPerLot:
-        3.5,
-
-      lotSize:
-        instrument.lotSize ??
-        100_000,
-
-      pricePrecision:
-        instrument.pricePrecision,
-
-      gaps:
-        historical.gaps,
-
-      onProgress,
-    });
-  };
-
-
-  // ==========================================================
   // BOT ACTIVITY
   // ==========================================================
 
   const handleGetBotActivity = async (
-    botId: string
+    goatId: string
   ): Promise<AgentTimelineEvent[]> => {
     const store =
       agentRuntime.getTimelineStore();
 
-    return store.getByBot
-      ? store.getByBot(
-          botId,
+    return store.getByGoat
+      ? store.getByGoat(
+          goatId,
           {
             limit: 100,
           }
@@ -1606,40 +1080,64 @@ Explain the reason for every trading decision.
 
   const handleEmergencyKillSwitch =
     () => {
-      setIsKillSwitchActive(
+      /*
+       * Engage the engine's kill switch first, before anything else.
+       *
+       * Order matters. The flatten below submits real closes, and if the
+       * switch is not already on in `riskManager` those closes race new
+       * opens from a running agent. Setting the React state first and the
+       * engine second left a window where the UI claimed trading was
+       * halted while the engine still allowed orders.
+       */
+      riskManager.setKillSwitch(
         true
+      );
+
+      // Read the flag back from the engine rather than assuming the
+      // value we just asked for, so the interface and the gate cannot
+      // drift apart.
+      setIsKillSwitchActive(
+        riskManager.isKillSwitchActive()
       );
 
       /*
        * Close every currently open position.
        *
-       * The kill switch also stops every UI-known running bot.
+       * Each close is a floating promise that can reject (a vanished
+       * position, a failed quote). Collecting the failures means the user
+       * finds out which position did not close instead of the rejection
+       * disappearing into the console.
        */
+      const flattenFailures: string[] = [];
       positions.forEach((position) => {
         void handleClosePosition(
           position.id
+        ).catch((error: unknown) => {
+          flattenFailures.push(`${position.symbol}: ${(error as Error).message}`);
+        });
+      });
+      if (flattenFailures.length > 0) {
+        setSafetyNotice(
+          `Kill switch engaged, but ${flattenFailures.length} position(s) did not close: ${flattenFailures.join('; ')}`,
         );
-      });
+      }
 
-      bots.forEach((bot) => {
-        if (
-          bot.agentId &&
-          bot.status ===
-            'RUNNING'
-        ) {
-          void agentRuntime.stop(
-            bot.agentId
-          );
+      /*
+       * Stop every running agent.
+       *
+       * This used to iterate a `bots` array held in React state, which
+       * meant the kill switch only knew about agents something had
+       * remembered to record. The runtime is the authority on what is
+       * running, so the kill switch asks the runtime — otherwise a GOAT
+       * the UI had lost track of would have kept its trackers alive
+       * through a kill switch, which is the opposite of what a kill
+       * switch is for.
+       */
+      for (const instance of agentRuntime.listAgents()) {
+        if (instance.isRunning) {
+          void agentRuntime.stop(instance.agent.id);
         }
-      });
-
-      setBots((previous) =>
-        previous.map((bot) => ({
-          ...bot,
-          status:
-            'STOPPED',
-        }))
-      );
+      }
 
       setShowKillSwitchModal(
         false
@@ -1651,6 +1149,19 @@ Explain the reason for every trading decision.
   // EXECUTION MODE
   // ==========================================================
 
+  /*
+   * Execution-mode selection.
+   *
+   * LIVE is not implemented: `handleModeSelect` never sets it, and asking
+   * for it opens a notice explaining why instead. This is the only place
+   * the execution mode is written, so a connected wallet — or anything else
+   * — cannot turn a connected session into live trading.
+   *
+   * Two separate notions, deliberately not merged: the execution mode here
+   * is what fills are simulated as, while `venueEnvironment` is which
+   * Hyperliquid network the data comes from. A GOAT's own deployment mode
+   * is a third, and refuses LIVE outright.
+   */
   const handleModeSelect = (
     mode: ExecutionMode
   ) => {
@@ -1672,30 +1183,212 @@ Explain the reason for every trading decision.
 
 
   // ==========================================================
-  // AI CONTEXT
+  // READ-ONLY AI APPLICATION CONTEXT
   // ==========================================================
 
-  const aiContext: AIContext = {
-    currentTab,
+  /*
+   * The assistant reads from a sanitised projection of state the app
+   * already has. It cannot write, cannot reach the execution adapter or
+   * the wallet provider, and every payload is checked for
+   * credential-shaped keys before it leaves the store.
+   *
+   * Throttled, because `quotes` is a dependency and quotes arrive
+   * continuously: rebuilding every position, trade and instrument on each
+   * tick put a long synchronous handler in the browser's message loop for
+   * no benefit, since a person cannot read a balance faster than twice a
+   * second. The projection may therefore lag real state by up to half a
+   * second, which is the right trade for a read-only view of it.
+   */
+  useEffect(() => {
+    const publish = () => appContextStore.publish({
+      currentTab,
+      currentView: currentViewLabel(currentTab),
+      selectedMarket: symbol || undefined,
+      selectedTimeframe: timeframe,
+      selectedGoatId: selectedGoatIdRef.current || undefined,
+      executionMode,
+      account: {
+        balance,
+        equity,
+        marginUsed: margin,
+        freeMargin,
+        unrealizedPnL: positions.reduce(
+          (sum, position) => sum + position.unrealizedPnL,
+          0
+        ),
+        realizedPnlToday: trades.reduce(
+          (sum, trade) => sum + trade.pnl,
+          0
+        ),
+        openPositions: positions.length,
+        openTrades: trades.length,
+        runningGoats: goatOrchestrator.stores.goals
+          .list()
+          .filter((goal) => goal.status === 'MONITORING').length,
+        environment: executionMode,
+        liveExecutionAvailable: false,
+        accountCurrency: ACCOUNT_CURRENCY,
+        riskState: isKillSwitchActive
+          ? 'KILL_SWITCH'
+          : freeMargin <= 0
+            ? 'EXPOSURE_LIMITED'
+            : 'NORMAL',
+      },
+      positions: positions.map((position) => ({
+        id: position.id,
+        symbol: position.symbol,
+        side: position.side,
+        quantity: position.volume,
+        entryPrice: position.entryPrice,
+        markPrice: position.currentPrice,
+        unrealizedPnL: position.unrealizedPnL,
+        unrealizedPnlPercent: position.unrealizedPnlPercent,
+        stopLoss: position.stopLoss,
+        takeProfit: position.takeProfit,
+        openedAt: position.timestamp,
+        goatId: position.goatId,
+        goatName: position.goatName,
+      })),
+      trades: trades.map((trade) => ({
+        id: trade.id,
+        symbol: trade.symbol,
+        side: trade.side,
+        quantity: trade.volume,
+        entryPrice: trade.entryPrice,
+        exitPrice: trade.exitPrice,
+        realizedPnl: trade.pnl,
+        entryTime: trade.entryTime,
+        exitTime: trade.exitTime,
+        exitReason: trade.exitReason,
+        goatId: trade.goatId,
+        goatName: trade.goatName,
+      })),
+      markets: instruments.map((instrument) => ({
+        symbol: instrument.symbol,
+        displayName: instrument.displayName,
+        assetClass: instrument.assetClass,
+        providerSymbol: instrument.providerSymbol,
+        availability: instrument.availability,
+        unavailableReason: instrument.unavailableReason,
+        bid: quotes[instrument.symbol]?.bid,
+        ask: quotes[instrument.symbol]?.ask,
+        lastPrice: instrument.market?.lastPrice,
+        change24h: instrument.market?.change24h,
+        pricePrecision: instrument.pricePrecision,
+        sizePrecision: instrument.sizePrecision,
+        sizeStep: instrument.sizeStep,
+        minOrderSize: instrument.minOrderSize,
+        maxOrderSize: instrument.maxOrderSize,
+        maxLeverage: instrument.maxLeverage,
+        quoteCurrency: instrument.quoteCurrency,
+      })),
+      /*
+       * The AI context reports what the user is actually pursuing.
+       *
+       * A GOAT has no hand-authored observation plan to summarise — that
+       * is the point of the architecture — so what is reported is the
+       * goal, and what it has chosen to watch so far.
+       */
+      goats: [
+        ...goatOrchestrator.stores.goals.list().map((goal) => ({
+          id: goal.id,
+          statement: goal.statement,
+          status: goal.status,
+          skills: goal.skillIds,
+          updatedAt: goal.updatedAt,
+        })),
+        ...starterGoatContext(),
+      ],
+      riskLimits: {
+        ...riskManager.getLimits(),
+        killSwitchActive: isKillSwitchActive,
+      },
+      wallet: {
+        status: walletState.status,
+        authenticated: walletState.authenticated,
+        address: walletState.address,
+        shortAddress: walletState.shortAddress,
+        configured: walletState.configured,
+        liveExecutionEnabled: false,
+      },
+    });
 
-    selectedMarket:
-      symbol,
+    const now = Date.now();
+    const since = now - contextPublishRef.current.last;
+    if (since >= CONTEXT_PUBLISH_INTERVAL_MS) {
+      contextPublishRef.current.last = now;
+      publish();
+      return;
+    }
+    if (contextPublishRef.current.timer !== null) return;
+    contextPublishRef.current.timer = window.setTimeout(() => {
+      contextPublishRef.current.timer = null;
+      contextPublishRef.current.last = Date.now();
+      publish();
+    }, CONTEXT_PUBLISH_INTERVAL_MS - since);
+  }, [
+    currentTab, symbol, timeframe, executionMode, balance, equity, margin,
+    freeMargin, positions, trades, instruments, quotes, goatOrchestrator,
+    isKillSwitchActive, walletState,
+  ]);
 
-    accountBalance:
-      balance,
+  // A pending publish must not fire into an unmounted tree.
+  useEffect(
+    () => () => {
+      if (contextPublishRef.current.timer !== null) {
+        window.clearTimeout(contextPublishRef.current.timer);
+        contextPublishRef.current.timer = null;
+      }
+    },
+    [],
+  );
 
-    openPositionsCount:
-      positions.length,
 
-    activeBotsCount:
-      bots.filter(
-        (bot) =>
-          bot.status ===
-          'RUNNING'
-      ).length,
+  // ==========================================================
+  // CONDITION PREVIEW CONTEXT
+  // ==========================================================
 
-    ...aiCustomContext,
-  };
+  /*
+   * The condition preview needs the same state a tracker evaluation would
+   * see. It is read-only and lives entirely in the client; the backtest
+   * provider is only consulted when the user explicitly loads a range.
+   */
+  const conditionPreviewContext: TrackerConditionContext | undefined = useMemo(() => {
+    if (!symbol) return undefined;
+
+    const instrument = instruments.find(
+      (candidate) => candidate.symbol === symbol
+    );
+
+    const quote = quotes[symbol];
+
+    return {
+      state: {
+        timestamp: Date.now(),
+        environment: executionMode,
+        symbol,
+        timeframe,
+        price: quote
+          ? (quote.bid + quote.ask) / 2
+          : instrument?.market?.lastPrice,
+        spread: quote?.spread,
+        bars,
+        positions: positions
+          .filter((position) => position.symbol === symbol)
+          .map((position) => ({
+            id: position.id,
+            symbol: position.symbol,
+            side: position.side,
+            entryPrice: position.entryPrice,
+            currentPrice: position.currentPrice,
+            volume: position.volume,
+            stopLoss: position.stopLoss,
+            takeProfit: position.takeProfit,
+          })),
+      },
+      instrument,
+    };
+  }, [symbol, instruments, quotes, bars, positions, timeframe, executionMode]);
 
 
   // ==========================================================
@@ -1731,7 +1424,17 @@ Explain the reason for every trading decision.
   // ==========================================================
 
   return (
-    <div className="flex flex-col md:flex-row h-screen w-screen overflow-hidden bg-[#070b13] text-slate-200 select-none">
+    /*
+     * App shell.
+     *
+     * Scrolling model: the *document* is the only vertical scroll region.
+     * The sidebar and the header are `sticky`, so they stay put while the
+     * content column flows and scrolls at the viewport edge. Nothing here
+     * may set a height constraint or `overflow: hidden` on the shell, the
+     * sidebar, the header, or `<main>` - that is what previously trapped
+     * the page inside an inner scroll box on desktop.
+     */
+    <div className="flex min-h-screen w-full flex-col md:flex-row bg-bg text-ink-2">
 
       {/* =====================================================
           BOTTOM NAV
@@ -1760,12 +1463,11 @@ Explain the reason for every trading decision.
           positions.length
         }
 
-        runningBotsCount={
-          bots.filter(
-            (bot) =>
-              bot.status ===
-              'RUNNING'
-          ).length
+        runningGoatsCount={
+          goatOrchestrator.stores.goals
+            .list()
+            .filter((goal) => goal.status === 'MONITORING')
+            .length
         }
 
         user={
@@ -1789,15 +1491,40 @@ Explain the reason for every trading decision.
           MAIN APPLICATION
           ===================================================== */}
 
-      <div className="flex-1 flex flex-col h-full overflow-hidden relative">
+      <div className="flex min-w-0 flex-1 flex-col">
 
         {/* ===================================================
             MOBILE / TOP HEADER
             =================================================== */}
 
+        {/*
+         * A safety notice is rendered above everything else and cannot be
+         * dismissed by accident: if the emergency flatten only partly
+         * worked, that fact outranks whatever the user was doing.
+         */}
+        {safetyNotice && (
+          <div
+            role="alert"
+            className="sticky top-0 z-[100] flex items-start gap-3 border-b border-neg/50 bg-neg-soft/95 px-4 py-3 text-xs text-neg backdrop-blur"
+          >
+            <span className="flex-1">{safetyNotice}</span>
+            <button
+              type="button"
+              onClick={() => setSafetyNotice(null)}
+              className="shrink-0 rounded border border-neg/40 px-2 py-0.5 text-[10px] font-bold uppercase"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
         <MobileHeader
           executionMode={
             executionMode
+          }
+
+          venueEnvironment={
+            venueEnvironment
           }
 
           onToggleMode={
@@ -1825,23 +1552,18 @@ Explain the reason for every trading decision.
             )
           }
 
-          onOpenAI={() => {
-            if (
-              !requireOpenRouterKey()
-            ) {
-              return;
-            }
-
-            setExternalAIPrompt(
-              'What is the current market overview?'
-            );
-          }}
-
-          onOpenProfile={() =>
-            setShowProfileView(
-              true
+          onOpenAI={() =>
+            setAiOpenRequest(
+              (count) =>
+                count + 1
             )
           }
+
+          onOpenWalletSettings={() => {
+            setShowProfileView(false);
+            setShowDocsView(false);
+            setCurrentTab('settings');
+          }}
         />
 
 
@@ -1849,7 +1571,7 @@ Explain the reason for every trading decision.
             MAIN CONTENT
             =================================================== */}
 
-        <main className="flex-1 flex flex-col overflow-hidden relative">
+        <main className="flex min-w-0 flex-1 flex-col">
 
           {/* =================================================
               PROFILE
@@ -1878,7 +1600,7 @@ Explain the reason for every trading decision.
                DOCS
                =============================================== */
 
-            <div className="flex-1 overflow-y-auto p-4 max-w-4xl mx-auto w-full">
+            <div className="mx-auto w-full max-w-4xl p-4">
 
               <button
                 onClick={() =>
@@ -1887,7 +1609,7 @@ Explain the reason for every trading decision.
                   )
                 }
 
-                className="mb-3 text-xs font-semibold text-sky-400 hover:text-sky-300"
+                className="mb-3 text-xs font-semibold text-accent hover:text-accent-ink"
               >
                 ← Back to Settings
               </button>
@@ -1895,6 +1617,44 @@ Explain the reason for every trading decision.
               <DocsView />
 
             </div>
+
+          ) : currentTab === 'goat' ? (
+
+            /* ===============================================
+               GOAT — Goal-Oriented Agentic Trader
+               =============================================== */
+
+            <GoatView
+              onRefreshRequest={(
+                request,
+              ) => {
+                requestGoatViewRefresh =
+                  request;
+              }}
+
+              onOpenAISettings={() =>
+                setShowAIModal(
+                  true
+                )
+              }
+
+              orchestrator={
+                goatOrchestrator
+              }
+
+              markets={
+                marketsFromDiscovery(
+                  instruments
+                )
+                  .filter(
+                    (market) =>
+                      market.tradeable
+                  )
+                  .map(
+                    (market) =>
+                      market.id
+                  )
+              }            />
 
           ) : currentTab === 'trades' ? (
 
@@ -1949,7 +1709,7 @@ Explain the reason for every trading decision.
 
               onOpenBots={() =>
                 setCurrentTab(
-                  'bots'
+                  'goat'
                 )
               }
 
@@ -1959,10 +1719,6 @@ Explain the reason for every trading decision.
                 ) {
                   return;
                 }
-
-                setAiCustomContext(
-                  ctx
-                );
 
                 setExternalAIPrompt(
                   `Analyze my trade on ${
@@ -2040,105 +1796,11 @@ Explain the reason for every trading decision.
                   return;
                 }
 
-                setAiCustomContext(
-                  ctx
-                );
-
                 setExternalAIPrompt(
                   `Provide technical analysis and key levels for ${
                     ctx.selectedMarket ||
                     symbol
                   }`
-                );
-              }}
-            />
-
-          ) : currentTab === 'bots' ? (
-
-            /* ===============================================
-               BOTS / AGENTS
-               =============================================== */
-
-            <BotsTab
-              bots={
-                bots
-              }
-
-              strategies={
-                strategies
-              }
-
-              executionMode={
-                executionMode
-              }
-
-              onToggleBotStatus={
-                handleToggleBotStatus
-              }
-
-              onCreateBot={
-                handleCreateBot
-              }
-
-              /*
-               * Legacy backtest callback remains available to
-               * BotsTab for compatibility.
-               *
-               * It should not be used for AI BotDefinition
-               * backtesting; onBacktestBot is the canonical path.
-               */
-              onRunBacktest={
-                async () => null
-              }
-
-              onBacktestBot={
-                handleRunBotBacktest
-              }
-
-              botDefinitions={
-                botDefinitions
-              }
-
-              onSaveBotDefinition={(
-                definition
-              ) =>
-                setBotDefinitions(
-                  (current) => [
-                    definition,
-
-                    ...current.filter(
-                      (item) =>
-                        item.identity.id !==
-                        definition.identity.id
-                    ),
-                  ]
-                )
-              }
-
-              onGetBotActivity={
-                handleGetBotActivity
-              }
-
-              backtestResult={
-                backtestResult
-              }
-
-              onOpenAIWithPrompt={(
-                prompt,
-                ctx
-              ) => {
-                if (
-                  !requireOpenRouterKey()
-                ) {
-                  return;
-                }
-
-                setAiCustomContext(
-                  ctx
-                );
-
-                setExternalAIPrompt(
-                  prompt
                 );
               }}
             />
@@ -2160,10 +1822,6 @@ Explain the reason for every trading decision.
                 ) {
                   return;
                 }
-
-                setAiCustomContext(
-                  ctx
-                );
 
                 setExternalAIPrompt(
                   `Audit this historical trade on ${
@@ -2228,12 +1886,13 @@ Explain the reason for every trading decision.
               }
 
               accountStats={{
-                botsCount:
-                  bots.filter(
-                    (bot) =>
-                      bot.status ===
-                      'RUNNING'
-                  ).length,
+                goatsCount:
+                  goatOrchestrator.stores.goals
+                    .list()
+                    .filter(
+                      (goal) =>
+                        goal.status === 'MONITORING',
+                    ).length,
 
                 tradesCount:
                   trades.length,
@@ -2252,10 +1911,6 @@ Explain the reason for every trading decision.
             =================================================== */}
 
         <FloatingAIAssistant
-          context={
-            aiContext
-          }
-
           openPositions={
             positions
           }
@@ -2268,12 +1923,145 @@ Explain the reason for every trading decision.
             externalAIPrompt
           }
 
+          openRequest={
+            aiOpenRequest
+          }
+
           onClearExternalPrompt={() =>
             setExternalAIPrompt(
               null
             )
           }
+
+          hasProviderKey={
+            hasOpenRouterKey()
+          }
+
+          onOpenProviderSettings={() =>
+            setShowAIModal(
+              true
+            )
+          }
+
+          onSelectMarket={(next) => {
+            setSymbol(
+              next
+            );
+
+            setCurrentTab(
+              'quotes'
+            );
+          }}
+
+          onInspectTracker={() =>
+            setCurrentTab(
+              'goat'
+            )
+          }
+
+          onTestCondition={() =>
+            setCurrentTab(
+              'goat'
+            )
+          }
+
+          onGoatControl={async (
+            control,
+          ) => {
+            /*
+             * A GOAT runtime change, pressed by a person.
+             *
+             * The assistant puts a confirmation card on screen and nothing
+             * more; this is where the button lands. There is no path from
+             * model output to any of these three methods.
+             */
+            try {
+              if (
+                control.kind ===
+                'stop'
+              ) {
+                await goatOrchestrator.stopGoat(
+                  control.goalId,
+                  'Stopped from the assistant.',
+                );
+                goatViewRefresh();
+                return {
+                  ok: true,
+                  message: `Stopped. Its goal, thesis, evidence and any trade plan are kept, so you can play it again from the GOAT screen.`,
+                };
+              }
+
+              if (
+                control.kind ===
+                'resume'
+              ) {
+                const resumed =
+                  await goatOrchestrator.resumeGoat(
+                    control.goalId,
+                  );
+                goatViewRefresh();
+                return {
+                  ok: true,
+                  message: resumed.alreadyRunning
+                    ? 'It was already running.'
+                    : `Resumed on the same deployment. ${resumed.investigation.message}`,
+                };
+              }
+
+              const steered =
+                await goatOrchestrator.steerGoat(
+                  control.goalId,
+                  control.text ??
+                    '',
+                );
+              goatViewRefresh();
+              return {
+                ok: true,
+                message: steered.woke
+                  ? 'Sent. It will read that the next time it wakes — it is guidance, not a new goal.'
+                  : 'Recorded. It is not deployed, so it will read that when it next starts.',
+              };
+            } catch (
+              caught: unknown
+            ) {
+              return {
+                ok: false,
+                message: caught instanceof Error
+                  ? caught.message
+                  : String(caught),
+              };
+            }
+          }}
+
+          onNavigate={(
+            target
+          ) => {
+            /*
+             * Navigation only. The assistant can move the user between
+             * screens; it can never place, modify, or close a trade, and
+             * it can never change the execution environment.
+             */
+            const tab = tabForNavigation(target);
+
+            if (!tab) {
+              return;
+            }
+
+            setShowProfileView(
+              false
+            );
+
+            setShowDocsView(
+              false
+            );
+
+            setCurrentTab(
+              tab
+            );
+          }}
         />
+
+
 
       </div>
 
@@ -2287,18 +2075,25 @@ Explain the reason for every trading decision.
           showHyperliquidModal
         }
 
-        network={
-          hyperliquidNetwork
+        environment={
+          venueEnvironment
         }
 
-        onSave={(network) => {
-          setHyperliquidNetwork(
-            network
+        status={
+          connectionStatus
+        }
+
+        onSave={(environment) => {
+          setVenueEnvironment(
+            environment
           );
 
+          // Changing the environment re-reads every market and drops
+          // every cached series, sequence memory and quote from the
+          // other one, so nothing crosses over.
           void hyperliquidMarketData
-            .setNetwork(
-              network
+            .setEnvironment(
+              environment
             );
         }}
 
@@ -2358,11 +2153,22 @@ Explain the reason for every trading decision.
           positions.length
         }
 
-        onToggleKillSwitch={() =>
-          setIsKillSwitchActive(
-            (previous) =>
-              !previous
-          )
+        onToggleKillSwitch={
+          () => {
+            /*
+             * The kill switch is a safety control, and `riskManager` is
+             * the only thing that actually blocks an order. Toggling the
+             * React state alone left the header saying "Trading is halted"
+             * while `validateOrder` still returned valid, so every manual
+             * and agent order kept filling. The two must move together:
+             * the engine is the source of truth and the UI mirrors it.
+             */
+            setIsKillSwitchActive((previous) => {
+              const next = !previous;
+              riskManager.setKillSwitch(next);
+              return next;
+            });
+          }
         }
 
         onFlattenAllPositions={
@@ -2386,17 +2192,7 @@ Explain the reason for every trading decision.
           showLiveConfirm
         }
 
-        onConfirm={() => {
-          setExecutionMode(
-            'LIVE'
-          );
-
-          setShowLiveConfirm(
-            false
-          );
-        }}
-
-        onCancel={() =>
+        onClose={() =>
           setShowLiveConfirm(
             false
           )

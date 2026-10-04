@@ -24,7 +24,7 @@ import {
   InMemoryAgentTimelineStore,
   PersistentAgentTimelineStore,
 } from './timeline';
-import { BotDefinition, Deployment, compileBotDefinition } from './botDefinition';
+import { GoatDefinition, GoatDeployment, compileGoatDefinition } from '../goat/definition';
 
 export interface AgentInstance {
   agent: TradingAgent;
@@ -34,7 +34,7 @@ export interface AgentInstance {
   allowedCapabilities: string[];
   skillsInstructions: string;
   validator: ActionValidator;
-  botId?: string;
+  goatId?: string;
   deploymentId?: string;
 }
 
@@ -47,7 +47,7 @@ export class AgentRuntime {
 
   private readonly positionCorrelations = new Map<
     string,
-    { agentId: string; triggerId?: string; correlationId: string }
+    { agentId: string; trackerId?: string; correlationId: string }
   >();
 
   constructor(
@@ -169,7 +169,7 @@ export class AgentRuntime {
       allowedCapabilities,
       skillsInstructions,
       validator,
-      botId: agent.botId,
+      goatId: agent.goatId,
       deploymentId: agent.deploymentId,
     };
 
@@ -187,14 +187,52 @@ export class AgentRuntime {
     return instance;
   }
 
-  registerBot(
-    definition: BotDefinition,
-    deployment: Deployment,
+  /**
+   * Register the runtime agent for a deployed GOAT.
+   *
+   * Note what this does not take: no observation plan. The agent is given
+   * its goal, its skills and its authority, and then it works out what
+   * to monitor through the Tracker SDK. The observation plan is its own
+   * output.
+   */
+  registerGoat(
+    definition: GoatDefinition,
+    deployment: GoatDeployment,
     runtimeSymbol: string,
     env: ITradingEnvironment,
   ): AgentInstance {
-    const agent = compileBotDefinition(definition, deployment, runtimeSymbol, env.mode);
+    const agent = compileGoatDefinition({
+      definition,
+      deployment,
+      marketSymbol: runtimeSymbol,
+      env,
+    });
     return this.registerAgent(agent, env);
+  }
+
+  /**
+   * Forget an agent entirely.
+   *
+   * A GOAT is bound to a market by *deployment*, not by creation, so
+   * moving one to another market means the old executor has to go. Stop
+   * it first if it is running: this drops the instance, and a stopped
+   * agent that is dropped cannot wake, decide, or place anything.
+   *
+   * The tracker runtime keeps its own memory keyed by agent, so the
+   * caller retires that too — otherwise a redeployed GOAT would inherit
+   * the previous market's "already reported" state and stay silent.
+   */
+  unregisterAgent(agentId: string): boolean {
+    const instance = this.instances.get(agentId);
+    if (!instance) return false;
+    instance.isRunning = false;
+    this.instances.delete(agentId);
+    this.activeCycles.delete(agentId);
+    eventBus.emit({
+      type: 'AGENT_STOPPED',
+      data: { agentId, timestamp: Date.now() },
+    });
+    return true;
   }
 
   getAgent(agentId: string): AgentInstance | undefined {
@@ -418,25 +456,25 @@ export class AgentRuntime {
   ): Promise<AgentDecision> {
     const wakeEvent: AgentWakeEvent =
       event || {
-        type: 'MANUAL_TRIGGER',
+        type: 'MANUAL_WAKE',
         timestamp: Date.now(),
         symbol: instance.agent.symbols[0],
       };
 
-    const triggerData = isRecord(wakeEvent.data)
+    const wakeData = isRecord(wakeEvent.data)
       ? wakeEvent.data
       : undefined;
 
-    const triggerId =
-      typeof triggerData?.triggerId === 'string'
-        ? triggerData.triggerId
+    const trackerId =
+      typeof wakeData?.trackerId === 'string'
+        ? wakeData.trackerId
         : undefined;
 
     const correlationId =
-      typeof triggerData?.correlationId === 'string'
-        ? triggerData.correlationId
-        : triggerId
-          ? `${agentId}:${triggerId}:${wakeEvent.timestamp}`
+      typeof wakeData?.correlationId === 'string'
+        ? wakeData.correlationId
+        : trackerId
+          ? `${agentId}:${trackerId}:${wakeEvent.timestamp}`
           : `${agentId}:cycle:${wakeEvent.timestamp}`;
 
     let observation: AgentObservation;
@@ -453,7 +491,7 @@ export class AgentRuntime {
         agentId,
         timestamp: wakeEvent.timestamp,
         type: 'ERROR',
-        triggerId,
+        trackerId,
         correlationId,
         data: {
           code: 'OBSERVATION_ERROR',
@@ -482,7 +520,7 @@ export class AgentRuntime {
       timestamp: observation.timestamp,
       type: 'OBSERVATION',
       environment: instance.env.mode,
-      triggerId,
+      trackerId,
       correlationId,
       data: observationSnapshot(observation),
     });
@@ -542,8 +580,8 @@ export class AgentRuntime {
           ),
           iteration,
           wakeReason:
-            typeof triggerData?.reason === 'string'
-              ? triggerData.reason
+            typeof wakeData?.reason === 'string'
+              ? wakeData.reason
               : wakeEvent.type,
         });
       } catch (error: unknown) {
@@ -572,7 +610,7 @@ export class AgentRuntime {
           timestamp: await this.nowFor(instance),
           type: 'ERROR',
           environment: instance.env.mode,
-          triggerId,
+          trackerId,
           correlationId,
           data: {
             code: 'MODEL_ERROR',
@@ -659,7 +697,7 @@ export class AgentRuntime {
             timestamp: await this.nowFor(instance),
             type: 'RISK_CHECK',
             environment: instance.env.mode,
-            triggerId,
+            trackerId,
             correlationId,
             data: {
               status: 'REJECTED',
@@ -686,7 +724,7 @@ export class AgentRuntime {
           timestamp: await this.nowFor(instance),
           type: 'CAPABILITY_CALL',
           environment: instance.env.mode,
-          triggerId,
+          trackerId,
           correlationId,
           data: {
             capability: capId,
@@ -755,7 +793,7 @@ export class AgentRuntime {
           timestamp: await this.nowFor(instance),
           type: 'CAPABILITY_RESULT',
           environment: instance.env.mode,
-          triggerId,
+          trackerId,
           correlationId,
           data: {
             capability: capId,
@@ -771,7 +809,7 @@ export class AgentRuntime {
             timestamp: await this.nowFor(instance),
             type: 'ERROR',
             environment: instance.env.mode,
-            triggerId,
+            trackerId,
             correlationId,
             data: {
               code: 'CAPABILITY_ERROR',
@@ -936,7 +974,7 @@ export class AgentRuntime {
       timestamp: await this.nowFor(instance),
       type: 'RISK_CHECK',
       environment: instance.env.mode,
-      triggerId,
+      trackerId,
       correlationId,
       data: {
         status:
@@ -1005,7 +1043,7 @@ export class AgentRuntime {
               await this.nowFor(instance),
             type: 'ORDER',
             environment: instance.env.mode,
-            triggerId,
+            trackerId,
             correlationId,
             orderId:
               typeof executionRecord.orderId ===
@@ -1051,7 +1089,7 @@ export class AgentRuntime {
                 executionRecord.positionId,
                 {
                   agentId,
-                  triggerId,
+                  trackerId,
                   correlationId,
                 }
               );
@@ -1062,7 +1100,7 @@ export class AgentRuntime {
                   await this.nowFor(instance),
                 type: 'POSITION_UPDATE',
                 environment: instance.env.mode,
-                triggerId,
+                trackerId,
                 correlationId,
                 positionId:
                   executionRecord.positionId,
@@ -1153,7 +1191,7 @@ export class AgentRuntime {
             await this.nowFor(instance),
           type: 'ERROR',
           environment: instance.env.mode,
-          triggerId,
+          trackerId,
           correlationId,
           data: {
             code: 'EXECUTION_ERROR',
@@ -1300,7 +1338,7 @@ export class AgentRuntime {
       timestamp: auditRecord.timestamp,
       type: 'DECISION',
       environment: instance.env.mode,
-      triggerId,
+      trackerId,
       correlationId,
       data: {
         decision:
@@ -1392,7 +1430,7 @@ export class AgentRuntime {
       const instance = this.instances.get(event.agentId);
       await this.timeline.append({
         ...event,
-        botId: event.botId || instance?.botId,
+        goatId: event.goatId || instance?.goatId,
         deploymentId: event.deploymentId || instance?.deploymentId,
         environment: eventEnvironment,
         id:
@@ -1451,7 +1489,7 @@ export class AgentRuntime {
         type: 'POSITION_UPDATE',
         environment:
           this.instances.get(agentId)?.env.mode,
-        triggerId: correlation.triggerId,
+        trackerId: correlation.trackerId,
         correlationId:
           correlation.correlationId,
         positionId: position.id,
@@ -1488,7 +1526,7 @@ export class AgentRuntime {
       agentId: correlation.agentId,
       timestamp: Date.now(),
       type: 'POSITION_UPDATE',
-      triggerId: correlation.triggerId,
+      trackerId: correlation.trackerId,
       correlationId:
         correlation.correlationId,
       positionId,
@@ -1726,7 +1764,7 @@ export class AgentRuntime {
         'NEW_BAR',
         'PRICE_THRESHOLD',
         'POSITION_OPENED',
-        'TRIGGER_FIRED',
+        'TRACKER_OBSERVED',
         'POSITION_APPROACHING_STOP',
         'POSITION_REACHED_PROFIT_TARGET',
         'SPREAD_CHANGED',
@@ -1734,7 +1772,7 @@ export class AgentRuntime {
         'ORDER_FILLED',
         'ORDER_REJECTED',
         'RISK_STATE_CHANGED',
-        'MANUAL_TRIGGER',
+        'MANUAL_WAKE',
       ];
 
     if (

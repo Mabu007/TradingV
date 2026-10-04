@@ -5,6 +5,14 @@ export type ConnectionStatus =
   | 'CONNECTING'
   | 'CONNECTED'
   | 'RECONNECTING'
+  /**
+   * The socket is open and the venue has said nothing for a while.
+   *
+   * A state rather than an absence, because the failure it describes is
+   * invisible otherwise: the UI keeps showing a last-known price and
+   * nothing in the interface says that price is from the past.
+   */
+  | 'STALE'
   | 'ERROR';
 
 export type TradingEnvironment = 'DEMO' | 'LIVE';

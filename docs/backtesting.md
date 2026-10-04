@@ -1,6 +1,6 @@
 # Backtesting Engine
 
-This document details the historical backtesting simulator, financial simulation metrics, and CSV reporting engine in **TradingVibe**.
+This document details the historical backtesting simulator, financial simulation metrics, and CSV reporting engine in **TradingGOATs**.
 
 ---
 
@@ -25,7 +25,7 @@ graph TD
 
 ## 2. Realistic Market Simulation
 
-Unlike naive backtesters that assume fills occur exactly at bar close prices with zero transaction costs, TradingVibe incorporates realistic institutional friction:
+Unlike naive backtesters that assume fills occur exactly at bar close prices with zero transaction costs, TradingGOATs incorporates realistic institutional friction:
 
 1. **Spread Simulation**: Orders pay a configurable spread, expressed as a raw price distance or, for pip-quoted Forex instruments, in pips. Buy orders enter at Ask, Sell orders at Bid.
 2. **Commission Simulation**: Standard institutional commission of **$3.50 per lot** ($7.00 round turn).

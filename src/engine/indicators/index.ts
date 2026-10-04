@@ -154,9 +154,35 @@ export function calculateBollingerBands(
   return { upper, middle, lower };
 }
 
+/**
+ * Wilder's smoothing, aka RMA.
+ *
+ * Deliberately *not* an EMA. ATR is defined as an RMA of true range
+ * with alpha = 1/period, whereas an EMA uses alpha = 2/(period + 1).
+ * The two share a seed and diverge from the next sample onward, so
+ * conflating them makes the browser disagree with the engine on the
+ * same candles. The Python engine is the authority here; this matches it.
+ */
+export function calculateRMA(values: number[], period: number): number[] {
+  if (period <= 0 || values.length === 0) return [];
+  const result: number[] = new Array(values.length).fill(NaN);
+  if (values.length < period) return result;
+
+  let sum = 0;
+  for (let i = 0; i < period; i++) sum += values[i];
+  result[period - 1] = Number((sum / period).toFixed(6));
+
+  for (let i = period; i < values.length; i++) {
+    result[i] = Number(((result[i - 1] * (period - 1) + values[i]) / period).toFixed(6));
+  }
+  return result;
+}
+
 export function calculateATR(bars: Bar[], period: number = 14): number[] {
   if (bars.length === 0 || period <= 0) return [];
   const tr: number[] = new Array(bars.length);
+  // Matches the engine: with no previous close on the first bar, the
+  // true range can only be the bar's own high-low.
   tr[0] = bars[0].high - bars[0].low;
 
   for (let i = 1; i < bars.length; i++) {
@@ -166,7 +192,7 @@ export function calculateATR(bars: Bar[], period: number = 14): number[] {
     tr[i] = Math.max(hl, hc, lc);
   }
 
-  return calculateEMA(tr, period);
+  return calculateRMA(tr, period);
 }
 
 export const indicators: IndicatorOutputs = {
