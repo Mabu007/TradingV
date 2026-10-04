@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Pencil, Rocket, Trash2, ChevronRight } from 'lucide-react';
+import { ChevronDown, Pencil, Rocket, Trash2, ChevronRight } from 'lucide-react';
 import { ConfirmDestructive } from './ConfirmDestructive';
 import type { GoatMission } from '../../engine/goat/mission';
 
@@ -27,8 +27,33 @@ export const MyGoatCard: React.FC<MyGoatCardProps> = ({
   onDeploy,
   onArchive,
 }) => {
+  /*
+   * The disclosure.
+   *
+   * A list of GOATs has to stay scannable, so the objective is clamped to a
+   * couple of lines and the full description is one click away. The toggle is a
+   * separate control from "Open" on purpose: opening a GOAT is navigation, and
+   * expanding a card is not — a reader who wants to know what a GOAT is should
+   * not have to leave the list to find out.
+   *
+   * Keyboard-accessible because it is a real `<button>` with `aria-expanded`,
+   * and it stops propagation so expanding never doubles as opening.
+   */
+  const [expanded, setExpanded] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const deployed = mission.deployment !== undefined;
+  /*
+   * Always shown.
+   *
+   * It was originally conditional on the GOAT having a description or skills, on
+   * the reasoning that a card with nothing to add should not offer an expansion.
+   * That reasoning is wrong here: the collapsed card already shows a two-line,
+   * truncated objective, so the expansion is what makes the *whole* objective
+   * readable. Gating it on extra metadata meant the control was absent for exactly
+   * the cards that needed it — a starter GOAT with nothing but an objective showed
+   * an objective no one could read in full.
+   */
+  const hasDisclosure = true;
 
   return (
     <article className="flex flex-col rounded-2xl border border-line bg-surface transition-colors hover:border-accent/40">
@@ -42,12 +67,15 @@ export const MyGoatCard: React.FC<MyGoatCardProps> = ({
           <StatusChip mission={mission} />
         </div>
 
-        {mission.description && (
-          <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-ink-2">
-            {mission.description}
-          </p>
-        )}
-        <p className="mt-2 line-clamp-3 text-[11px] leading-relaxed text-ink-3">{mission.goal}</p>
+        <p
+          className={
+            expanded
+              ? 'mt-2 text-[11px] leading-relaxed text-ink-3'
+              : 'mt-2 line-clamp-2 text-[11px] leading-relaxed text-ink-3'
+          }
+        >
+          {mission.goal}
+        </p>
 
         <dl className="mt-3 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[10px] text-ink-4">
           {mission.market && (
@@ -56,10 +84,60 @@ export const MyGoatCard: React.FC<MyGoatCardProps> = ({
               {mission.mode ? ` · ${mission.mode}` : ''}
             </span>
           )}
+          {mission.timeframes.length > 0 && <span>{mission.timeframes.join(' · ')}</span>}
           {deployed && <span>{mission.activeTrackerCount} watching</span>}
           {mission.tradePlan && <span>plan {mission.tradePlan.status.replace(/_/g, ' ')}</span>}
         </dl>
       </button>
+
+      {hasDisclosure && (
+        <div className="border-t border-line/60 px-5 py-2.5">
+          <button
+            type="button"
+            onClick={(event) => {
+              // Never let this double as "Open": the card is a button next door.
+              event.stopPropagation();
+              setExpanded((value) => !value);
+            }}
+            aria-expanded={expanded}
+            aria-label={`${expanded ? 'Hide' : 'Show'} the details of ${mission.name || 'this GOAT'}`}
+            data-testid="goat-disclosure"
+            data-goat-id={mission.goalId}
+            className="inline-flex items-center gap-1.5 font-mono text-[10px] tracking-[0.12em] text-ink-4 transition-colors hover:text-ink-2"
+          >
+            <ChevronDown
+              className={`h-3 w-3 transition-transform ${expanded ? 'rotate-180' : ''}`}
+              aria-hidden="true"
+            />
+            {expanded ? 'HIDE DETAILS' : 'WHAT IT DOES'}
+          </button>
+
+          {expanded && (
+            <div
+              className="mt-2 space-y-2 text-[11px] leading-relaxed text-ink-3"
+              data-testid="goat-disclosure-body"
+            >
+  {mission.description && <p>{mission.description}</p>}
+              <p className="text-ink-2">
+                <span className="font-mono text-[9px] tracking-[0.14em] text-ink-4">OBJECTIVE </span>
+                {mission.goal}
+              </p>
+              {mission.interpretation && (
+                <p className="text-ink-3">
+                  <span className="font-mono text-[9px] tracking-[0.14em] text-ink-4">READS IT AS </span>
+                  {mission.interpretation}
+                </p>
+              )}
+              {mission.skillIds.length > 0 && (
+                <p>
+                  <span className="font-mono text-[9px] tracking-[0.14em] text-ink-4">SKILLS </span>
+                  {mission.skillIds.join(' · ')}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="flex flex-wrap items-center gap-1.5 border-t border-line px-4 py-2.5">
         <CardAction onClick={() => onOpen(mission.goalId)} label={`Open ${mission.name || 'GOAT'}`} icon={<ChevronRight className="h-3 w-3" />}>

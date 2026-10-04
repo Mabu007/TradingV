@@ -84,7 +84,7 @@ type Screen = 'home' | 'create' | 'review' | 'deploy' | 'detail' | 'backtest';
  */
 type Tab = 'mine' | 'explore' | 'skills';
 
-type Activity = 'idle' | 'creating' | 'deploying' | 'starting' | 'stopping' | 'archiving' | 'reading';
+type Activity = 'idle' | 'creating' | 'deploying' | 'starting' | 'stopping' | 'archiving' | 'reading' | 'refresh';
 
 export const GoatView: React.FC<GoatViewProps> = ({
   orchestrator,
@@ -688,6 +688,21 @@ export const GoatView: React.FC<GoatViewProps> = ({
               onChanged={refresh}
               onDeploy={() => setScreen('deploy')}
               onBacktest={() => backtestGoat(mission)}
+              onRefresh={() => {
+                setActivity('refresh');
+                void orchestrator
+                  .refreshGoat(mission.goalId)
+                  .then((report) => {
+                    setNotice(
+                      `Started fresh. Cleared ${report.cleared.trackers} condition${report.cleared.trackers === 1 ? '' : 's'}, its runtime state and anything it was mid-way through answering. The GOAT, its market, its skills and its history are untouched.`,
+                    );
+                  })
+                  .catch((caught: unknown) => setError(describe(caught)))
+                  .finally(() => {
+                    setActivity('idle');
+                    refresh();
+                  });
+              }}
               onArchive={() => void archive(mission.goalId)}
             />
           </>

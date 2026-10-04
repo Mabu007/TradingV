@@ -23,7 +23,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Compass, History, Loader2, Pause, Play, Rocket, Send, Trash2 } from 'lucide-react';
+import { Compass, History, Loader2, Pause, Play, RefreshCw, Rocket, Send, Trash2 } from 'lucide-react';
 
 import type { GoatOrchestrator } from '../../engine/goat/orchestrator';
 import type { AgentEventView } from '../../engine/goat/agentEvents';
@@ -56,6 +56,16 @@ export interface GoatWorkspaceProps {
    * question.
    */
   onBacktest?: () => void;
+  /**
+   * Start the agent again from a clean runtime state.
+   *
+   * Deliberately not "Delete" and not "Deploy". The GOAT, its market, its
+   * skills and its history survive; what goes is the runtime — the agent
+   * instance, its conditions, their cooldowns, and anything it was part-way
+   * through answering. Confirmation is required, because a control that resets
+   * an agent should never be one tap away from a muscle memory.
+   */
+  onRefresh?: () => void;
   onArchive?: () => void;
 }
 
@@ -68,6 +78,7 @@ export const GoatWorkspace: React.FC<GoatWorkspaceProps> = ({
   onDismissError,
   onDeploy,
   onBacktest,
+  onRefresh,
   onArchive,
 }) => {
   /*
@@ -153,6 +164,17 @@ export const GoatWorkspace: React.FC<GoatWorkspaceProps> = ({
     }
   }, [onArchive]);
 
+  /*
+   * Refresh is confirmed, because it is the only control here that discards
+   * something the user cannot see.
+   *
+   * The dialog states exactly what survives, because "clear the runtime" is the
+   * sort of phrase that makes someone hesitate for the wrong reason: nothing
+   * permanent is at stake, and a GOAT that has drifted needs this.
+   */
+  const [confirmRefresh, setConfirmRefresh] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+
   const [steeringOpen, setSteeringOpen] = useState(false);
   const [steeringText, setSteeringText] = useState('');
   const [steeringBusy, setSteeringBusy] = useState(false);
@@ -184,6 +206,7 @@ export const GoatWorkspace: React.FC<GoatWorkspaceProps> = ({
         onPlay={() => void orchestrator.resumeGoat(mission.goalId).then(onChanged)}
         onDeploy={onDeploy}
         onBacktest={onBacktest}
+        onRefresh={onRefresh}
         onArchive={onArchive ? () => setConfirmDelete(true) : undefined}
       />
 
@@ -240,6 +263,25 @@ export const GoatWorkspace: React.FC<GoatWorkspaceProps> = ({
         />
       </div>
 
+      {onRefresh && (
+        <ConfirmDestructive
+          open={confirmRefresh}
+          busy={refreshing}
+          title={`Start "${mission.name || 'this GOAT'}" fresh?`}
+          body="Its runtime is cleared: the running agent, the conditions it is watching, their cooldowns, and anything it was part-way through answering."
+          keptNote="The GOAT itself is kept — its objective, skills, market, deployment, Trade Plan history and evidence all stay. It will read the market again and form a new plan."
+          confirmLabel="Start fresh"
+          testId="goat-refresh-confirm"
+          onConfirm={() => {
+            setRefreshing(true);
+            onRefresh?.();
+            setConfirmRefresh(false);
+            window.setTimeout(() => setRefreshing(false), 600);
+          }}
+          onCancel={() => setConfirmRefresh(false)}
+        />
+      )}
+
       {onArchive && (
         <ConfirmDestructive
           open={confirmDelete}
@@ -271,6 +313,16 @@ interface GoatHeaderProps {
   onPlay: () => void;
   onDeploy: () => void;
   onBacktest?: () => void;
+  /**
+   * Start the agent again from a clean runtime state.
+   *
+   * Deliberately not "Delete" and not "Deploy". The GOAT, its market, its
+   * skills and its history survive; what goes is the runtime — the agent
+   * instance, its conditions, its cooldowns and anything it was mid-way through
+   * answering. Confirmation is required, because a control that resets an agent
+   * should never be one tap away from a muscle memory.
+   */
+  onRefresh?: () => void;
   onArchive?: () => void;
 }
 
@@ -282,7 +334,7 @@ interface GoatHeaderProps {
  * that is the order the questions arrive in.
  */
 const GoatHeader: React.FC<GoatHeaderProps> = ({
-  mission, now, live, steeringPending, busy, onSteer, onStop, onPlay, onDeploy, onBacktest, onArchive,
+  mission, now, live, steeringPending, busy, onSteer, onStop, onPlay, onDeploy, onBacktest, onRefresh, onArchive,
 }) => {
   const stopped = mission.runtime === 'STOPPED' || mission.runtime === 'PAUSED';
   return (
@@ -324,6 +376,17 @@ const GoatHeader: React.FC<GoatHeaderProps> = ({
             testId="goat-backtest"
           >
             Backtest
+          </ControlButton>
+        )}
+        {onRefresh && (
+          <ControlButton
+            onClick={onRefresh}
+            disabled={busy}
+            icon={<RefreshCw className="h-3 w-3" />}
+            testId="goat-refresh"
+            label="Start fresh: clear this GOAT's runtime and let it reason again"
+          >
+            Refresh
           </ControlButton>
         )}
         <ControlButton onClick={onSteer} icon={<Compass className="h-3 w-3" />}>

@@ -41,34 +41,10 @@ import { watcherIdFor } from './ids';
 import { consume, isPreflight, type RateBucket, type RateDecision, type RateLimitState } from './rate-limit';
 import type { WatcherAction } from './contract';
 import type { HealthReport } from './health';
+import type { Env } from './env';
+import { identifyCaller } from './auth';
 
-export interface Env extends WatcherEnv {
-  /** Watchers. One object per (userId, goatId, deploymentId). */
-  WATCHERS: DurableObjectNamespace;
-  /** Per-user list of deployments, so a user can list their watchers. */
-  REGISTRY: DurableObjectNamespace;
-  /** Per-market list of deployments, so a feed can fan out by symbol. */
-  MARKET_INDEX: DurableObjectNamespace;
-  /** Per-user request budget, so one caller cannot spin objects. */
-  RATE_LIMITS: DurableObjectNamespace;
-  /**
-   * Shared secret for the market-data feed.
-   *
-   * Compared with a constant-time comparison, and rejected outright when
-   * unset: an unauthenticated feed would let anyone wake any bot.
-   */
-  MARKET_FEED_TOKEN?: string;
-  /**
-   * The signed header the authenticated gateway sets.
-   *
-   * V0 has no real identity provider, so this is a single shared secret
-   * standing in for one. It is documented as a YELLOW item: a real
-   * deployment needs per-user tokens with expiry, and this is explicitly
-   * not that.
-   */
-  AUTH_TOKEN?: string;
-  ALLOWED_ORIGINS?: string;
-}
+export type { Env } from './env';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
 
@@ -483,18 +459,15 @@ export class MarketIndexObject extends DurableObject<Env> {
  * Plumbing
  * ------------------------------------------------------------------ */
 
+/**
+ * Identify the caller, or refuse.
+ *
+ * Thin wrapper over `identifyCaller`, so a route reads as "who is this, and is
+ * that anybody?" rather than reaching for a header.
+ */
 async function authenticate(request: Request, env: Env): Promise<string | null> {
-  if (!env.AUTH_TOKEN) return null;
-  const header = request.headers.get('Authorization') ?? '';
-  const presented = header.startsWith('Bearer ') ? header.slice(7) : '';
-  if (!constantTimeEquals(presented, env.AUTH_TOKEN)) return null;
-  /*
-   * V0 stands in for a real identity provider with one shared token, so
-   * the user id is fixed. A production deployment replaces this with a
-   * verified per-user claim; until then every caller is the same user,
-   * which is honest because there is only one user.
-   */
-  return request.headers.get('X-User-Id') || 'v0-single-user';
+  const caller = await identifyCaller(request, env);
+  return caller.userId.length > 0 ? caller.userId : null;
 }
 
 /** Length-independent comparison, so a mismatch does not leak by timing. */

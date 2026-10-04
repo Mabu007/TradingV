@@ -382,6 +382,37 @@ export interface GoatDeps {
   venueEnvironment?: VenueEnvironment;
 }
 
+/**
+ * What a refresh cleared and what it deliberately kept.
+ *
+ * Returned rather than logged alone, because "clear the runtime" is a
+ * destructive-sounding request and the user is entitled to see the boundary the
+ * product drew: the runtime went, the GOAT stayed.
+ */
+export interface RefreshReport {
+  cleared: {
+    /** Trackers that existed before the refresh. */
+    trackers: number;
+    /** Of those, the ones cancelled outright rather than disposed. */
+    cancelledTrackers: number;
+    /** True when a model request was outstanding and has been abandoned. */
+    pendingModelRequest: boolean;
+    /** Unprompted "look again" attempts discarded. */
+    reconsiderations: number;
+    /** Recorded model timings discarded. */
+    modelTimings: boolean;
+    /** The runtime instance was rebuilt. */
+    executor: boolean;
+  };
+  kept: {
+    goal: boolean;
+    deployment: boolean;
+    deploymentId?: string;
+    theses: number;
+    evidence: number;
+  };
+}
+
 export interface CreateGoatResult {
   agentId: string;
   goal: Goal;
@@ -498,6 +529,33 @@ export class GoatOrchestrator {
    * surface infers from timestamps.
    */
   private readonly modelCalls = new Map<string, Array<{ at: number; elapsedMs: number; phase: 'FORMING' | 'UPDATING' }>>();
+
+  /**
+   * Bumped whenever a GOAT's runtime is rebuilt under an in-flight request.
+   *
+   * The stale-reply hazard, closed. Clearing `pendingModels` on a refresh stops
+   * the *indicator* from lying, but the call that was already awaiting the model
+   * is still holding a promise: when it comes back it will parse the answer and
+   * apply it — forming a Trade Plan and arming conditions on a runtime the user
+   * has just deliberately emptied.
+   *
+   * A generation counter is the smallest thing that distinguishes "this answer
+   * belongs to the runtime that asked" from "this answer belongs to the one
+   * before the refresh", without threading a cancellation signal through every
+   * reasoning path.
+   */
+  private readonly runtimeGeneration = new Map<string, number>();
+
+  /** The generation an agent's runtime is currently at. */
+  runtimeGenerationFor(agentId: string): number {
+    return this.runtimeGeneration.get(agentId) ?? 0;
+  }
+
+  private bumpRuntimeGeneration(agentId: string): number {
+    const next = this.runtimeGenerationFor(agentId) + 1;
+    this.runtimeGeneration.set(agentId, next);
+    return next;
+  }
 
   constructor(private readonly deps: GoatDeps) {
     this.stores = deps.stores;
@@ -1895,10 +1953,27 @@ export class GoatOrchestrator {
      */
     this.ensureExecutor(goal, deployment);
 
+    const generation = this.runtimeGenerationFor(goal.agentId);
     this.investigating.add(goal.agentId);
     try {
       const investigation = await this.proposeInvestigation(goal, deployment);
       const proposal = investigation;
+
+      /*
+       * The runtime was rebuilt while this pass was talking to the model.
+       *
+       * The answer is still good — it is the market's answer, not the runtime's
+       * — but it was formed against a runtime that no longer exists, and
+       * applying it would form a Trade Plan and arm conditions on a GOAT the user
+       * has just emptied. Dropping it is the honest outcome, and it says so.
+       */
+      if (this.runtimeGenerationFor(goal.agentId) !== generation) {
+        return failed(
+          'The GOAT was refreshed while this pass was in flight, so its answer was discarded rather than applied.',
+          'NOT_DEPLOYED',
+          true,
+        );
+      }
 
       if (proposal.unavailable) {
         /*
@@ -2130,6 +2205,130 @@ export class GoatOrchestrator {
    * agent has not decided its history never happened, and a history that
    * vanishes on a pause is a history that cannot be read back.
    */
+  /**
+   * Start this GOAT again from a clean runtime state.
+   *
+   * "Refresh" is not "delete" and not "deploy again". The user is saying: this
+   * agent's *thinking* has drifted — it is holding a stale belief, reacting to
+   * conditions that no longer describe the market, or carrying an error it has
+   * not recovered from — and they want it to reason again from what is true now.
+   * The GOAT itself, its market, its skills, its risk configuration, its history
+   * and its ownership are not in question.
+   *
+   * So this clears exactly the transient layer:
+   *
+   *   kept    the goal, its skills, the deployment record and its identity
+   *           (one deployment, never a second), the theses and evidence already
+   *           recorded, the trade plans, the activity feed, the user
+   *   cleared  the executor, the trackers and their cooldowns and TTLs, the
+   *           pending "look again" timer, the unprompted-look counter, the
+   *           recorded model timings, and the agent's in-memory instance
+   *
+   * The deployment record is reactivated *in place*, so a refresh cannot leave
+   * two deployments for one GOAT, and the tracker runtime is rebuilt empty
+   * rather than re-seeded — the GOAT re-arms its own conditions from the market
+   * it can actually see, which is the whole point of asking for a second pass.
+   *
+   * Returns what was cleared, because a control that resets something has to be
+   * able to say what it reset.
+   */
+  async refreshGoat(goalId: string, reason = 'Refreshed by the operator.'): Promise<RefreshReport> {
+    const goal = this.stores.goals.get(goalId);
+    if (!goal) throw new Error(`Unknown goal ${goalId}.`);
+
+    const deployment = this.stores.deployments.currentFor(goal.agentId)
+      ?? this.stores.deployments.historyFor(goal.agentId)[0];
+
+    /*
+     * Stop everything that could still act.
+     *
+     * In order, and before anything is rebuilt: the pending model request is
+     * cleared so a late reply cannot mutate a runtime that no longer exists, the
+     * "look again" timer is cancelled, and the trackers are disposed. A refresh
+     * that left a tracker armed would produce exactly the duplicate the user is
+     * trying to escape.
+     */
+    const inFlightModel = this.pendingModels.has(goal.agentId);
+    this.pendingModels.delete(goal.agentId);
+    this.clearReconsideration(goal.agentId);
+    /*
+     * Invalidate every reasoning step that is mid-flight for this GOAT. When
+     * those promises come back they will find a newer generation and drop their
+     * answer instead of applying it to the runtime the user just cleared.
+     */
+    this.bumpRuntimeGeneration(goal.agentId);
+
+    const trackersBefore = this.trackers.listForGoal(goalId);
+    const cancelled = this.trackers.cancelTrackersForAgent(goal.agentId, reason);
+    const theses = this.stores.theses.listForGoal(goalId);
+    const evidenceKept = theses.reduce((total, thesis) => total + this.stores.evidence.listForThesis(thesis.id).length, 0);
+
+    if (this.deps.agentRuntime.getAgent(goal.agentId)) {
+      await this.deps.agentRuntime.stop(goal.agentId);
+      this.deps.agentRuntime.unregisterAgent(goal.agentId);
+    }
+    this.trackers.disposeAgent(goal.agentId);
+    this.modelCalls.delete(goal.agentId);
+    const looksDiscarded = this.noThesisLooks.get(goal.agentId) ?? 0;
+    this.noThesisLooks.delete(goal.agentId);
+
+    /*
+     * Reactivate the same deployment rather than creating one.
+     *
+     * A new deployment id would give the GOAT a second runtime identity, and
+     * anything keyed on deployment identity — the tracker tier's objects, the
+     * history, the risk record — would then describe two deployments where the
+     * user has one.
+     */
+    if (deployment) {
+      this.stores.deployments.save({ ...deployment, status: 'active', updatedAt: this.now() });
+      this.stores.goals.save({ ...goal, status: 'MONITORING', updatedAt: this.now() });
+    }
+
+    this.recordActivity({
+      goatId: goal.agentId,
+      deploymentId: deployment?.id,
+      agentId: goal.agentId,
+      type: 'GOAT_RESTARTED',
+      data: {
+        reason,
+        market: deployment?.marketId,
+        clearedTrackers: trackersBefore.length,
+        keptTheses: theses.length,
+        keptEvidence: evidenceKept,
+      },
+    });
+
+    /*
+     * Re-register the executor so the GOAT is deployable again immediately. No
+     * investigation is started here: the user pressed Refresh, not Start, and a
+     * silent model call would be the same "quiet seconds" this product stopped
+     * doing three commits ago.
+     */
+    if (deployment) {
+      const refreshed = this.stores.goals.get(goalId)!;
+      this.ensureExecutor(refreshed, this.stores.deployments.currentFor(goal.agentId) ?? deployment);
+    }
+
+    return {
+      cleared: {
+        trackers: trackersBefore.length,
+        cancelledTrackers: cancelled.length,
+        pendingModelRequest: inFlightModel,
+        reconsiderations: looksDiscarded,
+        modelTimings: true,
+        executor: true,
+      },
+      kept: {
+        goal: true,
+        deployment: deployment !== undefined,
+        deploymentId: deployment?.id,
+        theses: theses.length,
+        evidence: evidenceKept,
+      },
+    };
+  }
+
   async stopGoat(goalId: string, reason = 'Stopped by the operator.'): Promise<GoatDeployment | undefined> {
     await this.undeployGoat(goalId, reason);
     const goal = this.stores.goals.get(goalId);

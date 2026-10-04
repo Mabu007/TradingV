@@ -1,5 +1,8 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+
+import { AuthGate } from './components/auth/AuthGate';
+import { configureFirebase } from './services/firebase/configure';
 import App from './App.tsx';
 import { ErrorBoundary } from './components/layout/ErrorBoundary.tsx';
 import { WalletProvider } from './services/wallet/index.ts';
@@ -34,7 +37,15 @@ createRoot(document.getElementById('root')!).render(
           through `useWallet()` and never touches the SDK directly.
         */}
         <WalletProvider>
-          <App />
+          {/*
+            The account gate sits outside the application, not inside a view, for
+            one reason: it must be in effect before any surface reads a session.
+            Wrapping a single view would leave the rest of the tree rendering for a
+            user who is not signed in.
+          */}
+          <AuthGate services={configureFirebase()}>
+            <App />
+          </AuthGate>
         </WalletProvider>
       </ThemeProvider>
     </ErrorBoundary>

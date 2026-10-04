@@ -37,6 +37,8 @@ export interface ConfirmDestructiveProps {
   busy?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
+  /** Named for the flows that assert on a destructive action by its role. */
+  testId?: string;
 }
 
 export const ConfirmDestructive: React.FC<ConfirmDestructiveProps> = ({
@@ -49,6 +51,7 @@ export const ConfirmDestructive: React.FC<ConfirmDestructiveProps> = ({
   busy,
   onConfirm,
   onCancel,
+  testId,
 }) => {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const cancelRef = useRef<HTMLButtonElement | null>(null);

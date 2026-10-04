@@ -1820,6 +1820,132 @@ test('timeframes: an objective that names its resolutions is not overruled', asy
 });
 
 // ---------------------------------------------------------------------------
+// 9. Refresh: a clean runtime without losing the GOAT
+// ---------------------------------------------------------------------------
+
+test('refresh: the runtime is cleared and the GOAT, its deployment and its history are not', async () => {
+  const h = makeHarness();
+  await h.investigate();
+
+  const before = h.mission();
+  const goal = h.orchestrator.getGoal(h.goalId)!;
+  const deploymentId = before.deployment?.id;
+  const thesisId = before.thesis?.id;
+  const evidenceBefore = before.evidence.length;
+  const trackersBefore = before.activeTrackerCount;
+  assert(trackersBefore > 0, 'there was something running to clear');
+
+  const report = await h.orchestrator.refreshGoat(h.goalId);
+
+  const after = h.mission();
+
+  // --- cleared ---------------------------------------------------------
+  assertEqual(report.cleared.trackers, trackersBefore, 'every tracker it had was reported as cleared');
+  assertEqual(after.activeTrackerCount, 0, 'and none of them is watching any more');
+  assertEqual(after.modelPending, undefined, 'no model request survives a refresh');
+  assertEqual(statusFor(after, h.clock.now()) === 'ERROR', false, 'and the GOAT is not left in a broken state');
+
+  // --- kept -------------------------------------------------------------
+  assertEqual(h.orchestrator.getGoal(h.goalId)?.id, goal.id, 'the GOAT is the same GOAT');
+  assertEqual(h.orchestrator.getGoal(h.goalId)?.statement, goal.statement, 'with the same objective');
+  assertEqual(
+    h.orchestrator.stores.deployments.currentFor(h.agentId)?.id,
+    deploymentId,
+    'and the same deployment identity — a refresh is not a second deployment',
+  );
+  assertEqual(after.deployment?.marketId, before.deployment?.marketId, 'pointed at the same market');
+  assertEqual(h.orchestrator.listThesesForGoal(h.goalId).length, before.thesisCount, 'its plan history is intact');
+  assert(after.evidence.length >= evidenceBefore, 'and its evidence is');
+  assertEqual(
+    h.orchestrator.stores.theses.get(thesisId!) !== undefined,
+    true,
+    'the thesis it was holding is still on record, even though nothing watches it now',
+  );
+
+  // --- and it is runnable again, without a duplicate runtime -------------
+  const restarted = await h.orchestrator.investigateGoal(h.goalId);
+  assert(restarted.deployed, 'it can be started again immediately');
+  const trackers = h.trackers.listForAgent(h.agentId).filter((tracker) => tracker.lifecycle.status === 'ACTIVE');
+  assertEqual(
+    trackers.length,
+    new Set(trackers.map((tracker) => tracker.purpose)).size,
+    'with one watch per condition, never two copies of the same watch',
+  );
+  assertEqual(
+    h.orchestrator.stores.deployments.historyFor(h.agentId).filter((entry) => entry.status === 'active').length,
+    1,
+    'and exactly one active deployment for this GOAT',
+  );
+});
+
+test('refresh: a GOAT with no deployment can be refreshed without inventing one', async () => {
+  const clock = makeClock();
+  const env = new StubEnvironment();
+  const agentRuntime = new AgentRuntime(undefined, undefined, undefined, undefined, new InMemoryAgentTimelineStore());
+  const trackers = new TrackerRuntime({
+    registry: new TrackerRegistry((id) => agentRuntime.getAgent(id)),
+    agents: agentRuntime, timeline: agentRuntime.getTimelineStore(), clock: clock.now,
+  });
+  const orchestrator = new GoatOrchestrator({
+    agentRuntime, trackers, env, clock: clock.now,
+    model: new ScriptedModel([]),
+    stores: {
+      goals: new InMemoryGoalStore(), theses: new InMemoryThesisStore(),
+      evidence: new InMemoryEvidenceStore(), ideas: new InMemoryTradeIdeaStore(),
+      deployments: new InMemoryDeploymentStore(), skills: new InMemorySkillStore(),
+    },
+    venueEnvironment: 'TESTNET',
+  });
+  orchestrator.stores.goals.save({
+    id: 'un', agentId: 'un_agent', statement: 'Watch EUR/USD for a break of the range.',
+    symbols: [], timeframes: [], skillIds: [], status: 'UNDEPLOYED',
+    createdAt: clock.now(), updatedAt: clock.now(),
+  });
+
+  const report = await orchestrator.refreshGoat('un');
+  assertEqual(report.kept.deployment, false, 'nothing was deployed, so nothing is reported as kept');
+  assertEqual(orchestrator.stores.deployments.historyFor('un_agent').length, 0, 'and a refresh creates no deployment');
+  assertEqual(report.kept.theses, 0, 'there was nothing to keep');
+});
+
+test('refresh: an outstanding model request cannot mutate the fresh runtime', async () => {
+  /*
+   * The dangerous version of this control.
+   *
+   * A request that is in flight when the user refreshes will come back some
+   * time later, against a runtime that no longer exists. If its answer is
+   * applied it will re-form a Trade Plan nobody asked for, on the previous
+   * context. So the pending request is dropped before anything is rebuilt.
+   */
+  const gate = new GatedModel();
+  const h = makeHarness({ model: gate as unknown as ScriptedModel });
+  const investigation = h.orchestrator.investigateGoal(h.goalId);
+
+  let pending = false;
+  for (let attempt = 0; attempt < 400 && !pending; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    pending = h.orchestrator.pendingModelRequest(h.agentId) !== undefined;
+  }
+  assert(pending, 'a request really is outstanding');
+
+  const report = await h.orchestrator.refreshGoat(h.goalId);
+  assertEqual(report.cleared.pendingModelRequest, true, 'and the refresh says it abandoned one');
+
+  gate.letGo();
+  await investigation;
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  const after = h.mission();
+  assertEqual(
+    h.orchestrator.pendingModelRequest(h.agentId),
+    undefined,
+    'the late answer cannot register itself against the new runtime',
+  );
+  assertEqual(after.thesisCount, 0, 'and forms no plan on the way out');
+  assertEqual(after.activeTrackerCount, 0, 'nor arms a condition the user just cleared');
+});
+
+// ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
 

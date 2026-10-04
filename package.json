@@ -38,7 +38,10 @@
     "test:venue": "bun src/config/venueTests.ts",
     "test:openrouter": "bun src/adapters/openrouter/tests.ts",
     "test:openrouter:live": "bun src/adapters/openrouter/liveCheck.ts",
-    "test:goat:live": "bun src/engine/goat/liveEndToEnd.ts"
+    "test:goat:live": "bun src/engine/goat/liveEndToEnd.ts",
+    "test:firebase": "bun src/services/firebase/tests.ts",
+    "test:rules": "bun src/services/firebase/rulesTests.ts",
+    "test:historical": "bun src/engine/backtester/historicalUnitTests.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -47,6 +50,7 @@
     "@tailwindcss/vite": "^4.3.3",
     "@vitejs/plugin-react": "^6.1.1",
     "dotenv": "^17.2.3",
+    "firebase": "^12.19.0",
     "lightweight-charts": "^5.2.1",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
@@ -55,6 +59,7 @@
     "vite": "^8.3.0"
   },
   "devDependencies": {
+    "@firebase/rules-unit-testing": "^5.0.2",
     "@types/node": "^22.14.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",

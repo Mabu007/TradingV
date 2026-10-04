@@ -24,6 +24,20 @@ ENGINE_URL = "http://127.0.0.1:8099"
 # Comma-separated browser origins allowed to call the API. Never "*".
 ALLOWED_ORIGINS = "http://localhost:3000"
 
+# The Firebase project whose ID tokens this worker accepts. Set it in production:
+# a caller is then identified by a verified token, and the user id comes from the
+# token's signed `sub` claim rather than from anything the caller sends.
+FIREBASE_PROJECT_ID = ""
+
+# Refuses every identity that is not a verified Firebase token. Set this to "true"
+# in production so a missing or misspelled project id fails loudly instead of
+# quietly downgrading to the single shared development user below.
+REQUIRE_FIREBASE_AUTH = "false"
+
+# Development only. Identifies its bearer as the fixed user "v0-single-user";
+# it can no longer name a user, because it never could safely do so.
+AUTH_TOKEN = ""
+
 # One binding per class. A namespace binding names a single `class_name`,
 # so with one binding the runtime instantiates that class for *every* id -
 # which means the index objects' methods are simply absent and every call

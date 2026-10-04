@@ -1,0 +1,34 @@
+{
+  "indexes": [
+    {
+      "//": "History is listed newest-first by `at`, not `updatedAt`: a history record is immutable, so its updatedAt is its creation time and a second index on it would be a second thing to keep correct.",
+      "collectionGroup": "history",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "kind", "order": "ASCENDING" },
+        { "fieldPath": "at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "//": "A GOAT's deployments, filtered by status, newest first — the query behind 'show me the ones that are still running'.",
+      "collectionGroup": "deployments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "goatId", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "updatedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "//": "Trackers awaiting an edit review for one deployment, oldest first.",
+      "collectionGroup": "trackers",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "deploymentId", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "updatedAt", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

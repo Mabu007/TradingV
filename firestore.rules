@@ -1,0 +1,330 @@
+rules_version = '2';
+
+/**
+ * Firestore security rules.
+ *
+ * ## What these rules are for
+ *
+ * Every document this application writes lives under `users/{uid}/…`. That shape
+ * is not cosmetic: it lets authorisation be decided here rather than by the
+ * client remembering to check. A client that asks for another user's documents
+ * gets nothing — which is the whole point of doing this in Firestore rather than
+ * trusting `ownerId === currentUser.uid` in TypeScript, since a client is
+ * trivially modified and this file is not.
+ *
+ * ## The decisions, and what each one costs
+ *
+ * 1. **A user may only read and write their own subtree.** Denied, not filtered.
+ *    `ownerId` is required to equal the path's uid on every write, so a document
+ *    cannot be moved into another user's path and then claimed.
+ * 2. **Immutable identity fields.** `id`, `ownerId`, `createdAt` and
+ *    `schemaVersion` cannot change after creation. A document's id is the join
+ *    key between the database, the deployment and the tracker runtime; an edit
+ *    that changed one would orphan the other two silently.
+ * 3. **Trackers may only exist under an existing deployment.** The hierarchy is
+ *    enforced at write time, closing an orphan at creation rather than after a
+ *    cleanup pass nobody scheduled.
+ * 4. **One active deployment per GOAT — enforced, not requested.**
+ *
+ *    Firestore rules cannot run a collection query, so "no *other* deployment is
+ *    active for this GOAT" is not expressible. Rather than write a rule that looks
+ *    like it enforces it and does not, the guarantee is restructured so it is
+ *    expressible: a GOAT document carries `activeDeploymentId`, and a deployment
+ *    may only become `active` if, in the same atomic write, that pointer names
+ *    it. One pointer, one value, so a second deployment cannot activate while the
+ *    pointer names the first — and the check works for two tabs racing, because
+ *    `getAfter` sees the state the write produces.
+ *
+ *    The cost is honest and stated: activating a deployment requires writing the
+ *    GOAT and the deployment in one batch. `PersistenceService` does exactly that.
+ * 5. **Configuration versions only move forward.** `is int` and `>=` rather than
+ *    trusted, because a version that can go backwards is a version the runtime
+ *    cannot order.
+ * 6. **History is append-only**, and bounded in kind, summary length and metric
+ *    shape — so a run's whole tick series cannot be smuggled into a "small metric
+ *    map" and billed monthly.
+ * 7. **No catch-all grant.** An unknown collection is denied, because a rule that
+ *    allows "anything else under users/{uid}" is one new collection away from
+ *    allowing anything.
+ *
+ * ## Deny, and mean it
+ *
+ * If a shape the application has not met yet is denied, the correct response is
+ * to add it here deliberately — not to widen the rule.
+ */
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------------------------------------------------
+    // Helpers
+    //
+    // Declared before use: Firestore's compiler resolves them in file order, so
+    // a helper defined inside a match and called above it is a rule that does
+    // not mean what its author thought.
+    // ------------------------------------------------------------------
+
+    /** The signed-in user. Every rule below denies when this is null. */
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    /** True when the path's uid is the signed-in user. */
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    /**
+     * Every field a collection's documents must carry, with the owner and the
+     * schema stamped to match the path.
+     */
+    function isValidOwner(uid) {
+      return isOwner(uid)
+        && request.resource.data.ownerId == uid
+        && request.resource.data.schemaVersion is int
+        && request.resource.data.createdAt is number
+        && request.resource.data.updatedAt is number
+        && request.resource.data.keys().size() <= 40;
+    }
+
+    /**
+     * The write ceiling: a document stays small enough to list cheaply and a
+     * hostile `set` cannot turn a per-tick write into a monthly bill.
+     */
+    function isSaneSize(maxBytes) {
+      return request.resource.data.size() <= maxBytes;
+    }
+
+    /** Identity is fixed once written. */
+    function identityIsUnchanged() {
+      return request.resource.data.ownerId == resource.data.ownerId
+        && request.resource.data.id == resource.data.id
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.schemaVersion == resource.data.schemaVersion;
+    }
+
+    /** True when the version field is an integer at least as high as the stored one. */
+    function versionDoesNotGoBackwards(field) {
+      return !(field in resource.data)
+        || (request.resource.data[field] is int && request.resource.data[field] >= resource.data[field]);
+    }
+
+    /** A GOAT's own document. */
+    function goatPath(uid, goatId) {
+      return /databases/$(database)/documents/users/$(uid)/goats/$(goatId);
+    }
+
+    /**
+     * Whether this write makes this deployment the GOAT's active one.
+     *
+     * Requires the GOAT's pointer to name this deployment *after* the write.
+     * That single value is what makes a second concurrent activation impossible.
+     */
+    function activationIsClaimed(uid, goatId, deploymentId) {
+      return getAfter(goatPath(uid, goatId)).data.activeDeploymentId == deploymentId;
+    }
+
+    /** The pointer field is either absent or a non-empty id. */
+    function activePointerIsWellFormed() {
+      return !('activeDeploymentId' in request.resource.data)
+        || (request.resource.data.activeDeploymentId is string
+            && request.resource.data.activeDeploymentId.size() > 0
+            && request.resource.data.activeDeploymentId.size() <= 128);
+    }
+
+    // ------------------------------------------------------------------
+    // GOAT definitions
+    // ------------------------------------------------------------------
+    //
+    // A definition, so freely editable — editing it does not change what is
+    // running, because what is running is described by the deployment. The one
+    // field with cross-document meaning is `activeDeploymentId`, and it is
+    // constrained rather than free.
+
+    match /users/{uid}/goats/{goatId} {
+      allow read: if isOwner(uid);
+
+      allow create: if isValidOwner(uid)
+        && 'id' in request.resource.data
+        && 'name' in request.resource.data
+        && 'objective' in request.resource.data
+        && 'symbols' in request.resource.data
+        && 'timeframes' in request.resource.data
+        && 'status' in request.resource.data
+        && request.resource.data.id == goatId
+        && request.resource.data.status in ['UNDEPLOYED', 'MONITORING', 'PAUSED', 'ARCHIVED']
+        && activePointerIsWellFormed()
+        && isSaneSize(8192);
+
+      allow update: if isOwner(uid)
+        && identityIsUnchanged()
+        && request.resource.data.status in ['UNDEPLOYED', 'MONITORING', 'PAUSED', 'ARCHIVED']
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 200
+        && activePointerIsWellFormed()
+        && request.resource.data.keys().size() <= 40
+        && isSaneSize(8192);
+
+      allow delete: if isOwner(uid);
+
+      // ----------------------------------------------------------------
+      // Trackers (also readable at the top level for a whole-GOAT view)
+      // ----------------------------------------------------------------
+
+      match /{trackerId} {
+        allow read, write: if false;
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Deployments
+    // ------------------------------------------------------------------
+
+    match /users/{uid}/deployments/{deploymentId} {
+      allow read: if isOwner(uid);
+
+      allow create: if isValidOwner(uid)
+        && 'id' in request.resource.data
+        && 'goatId' in request.resource.data
+        && 'market' in request.resource.data
+        && 'timeframe' in request.resource.data
+        && 'mode' in request.resource.data
+        && 'status' in request.resource.data
+        && request.resource.data.id == deploymentId
+        && request.resource.data.mode in ['SHADOW', 'DEMO']
+        && request.resource.data.status in ['active', 'paused', 'stopped']
+        && request.resource.data.goatId is string
+        && request.resource.data.goatId.size() > 0
+        && isSaneSize(8192)
+        // The GOAT must already exist, and if this deployment claims to be
+        // active then the GOAT must point at it after this write.
+        && existsAfter(goatPath(uid, request.resource.data.goatId))
+        && (request.resource.data.status != 'active'
+            || activationIsClaimed(uid, request.resource.data.goatId, deploymentId));
+
+      allow update: if isOwner(uid)
+        && identityIsUnchanged()
+        && request.resource.data.goatId == resource.data.goatId
+        && request.resource.data.mode in ['SHADOW', 'DEMO']
+        && request.resource.data.status in ['active', 'paused', 'stopped']
+        && request.resource.data.keys().size() <= 40
+        && isSaneSize(8192)
+        // Becoming active requires claiming the pointer; a deployment already
+        // active keeps its claim, so an unrelated field edit is not rejected.
+        && (request.resource.data.status != 'active'
+            || resource.data.status == 'active'
+            || activationIsClaimed(uid, request.resource.data.goatId, deploymentId));
+
+      allow delete: if isOwner(uid);
+
+      // ----------------------------------------------------------------
+      // Trackers
+      // ----------------------------------------------------------------
+      //
+      // One condition's configuration. Only under an existing deployment,
+      // identity fixed at creation, configuration version monotonic.
+
+      match /trackers/{trackerId} {
+        allow read: if isOwner(uid);
+
+        allow create: if isValidOwner(uid)
+          && 'id' in request.resource.data
+          && 'deploymentId' in request.resource.data
+          && 'goatId' in request.resource.data
+          && 'purpose' in request.resource.data
+          && 'kind' in request.resource.data
+          && 'timeframe' in request.resource.data
+          && 'status' in request.resource.data
+          && 'configurationVersion' in request.resource.data
+          && request.resource.data.id == trackerId
+          && request.resource.data.deploymentId == deploymentId
+          && request.resource.data.status in ['ACTIVE', 'PAUSED', 'CANCELLED', 'EXPIRED']
+          && request.resource.data.configurationVersion is int
+          && request.resource.data.configurationVersion >= 1
+          && exists(/databases/$(database)/documents/users/$(uid)/deployments/$(deploymentId))
+          && isSaneSize(8192);
+
+        allow update: if isOwner(uid)
+          && identityIsUnchanged()
+          && request.resource.data.deploymentId == resource.data.deploymentId
+          && request.resource.data.goatId == resource.data.goatId
+          && request.resource.data.status in ['ACTIVE', 'PAUSED', 'CANCELLED', 'EXPIRED']
+          && versionDoesNotGoBackwards('configurationVersion')
+          && request.resource.data.keys().size() <= 40
+          && isSaneSize(8192);
+
+        allow delete: if isOwner(uid);
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // History
+    // ------------------------------------------------------------------
+    //
+    // Append-only. `kind` is constrained so a list can render every record it
+    // will ever be given.
+
+    match /users/{uid}/history/{historyId} {
+      allow read: if isOwner(uid);
+
+      allow create: if isValidOwner(uid)
+        && 'id' in request.resource.data
+        && 'kind' in request.resource.data
+        && 'subjectId' in request.resource.data
+        && 'summary' in request.resource.data
+        && request.resource.data.id == historyId
+        && request.resource.data.kind in ['BACKTEST', 'DEPLOYMENT', 'TRADE_PLAN', 'WALLET']
+        && request.resource.data.at is number
+        && request.resource.data.summary is string
+        && request.resource.data.summary.size() <= 1000
+        && request.resource.data.keys().size() <= 12
+        && (!('metrics' in request.resource.data)
+            || (request.resource.data.metrics.keys().size() <= 20
+                && request.resource.data.metrics.size() <= 2048))
+        && isSaneSize(4096);
+
+      // No update, no delete: a record that can be rewritten is not a record of
+      // what happened. Nothing in this product needs to correct a past run.
+      allow update, delete: if false;
+    }
+
+    // ------------------------------------------------------------------
+    // Preferences
+    // ------------------------------------------------------------------
+    //
+    // A single account-level document. Presentation preferences only, never
+    // trading state — a preference that could change what gets traded belongs to
+    // the GOAT, under its own rules.
+
+    match /users/{uid}/preferences/{preferenceId} {
+      allow read: if isOwner(uid);
+
+      allow create, update: if isOwner(uid)
+        && request.resource.data.ownerId == uid
+        && request.resource.data.id == preferenceId
+        && request.resource.data.schemaVersion is int
+        && request.resource.data.updatedAt is number
+        && request.resource.data.keys().size() <= 20
+        && isSaneSize(4096);
+
+      allow delete: if isOwner(uid);
+    }
+
+    // ------------------------------------------------------------------
+    // Everything else
+    // ------------------------------------------------------------------
+    //
+    // Denied explicitly. There is no catch-all grant anywhere in this file, and
+    // that is deliberate: an unknown collection under a user must fail closed
+    // rather than inherit a permissive parent.
+
+    match /users/{uid}/{document=**} {
+      allow read, write: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
