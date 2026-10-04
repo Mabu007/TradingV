@@ -39,7 +39,7 @@
  * "BUY" lines has no other way to know it was not real money.
  */
 
-import type { Bar, OrderResult, Position, Trade } from '../../../types/trading';
+import type { Bar, OrderResult, OrderStatus, Position, Trade } from '../../../types/trading';
 import type { InstrumentMetadata } from '../../../types/instruments';
 import type { NormalizedQuote } from '../../../types/quotes';
 import type {
@@ -118,6 +118,54 @@ export interface SimulationMarketConfig {
   instruments?: InstrumentMetadata[];
 }
 
+/**
+ * A resting limit order on the simulated book.
+ *
+ * This is the object that makes the difference between a replay and a trading
+ * simulation. Before it existed the only thing a GOAT could do was buy at the
+ * current close, which means the backtest could never demonstrate a GOAT
+ * *waiting* for its price — the single most characteristic thing about how a
+ * trader takes an entry.
+ */
+export interface SimulatedOrder {
+  id: string;
+  /** The GOAT trade plan this order came from. The join key back to the plan. */
+  planId?: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  type: 'LIMIT';
+  /**
+   * The price the GOAT said it would pay.
+   *
+   * Named `entryPrice` rather than reusing `OrderResult.requestedPrice` because a
+   * resting order's price *is* its definition here, and there is no second price
+   * until the moment it fills.
+   */
+  entryPrice: number;
+  stopLoss?: number;
+  takeProfit?: number;
+  volume: number;
+  status: OrderStatus;
+  /** Seconds, matching every other time in this file. */
+  placedAt: number;
+  /** Seconds. Absent means the order does not time out. */
+  expiresAt?: number;
+  filledAt?: number;
+  fillPrice?: number;
+  positionId?: string;
+  /** Why the GOAT chose this price, in its own words. Shown, never parsed. */
+  reason?: string;
+  /** Why an order left the book without filling. */
+  terminalReason?: string;
+  goatName?: string;
+}
+
+/** What happened to resting orders during one bar. */
+export interface SettledOrders {
+  filled: SimulatedOrder[];
+  expired: SimulatedOrder[];
+}
+
 export interface SimulatedOrderResult {
   success: boolean;
   positionId?: string;
@@ -162,8 +210,11 @@ export class SimulationEnvironment implements ITradingEnvironment {
   private maxEquitySeen: number;
   private readonly positions = new Map<string, Position>();
   private readonly trades: Trade[] = [];
+  /** Resting and settled limit orders, oldest first. */
+  private readonly orders: SimulatedOrder[] = [];
   private nextPositionId = 0;
   private nextTradeId = 0;
+  private nextOrderId = 0;
   /**
    * Index of the first bar that is still in the future.
    *
@@ -475,8 +526,27 @@ export class SimulationEnvironment implements ITradingEnvironment {
     return symbol ? all.filter((position) => position.symbol === symbol) : all;
   }
 
+  /**
+   * The book, in the shape the rest of the application reads orders.
+   *
+   * Not empty: an environment that reports no orders cannot be inspected, and
+   * "why is my GOAT still waiting?" is answered by looking at the book.
+   */
   async getOrders(): Promise<OrderResult[]> {
-    return [];
+    return this.orders.map((order) => ({
+      orderId: order.id,
+      ...(order.positionId ? { positionId: order.positionId } : {}),
+      ...(order.planId ? { clientOrderId: order.planId } : {}),
+      symbol: order.symbol,
+      side: order.side,
+      type: order.type,
+      volume: order.volume,
+      requestedPrice: order.entryPrice,
+      ...(order.fillPrice !== undefined ? { executionPrice: order.fillPrice } : {}),
+      status: order.status,
+      timestamp: order.placedAt * 1000,
+      ...(order.terminalReason ? { errorMessage: order.terminalReason } : {}),
+    }));
   }
 
   // -------------------------------------------------------------------------
@@ -570,8 +640,234 @@ export class SimulationEnvironment implements ITradingEnvironment {
     return { success: true, pnl };
   }
 
+  // -------------------------------------------------------------------------
+  // The order book
+  // -------------------------------------------------------------------------
+
+  /**
+   * Rest a limit order.
+   *
+   * The whole point of this method is that it does *not* fill. It records the
+   * price the GOAT said it would pay and returns; the order is only filled later,
+   * by a candle that actually traded there. A backtest that filled immediately
+   * would be measuring a market order while calling it a limit order.
+   *
+   * Two refusals, both real:
+   *
+   *   - **A marketable limit.** A BUY LIMIT above the current price is not a
+   *     limit order; it is a market order wearing a limit order's clothes. It is
+   *     refused rather than quietly filled at the market, because a GOAT that
+   *     proposes one has misunderstood its own order and the replay should say
+   *     so instead of grading the intent generously.
+   *   - **A non-positive volume or price**, which is a caller bug rather than a
+   *     market opinion.
+   */
+  async placeLimitOrder(params: {
+    symbol: string;
+    side: 'BUY' | 'SELL';
+    volume: number;
+    price: number;
+    stopLoss?: number;
+    takeProfit?: number;
+    /** Seconds. The order stops existing at this instant. */
+    expiresAt?: number;
+    idempotencyKey?: string;
+    planId?: string;
+    reason?: string;
+    comment?: string;
+  }): Promise<{ success: boolean; orderId?: string; error?: string }> {
+    if (this.mode !== 'BACKTEST') {
+      throw new Error('The simulated book refuses to act as anything but a simulation.');
+    }
+    this.assertSymbol(params.symbol);
+    if (!Number.isFinite(params.volume) || params.volume <= 0) {
+      return { success: false, error: 'Volume must be positive.' };
+    }
+    if (!Number.isFinite(params.price) || params.price <= 0) {
+      return { success: false, error: 'A limit price must be a positive number.' };
+    }
+
+    const bar = this.currentBar();
+    if (!bar) return { success: false, error: 'No bar has closed yet in this simulation.' };
+
+    /*
+     * Idempotency, because a retried request must not become a second order.
+     *
+     * The key is the plan's own id, so re-submitting the same trade plan is
+     * answered with the order it already produced rather than a duplicate resting
+     * at the same price — two orders for one plan is two positions' worth of
+     * exposure from one idea.
+     */
+    const key = params.idempotencyKey ?? params.planId;
+    if (key !== undefined) {
+      const existing = this.orders.find((order) => order.planId === key && order.status === 'PENDING');
+      if (existing) return { success: true, orderId: existing.id };
+    }
+
+    if (params.side === 'BUY' && params.price >= bar.close) {
+      return {
+        success: false,
+        error: `A BUY LIMIT at ${params.price} is at or above the ${bar.close} market price, so it would fill immediately rather than wait. Use a market order if entering now is intended.`,
+      };
+    }
+    if (params.side === 'SELL' && params.price <= bar.close) {
+      return {
+        success: false,
+        error: `A SELL LIMIT at ${params.price} is at or below the ${bar.close} market price, so it would fill immediately rather than wait. Use a market order if exiting now is intended.`,
+      };
+    }
+
+    const order: SimulatedOrder = {
+      id: `sim_ord_${this.nextOrderId++}`,
+      ...(params.planId ? { planId: params.planId } : {}),
+      symbol: params.symbol,
+      side: params.side,
+      type: 'LIMIT',
+      entryPrice: this.round(params.price),
+      ...(params.stopLoss !== undefined ? { stopLoss: this.round(params.stopLoss) } : {}),
+      ...(params.takeProfit !== undefined ? { takeProfit: this.round(params.takeProfit) } : {}),
+      volume: params.volume,
+      status: 'PENDING',
+      placedAt: bar.time + this.baseSeconds,
+      ...(params.expiresAt !== undefined ? { expiresAt: params.expiresAt } : {}),
+      ...(params.reason ? { reason: params.reason } : {}),
+      ...(params.comment ? { goatName: params.comment } : {}),
+    };
+    this.orders.push(order);
+    return { success: true, orderId: order.id };
+  }
+
+  /**
+   * Withdraw a resting order.
+   *
+   * Fills and settled orders cannot be cancelled: an order that has already
+   * traded is a position, and cancelling it would be a way to erase a loss by
+   * declining to acknowledge it. A second cancellation reports why rather than
+   * pretending to have done something.
+   */
+  async cancelOrder(orderId: string, reason = 'The GOAT withdrew this setup.'): Promise<{ success: boolean; error?: string }> {
+    const order = this.orders.find((candidate) => candidate.id === orderId);
+    if (!order) return { success: false, error: `No order ${orderId} exists in this replay.` };
+    if (order.status !== 'PENDING') {
+      return { success: false, error: `Order ${orderId} is ${order.status} and cannot be cancelled.` };
+    }
+    order.status = 'CANCELLED';
+    order.terminalReason = reason;
+    return { success: true };
+  }
+
+  /**
+   * Settle resting orders against the newest visible candle.
+   *
+   * The fill test is the one the venue would use:
+   *
+   *   BUY LIMIT fills when `low <= entryPrice` — the market traded down through it
+   *   SELL LIMIT fills when `high >= entryPrice` — the market traded up through it
+   *
+   * and it is evaluated against *closed* candles only, for the same reason stops
+   * are: a bar that has not closed has price in it the agent was not entitled to
+   * see, and filling against it would be look-ahead wearing a fill's clothes.
+   *
+   * A fill on a bar that also reaches the stop is resolved by `settleOpenPositions`
+   * in the same bar, which checks the stop before the target. That ordering is the
+   * honest answer to an OHLC candle whose range spans both the entry and the stop:
+   * the data cannot say which came first, so the replay assumes the worse one. The
+   * alternative — assuming the entry came first and the stop was never reached —
+   * is a flattering guess, and a backtest that flatters itself cannot be used to
+   * judge a strategy.
+   */
+  settleOrders(): SettledOrders {
+    const bar = this.currentBar();
+    const settled: SettledOrders = { filled: [], expired: [] };
+    if (!bar) return settled;
+
+    const nowSeconds = bar.time + this.baseSeconds;
+    for (const order of this.orders) {
+      if (order.status !== 'PENDING') continue;
+
+      // Expiry is checked before the fill on purpose.
+      //
+      // An order whose life ended on this boundary did not exist to be filled by
+      // it, and resolving the other way would let a bar that arrives exactly on
+      // expiry either fill or expire depending on which check ran first — the kind
+      // of ordering accident that makes a backtest irreproducible.
+      if (order.expiresAt !== undefined && nowSeconds >= order.expiresAt) {
+        order.status = 'EXPIRED';
+        order.terminalReason = `No fill within ${this.round(order.expiresAt - order.placedAt)} seconds of waiting.`;
+        settled.expired.push(order);
+        continue;
+      }
+
+      const touched = order.side === 'BUY' ? bar.low <= order.entryPrice : bar.high >= order.entryPrice;
+      if (!touched) continue;
+
+      // A limit order fills at its limit, not at whatever the candle did. Slippage
+      // still applies against us, because a fill at exactly the limit assumes we
+      // were first in the queue.
+      const fillPrice = order.side === 'BUY'
+        ? order.entryPrice + this.slippagePrice
+        : order.entryPrice - this.slippagePrice;
+
+      const positionId = this.openPositionFromOrder(order, fillPrice, nowSeconds);
+      order.status = 'FILLED';
+      order.filledAt = nowSeconds;
+      order.fillPrice = this.round(fillPrice);
+      order.positionId = positionId;
+      settled.filled.push(order);
+    }
+    return settled;
+  }
+
+  /**
+   * Turn a filled order into a position.
+   *
+   * The same accounting a market fill uses — commission, equity tracking, the
+   * lot — so a limit fill and a market fill are not two different trades.
+   */
+  private openPositionFromOrder(order: SimulatedOrder, fillPrice: number, atSeconds: number): string {
+    const positionId = `sim_pos_${this.nextPositionId++}`;
+    const commission = this.commissionPerLot * (Math.abs(order.volume) / this.lotSize);
+    const position: Position = {
+      id: positionId,
+      symbol: order.symbol,
+      side: order.side,
+      volume: order.volume,
+      entryPrice: this.round(fillPrice),
+      currentPrice: this.round(fillPrice),
+      stopLoss: order.stopLoss,
+      takeProfit: order.takeProfit,
+      unrealizedPnL: 0,
+      unrealizedPnlPercent: 0,
+      timestamp: atSeconds * 1000,
+      commission,
+      ...(order.goatName ? { goatName: order.goatName } : {}),
+    };
+    this.balance -= commission;
+    this.positions.set(positionId, position);
+    if (this.balance + this.unrealized() > this.maxEquitySeen) {
+      this.maxEquitySeen = this.balance + this.unrealized();
+    }
+    return positionId;
+  }
+
+  /** Every order this replay has seen, oldest first. */
+  simulatedOrders(): SimulatedOrder[] {
+    return [...this.orders];
+  }
+
+  /** Orders still resting. */
+  restingOrders(): SimulatedOrder[] {
+    return this.orders.filter((order) => order.status === 'PENDING');
+  }
+
+  /** The order a trade plan produced, when it produced one. */
+  orderForPlan(planId: string): SimulatedOrder | undefined {
+    return this.orders.find((order) => order.planId === planId);
+  }
+
   /**
    * Move open positions to the newest visible close.
+
    *
    * Called once per replayed base bar, never with a bar the agent could not
    * have seen, and evaluated against that bar's own high and low — so a stop
@@ -579,6 +875,19 @@ export class SimulationEnvironment implements ITradingEnvironment {
    * treatment of 1m data and the same one the live venue adapter applies to a
    * candle.
    */
+  /**
+   * Mark open positions to market. The same act as `settleOpenPositions`.
+   *
+   * Two names for one behaviour: the engine drives the book through the
+   * `TradeBook` contract, which names it `settlePositions`, while callers that are
+   * only stepping the market — tests, a hand-driven replay — have always called
+   * `settleOpenPositions`. Rather than make every one of them change, the
+   * descriptive name is kept as the implementation and this is the contract name.
+   */
+  settlePositions(): void {
+    this.settleOpenPositions();
+  }
+
   settleOpenPositions(): void {
     const bar = this.currentBar();
     if (!bar) return;

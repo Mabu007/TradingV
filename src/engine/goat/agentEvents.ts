@@ -51,6 +51,8 @@ export type AgentEventChannel =
   | 'DECISION'
   | 'RISK'
   | 'EXECUTION'
+  /** The durable runtime that survives the tab closing. */
+  | 'RUNTIME'
   | 'WAIT'
   | 'INVALIDATION'
   | 'ERROR'
@@ -185,6 +187,39 @@ const STYLE: Record<AgentTimelineEventType, AgentEventStyle> = {
   POSITION_OPENED: { channel: 'EXECUTION', tone: 'positive', weight: 'important', label: 'EXECUTION' },
   POSITION_UPDATE: { channel: 'EXECUTION', tone: 'neutral', weight: 'normal', label: 'EXECUTION' },
   POSITION_CLOSED: { channel: 'EXECUTION', tone: 'neutral', weight: 'normal', label: 'EXECUTION' },
+  /*
+   * The order lifecycle.
+   *
+   * Same channel as execution, because an order is execution that has not
+   * happened yet — a resting limit order is the GOAT having acted, which is the
+   * thing a person watching wants to see. The tones carry the difference: a
+   * rejection is negative and an expiry is neutral, so an expiry never looks like
+   * a failure even though it usually is one from the strategy's point of view.
+   */
+  ORDER_PLACED: { channel: 'EXECUTION', tone: 'info', weight: 'important', label: 'EXECUTION' },
+  ORDER_FILLED: { channel: 'EXECUTION', tone: 'positive', weight: 'important', label: 'EXECUTION' },
+  ORDER_EXPIRED: { channel: 'EXECUTION', tone: 'neutral', weight: 'normal', label: 'EXECUTION' },
+  ORDER_CANCELLED: { channel: 'EXECUTION', tone: 'neutral', weight: 'normal', label: 'EXECUTION' },
+  ORDER_REJECTED: { channel: 'RISK', tone: 'negative', weight: 'important', label: 'RISK' },
+  /*
+   * The loop declined to do what the GOAT asked.
+   *
+   * Neutral rather than negative: the refusal is the system working. A GOAT that
+   * proposes something its skills forbid and is stopped is behaving correctly, and
+   * styling that as a failure would train a reader to ignore the one line that
+   * explains a stalled GOAT.
+   */
+  DECISION_REFUSED: { channel: 'VALIDATION', tone: 'neutral', weight: 'normal', label: 'VALIDATION' },
+  /*
+   * The durable runtime.
+   *
+   * `RUNTIME` rather than `EXECUTION`, because nothing is being traded here: this
+   * is the thing that survives the tab closing, and putting it in the execution
+   * channel would imply an order was placed.
+   */
+  RUNTIME_REGISTERED: { channel: 'RUNTIME', tone: 'positive', weight: 'normal', label: 'RUNTIME' },
+  RUNTIME_UNAVAILABLE: { channel: 'RUNTIME', tone: 'warning', weight: 'normal', label: 'RUNTIME' },
+  TRADE_CLOSED: { channel: 'EXECUTION', tone: 'positive', weight: 'important', label: 'EXECUTION' },
 
   // --- losing the hypothesis -------------------------------------------
   THESIS_INVALIDATED: { channel: 'INVALIDATION', tone: 'negative', weight: 'critical', label: 'INVALIDATION' },

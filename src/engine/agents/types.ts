@@ -174,7 +174,18 @@ export interface ITradingEnvironment {
     takeProfit?: number;
     comment?: string;
   }): Promise<{ success: boolean; positionId?: string; fillPrice?: number; error?: string; rejection?: ExecutionRejection }>;
-  placeLimitOrder?(params: { symbol: string; side: 'BUY' | 'SELL'; volume: number; price: number; stopLoss?: number; takeProfit?: number }): Promise<{ success: boolean; orderId?: string; error?: string; rejection?: ExecutionRejection }>;
+  /**
+   * Rest an order at a price and wait for the market to come to it.
+   *
+   * Optional because the live adapter may not implement every order type, and
+   * because an environment that cannot express a resting order has to say so
+   * rather than pretend. A caller that needs a limit must check for it rather than
+   * fall back to a market order silently — that fallback is exactly the difference
+   * between a GOAT that waits for its price and one that pays the spread to get in
+   * now, and it must never happen unnoticed.
+   */
+  placeLimitOrder?(params: { symbol: string; side: 'BUY' | 'SELL'; volume: number; price: number; stopLoss?: number; takeProfit?: number; expiresAt?: number; idempotencyKey?: string; comment?: string }): Promise<{ success: boolean; orderId?: string; error?: string; rejection?: ExecutionRejection }>;
+  /** Withdraw a resting order. */
   cancelOrder?(orderId: string): Promise<{ success: boolean; error?: string }>;
   modifyPosition(positionId: string, changes: { stopLoss?: number; takeProfit?: number }): Promise<{ success: boolean; error?: string }>;
   closePosition(positionId: string, volume?: number): Promise<{ success: boolean; pnl?: number; error?: string; rejection?: ExecutionRejection }>;

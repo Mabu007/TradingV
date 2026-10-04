@@ -405,6 +405,21 @@ export type AgentPlan =
   | { kind: 'REVISE_THESIS'; thesisId: string; reason: string; statement?: string; invalidation?: string; confidence?: number }
   | { kind: 'CREATE_TRACKER'; thesisId: string; spec: TrackerRequest; reason: string }
   | { kind: 'REMOVE_TRACKER'; trackerId: string; reason: string }
+  /**
+   * The hypothesis now meets the bar for trading.
+   *
+   * This is the escalation, and until it existed the GOAT could not trade at
+   * all — not "rarely", never. `PROPOSE_TRADE_IDEA` is only accepted on an
+   * ACTIONABLE thesis, and the only way to reach that state was
+   * `loop.reviseThesis`, which no wake path ever called. So a model that did
+   * everything right on every wake was refused at the last step, every time.
+   *
+   * One decision per wake is still the rule, so escalating and proposing are two
+   * wakes: this one says the thesis is ready, and the next one prices it. The
+   * alternative — letting one wake do both — would mean constructing a trade
+   * idea from evidence the model had not yet been shown.
+   */
+  | { kind: 'ESCALATE_THESIS'; thesisId: string; reason: string }
   | { kind: 'PROPOSE_TRADE_IDEA'; thesisId: string; idea: TradeIdeaRequest; reason: string }
   | { kind: 'WAIT'; reason: string };
 

@@ -349,7 +349,12 @@ export const GoatCommandCenter: React.FC<GoatCommandCenterProps> = ({
       </section>
 
       {/* ------------------------------------------------------------ trade plan */}
-      <TradePlanPanel plan={mission.tradePlan} mayExecute={mission.mayExecute} mode={mission.mode} />
+      <TradePlanPanel
+        plan={mission.tradePlan}
+        thesis={mission.thesis}
+        mayExecute={mission.mayExecute}
+        mode={mission.mode}
+      />
 
       {/* --------------------------------------------------------------- activity */}
       <ActivityLog orchestrator={orchestrator} mission={mission} />
@@ -423,9 +428,19 @@ const ActionButton: React.FC<{
  */
 const TradePlanPanel: React.FC<{
   plan?: TradeIdea;
+  /**
+   * The GOAT's working thesis, shown in place of an absent plan.
+   *
+   * A Trade Plan and a thesis are the same idea at different stages: the thesis is
+   * what the GOAT believes, the plan is what it has decided to trade. Showing
+   * "No trade plan yet" beside a fully-formed thesis — as this did — told a reader
+   * that the GOAT had nothing to say, while the sentence it had written was sitting
+   * a few lines above. The hypothesis is the plan until it is priced.
+   */
+  thesis?: { statement: string; invalidation?: string; direction?: string };
   mayExecute: boolean;
   mode?: string;
-}> = ({ plan, mayExecute, mode }) => (
+}> = ({ plan, thesis, mayExecute, mode }) => (
   <section className="rounded-2xl border border-line bg-surface">
     <header className="flex items-center gap-3 border-b border-line px-5 py-3.5">
       <div className="rounded-xl bg-accent-soft p-2 text-accent">
@@ -444,12 +459,42 @@ const TradePlanPanel: React.FC<{
       )}
     </header>
 
-    {!plan ? (
+    {!plan && thesis ? (
+      /*
+        Forming, not empty.
+
+        The GOAT believes something and has said so; it has not yet committed to
+        prices. Saying so is more useful than an empty panel, because an empty panel
+        next to a stated thesis reads as a contradiction rather than as progress.
+      */
       <div className="px-5 py-4">
-        <p className="text-[11px] leading-relaxed text-ink-2">No trade plan yet.</p>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="rounded-full border border-accent/40 bg-accent-soft px-2 py-0.5 text-[10px] font-bold text-accent-ink">
+            {thesis.direction ?? 'WORKING VIEW'}
+          </span>
+          <span className="rounded-full border border-line px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide text-ink-3">
+            FORMING TRADE PLAN
+          </span>
+        </div>
+        <p className="mt-2 text-[12px] leading-relaxed text-ink">{thesis.statement}</p>
+        {thesis.invalidation && (
+          <p className="mt-1.5 text-[11px] leading-relaxed text-ink-3">
+            <span className="font-mono text-[9px] tracking-[0.14em] text-ink-4">WRONG IF </span>
+            {thesis.invalidation}
+          </p>
+        )}
+        <p className="mt-2 text-[10px] leading-relaxed text-ink-4">
+          No entry, stop or target yet — the GOAT has a view but not a priced trade.
+        </p>
+      </div>
+    ) : !plan ? (
+      <div className="px-5 py-4">
+        <p className="text-[11px] leading-relaxed text-ink-2">
+          FORMING TRADE PLAN — the GOAT is still collecting evidence.
+        </p>
         <p className="mt-1 text-[11px] leading-relaxed text-ink-3">
-          The GOAT is still collecting evidence. Doing nothing is a real outcome here: a plan built
-          without evidence would be a guess with an entry price on it.
+          Doing nothing is a real outcome here: a plan built without evidence would be a guess with an
+          entry price on it.
         </p>
       </div>
     ) : (

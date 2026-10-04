@@ -50,6 +50,8 @@ import type { AgentEventView } from '../../engine/goat/agentEvents';
 import { historicalMarketDataProvider } from '../../engine/backtester/historical';
 
 import { AgentLog } from './AgentLog';
+import { TradeLog } from './TradeLog';
+import { tradeAnalysisPrompt } from './tradeAnalysis';
 import { TradePlanPanel } from './TradePlanPanel';
 
 /** How much history a replay covers by default: six hours of 1m bars. */
@@ -94,6 +96,14 @@ export interface BacktestSurfaceProps {
   /** Where history comes from. Injected so a demo or a test can supply its own. */
   loadBars?: (request: { market: string; start: number; end: number }) => Promise<Bar[]>;
   onExit: () => void;
+  /**
+   * Hand a prompt to the existing GOAT conversation.
+   *
+   * Optional so the surface still works where no assistant is mounted — a demo, or
+   * a test that only cares about the replay. The "AI ANALYSE TRADE" action simply
+   * does not appear without it, rather than appearing and failing.
+   */
+  onAskAI?: (prompt: string) => void;
 }
 
 /** How long the replay covers by default when started from a GOAT: two days. */
@@ -135,11 +145,27 @@ function fromLocalInput(value: string): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+/**
+ * The price unit for a market, when it has a recognisable one.
+ *
+ * Deliberately not a hardcoded "pips": a pip is a foreign-exchange unit, and
+ * calling a crypto move in pips would be reporting the wrong quantity rather than
+ * the right one badly. Markets this does not recognise report in the account's own
+ * currency instead.
+ */
+function unitFor(symbol: string | undefined): string | undefined {
+  if (!symbol) return undefined;
+  return /(USD\/JPY|EUR\/USD|GBP\/USD|AUD\/USD|USD\/CHF|USD\/CAD|NZD\/USD)/i.test(symbol)
+    ? 'pips'
+    : undefined;
+}
+
 export const BacktestSurface: React.FC<BacktestSurfaceProps> = ({
   markets,
   seed,
   loadBars,
   onExit,
+  onAskAI,
 }) => {
   /*
    * Defaults from the GOAT, not from the form.
@@ -625,6 +651,55 @@ export const BacktestSurface: React.FC<BacktestSurfaceProps> = ({
             )}
             {snapshot?.report && <ResultsPanel snapshot={snapshot} />}
           </div>
+
+          {/*
+            Where the replay is in the trade loop.
+
+            Shown above the log because it is the question a reader has first —
+            "is it researching, waiting on a price, or holding a position" — and
+            answering it with the generic replay state said only that the clock was
+            running. A replay that is waiting for a limit order to fill is not the
+            same as one that has nothing to do, and they now read differently.
+          */}
+          {snapshot?.tradePhase && (
+            <div className="flex items-baseline justify-between gap-3 px-1 pt-1">
+              <span
+                className="font-mono text-[10px] tracking-[0.18em] text-ink-3"
+                data-testid="backtest-trade-phase"
+              >
+                {snapshot.tradePhase}
+              </span>
+              {(snapshot.trades?.length ?? 0) > 0 && (
+                <span className="font-mono text-[10px] text-ink-4">
+                  {snapshot.trades!.filter((trade) => trade.status === 'PENDING').length} waiting ·{' '}
+                  {snapshot.trades!.filter((trade) => trade.status === 'RUNNING').length} open
+                </span>
+              )}
+            </div>
+          )}
+
+          {/*
+            The trades, above the activity log.
+
+            Two views of the same replay because they answer different questions:
+            the trade list is "what did it make and why", the activity log is "what
+            has it been doing". A reader following a position wants the first; a
+            reader wondering why nothing is happening wants the second.
+          */}
+          <TradeLog
+            trades={snapshot?.trades ?? []}
+            statistics={snapshot?.tradeStats}
+            unitLabel={unitFor(snapshot?.symbol)}
+            /*
+             * Reuses the existing GOAT conversation rather than opening a second
+             * chat: the assistant already has the market and the wallet in view, and
+             * a trade-review-only panel would have neither. The prompt carries the
+             * trade's own numbers, so the answer is about this trade rather than
+             * about trading in general.
+             */
+            onAnalyseTrade={(trade) => onAskAI?.(tradeAnalysisPrompt(trade).prompt)}
+            className="mb-3"
+          />
 
           <AgentLog
             entries={entries}

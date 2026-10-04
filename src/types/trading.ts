@@ -11,7 +11,17 @@ export type OrderSide = 'BUY' | 'SELL';
 
 export type OrderType = 'MARKET' | 'LIMIT' | 'STOP';
 
-export type OrderStatus = 'PENDING' | 'FILLED' | 'REJECTED' | 'CANCELLED';
+/**
+ * `EXPIRED` is separate from `CANCELLED` because they mean different things and
+ * a trader reads them differently.
+ *
+ * Cancelled means *we* withdrew it — the setup stopped being valid, or the GOAT
+ * found something better. Expired means the market simply never came to the price
+ * we asked for within the order's life. The first is a decision, the second is an
+ * outcome, and collapsing them would make "the GOAT changed its mind" and "the
+ * GOAT was patient and the trade never came" indistinguishable in the log.
+ */
+export type OrderStatus = 'PENDING' | 'FILLED' | 'REJECTED' | 'CANCELLED' | 'EXPIRED';
 
 export type ExecutionMode = 'BACKTEST' | 'DEMO' | 'LIVE';
 

@@ -57,6 +57,23 @@ export const LiveGoatCard: React.FC<LiveGoatCardProps> = ({ mission, onOpen }) =
       </span>
     </div>
 
+    {/*
+      What this GOAT is, in its own words.
+
+      A live card used to show only what the GOAT was doing this second, which meant
+      understanding *what kind* of GOAT it was required going back to the library.
+      The description is the strategy, and it belongs where the strategy is running.
+      Compact, one clamp, and quiet — it is context, not the headline.
+    */}
+    {mission.description && (
+      <p
+        className="mt-2 line-clamp-2 text-[10px] leading-relaxed text-ink-4"
+        data-testid="live-goat-description"
+      >
+        {mission.description}
+      </p>
+    )}
+
     {mission.runtime === 'ERROR' ? (
       <p className="mt-3 flex items-start gap-1.5 text-[11px] leading-relaxed text-neg">
         <AlertTriangle className="mt-px h-3 w-3 shrink-0" />
@@ -138,9 +155,16 @@ function stageChip(stage: GoatMission['stage']): string {
 function tradePlanLine(mission: GoatMission): string {
   const plan = mission.tradePlan;
   if (!plan) {
-    return mission.thesis
-      ? 'No trade plan yet — still gathering evidence'
-      : 'No trade plan yet — still forming a thesis';
+    // The GOAT's working view, not an absence.
+    //
+    // "No trade plan yet" next to a thesis the GOAT has already stated told a reader
+    // it had nothing to say. The hypothesis is the plan until it is priced, so it is
+    // shown instead — truncated by the card, which is a display decision rather
+    // than a different claim.
+    if (mission.thesis) {
+      return `${mission.thesis.direction ?? ''} ${mission.thesis.statement}`.trim();
+    }
+    return 'Forming a Trade Plan — still gathering evidence';
   }
   const status = plan.status.toLowerCase().replace(/_/g, ' ');
   return `${plan.direction} ${plan.symbol} · ${status}`;

@@ -608,8 +608,35 @@ test('wake: a simulated tick fires a tracker and the GOAT acts on it', async () 
     position.stopLoss !== undefined,
     'with the thesis\'s own invalidation as the stop, which is what it is for',
   );
-  const execution = log.filter((entry) => entry.type === 'ORDER' || entry.type === 'FILL' || entry.type === 'POSITION_OPENED');
-  assertEqual(execution.length, 3, 'and every execution line says EXECUTION in the log');
+  /*
+   * The execution lines are now specific about what happened.
+   *
+   * This used to assert a count of three against a filter that matched the older,
+   * vaguer event names, which only worked because `ORDER` and `FILL` said almost
+   * nothing about whether an order rested or filled. The trade engine names each
+   * transition for what it is — placed, filled, running — so the assertion follows
+   * the vocabulary, and checks that each line is filed under EXECUTION rather than
+   * merely that some lines exist.
+   */
+  const execution = log.filter(
+    (entry) =>
+      entry.type === 'ORDER_PLACED' ||
+      entry.type === 'ORDER_FILLED' ||
+      entry.type === 'POSITION_OPENED' ||
+      entry.type === 'ORDER' ||
+      entry.type === 'FILL',
+  );
+  assert(
+    execution.some((entry) => entry.type === 'ORDER_FILLED' || entry.type === 'FILL'),
+    'the log says the order filled, not merely that an order was sent',
+  );
+  assert(
+    execution.some((entry) => entry.type === 'POSITION_OPENED'),
+    'and that a position opened',
+  );
+  for (const entry of execution) {
+    assertEqual(entry.style.channel, 'EXECUTION', `${entry.type} is filed under EXECUTION`);
+  }
   assert(
     log.some((entry) => entry.type === 'TRADE_PLAN_RISK_CHECKED' || entry.type === 'TRADE_PLAN_REJECTED'),
     'after the deterministic risk layer had its say',

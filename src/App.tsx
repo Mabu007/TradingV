@@ -40,6 +40,9 @@ const starterGoatContext = () =>
   }));
 import { GoatOrchestrator, createGoatStores } from './engine/goat/orchestrator';
 import { ProfileView } from './components/views/ProfileView';
+import { createDurableRuntime } from './engine/goat/durableRuntime';
+import { runtimeServices } from './services/cloudflare/runtimeServices';
+import { firebaseServices } from './services/firebase/configure';
 
 import { User, userService } from './services/userService';
 import { ConnectionStatus } from './types/quotes';
@@ -129,6 +132,24 @@ const goatOrchestrator = new GoatOrchestrator({
   trackers: trackerRuntime,
   env: demoEnvironmentForGoat,
   stores: createGoatStores('PERSISTENT'),
+  /*
+   * The durable runtime, so a deployed GOAT keeps working when this tab closes.
+   *
+   * Wired to the same watcher service the client talks to, and to the same Firebase
+   * session that owns the deployment — so the uid the worker verifies from the ID
+   * token is the uid Firestore's rules key ownership on, and the two databases
+   * cannot disagree about who owns what.
+   *
+   * Both functions are read fresh on every call rather than captured: a user who
+   * signs in after a deployment must not have that deployment registered against
+   * nobody, and a user who signs out must not leave a runtime they can no longer
+   * address.
+   */
+  runtime: createDurableRuntime({
+    client: runtimeServices().watchers,
+    userId: () => firebaseServices().auth.current?.uid,
+  }),
+  runtimeUserId: () => firebaseServices().auth.current?.uid,
 });
 
 /*
@@ -1624,6 +1645,11 @@ function App() {
                GOAT — Goal-Oriented Agentic Trader
                =============================================== */
 
+            /*
+             * "AI ANALYSE TRADE" opens the assistant the product already has,
+             * rather than a review-only panel. Opening it explicitly matters:
+             * a prompt delivered into a closed assistant is a prompt nobody reads.
+             */
             <GoatView
               onRefreshRequest={(
                 request,
@@ -1637,6 +1663,14 @@ function App() {
                   true
                 )
               }
+
+              onAskAI={(prompt) => {
+                if (!requireOpenRouterKey()) {
+                  return;
+                }
+                setExternalAIPrompt(prompt);
+                setAiOpenRequest((count) => count + 1);
+              }}
 
               orchestrator={
                 goatOrchestrator

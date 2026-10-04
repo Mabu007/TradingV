@@ -45,6 +45,14 @@ import type { IAgentModel } from '../../agents/model/types';
 import { capabilityRegistry } from '../../agents/capabilities';
 import type { Bar, Trade } from '../../../types/trading';
 import type { GoatMission } from '../mission';
+import {
+  TradeEngine,
+  tradeStatistics,
+  type TradeContext,
+  type TradeRecord,
+  type TradeStatistics,
+  type TradeTransition,
+} from '../tradeEngine';
 
 import { GoatOrchestrator, createGoatStores, type GoatStores } from '../orchestrator';
 import type { Goal } from '../types';
@@ -197,6 +205,22 @@ export interface BacktestHistory {
   note?: string;
 }
 
+/**
+ * Where the replay is in the trade loop.
+ *
+ * Named for what the reader needs to know rather than for the component doing the
+ * work, and deliberately distinct from `state`, which describes the clock rather
+ * than the trading.
+ */
+export type BacktestTradePhase =
+  | 'RESEARCHING'
+  | 'FORMING PLAN'
+  | 'ORDER PENDING'
+  | 'POSITION OPEN'
+  | 'MANAGING TRADE'
+  | 'SEARCHING FOR NEXT TRADE'
+  | 'BACKTEST COMPLETE';
+
 export interface BacktestSnapshot {
   state: BacktestState;
   /** The simulated instant, epoch ms. */
@@ -224,6 +248,17 @@ export interface BacktestSnapshot {
   mission?: GoatMission;
   report?: BacktestReport;
   message?: string;
+  /**
+   * Every trade this replay has taken, as trades.
+   *
+   * Carried on the snapshot rather than read on demand because the surface re-renders
+   * from snapshots and a subscription that had to reach into the session for trades
+   * would be a second source of truth about what happened.
+   */
+  trades?: TradeRecord[];
+  tradeStats?: TradeStatistics;
+  /** Where the replay is in the trade loop. See `tradePhase`. */
+  tradePhase?: BacktestTradePhase;
 }
 
 export class BacktestSession {
@@ -266,6 +301,15 @@ export class BacktestSession {
   private report?: BacktestReport;
   private readonly reportedTrades = new Set<string>();
   private readonly executedPlans = new Set<string>();
+  /**
+   * The trades this replay has taken.
+   *
+   * Created with the session and never persisted, which is what makes "a new
+   * backtest has no trades from the last one" true by construction: there is no
+   * path by which a previous replay's trades can appear in a new one, because
+   * there is nothing to carry over.
+   */
+  private tradeEngine!: TradeEngine;
   private lastTickPrice?: number;
   private wakeInFlight = 0;
   private starting?: Promise<void>;
@@ -392,6 +436,20 @@ export class BacktestSession {
         : {}),
       ...(this.request.costModel?.leverage !== undefined ? { leverage: this.request.costModel.leverage } : {}),
       ...(this.request.costModel?.pipSize !== undefined ? { pipSize: this.request.costModel.pipSize } : {}),
+    });
+
+    /*
+     * The trade engine, over the same simulated book the GOAT reads.
+     *
+     * Its context is read fresh on every decision rather than captured once,
+     * because equity moves as trades close and a size computed against a stale
+     * balance would quietly exceed the risk budget the strategy set.
+     */
+    this.tradeEngine = new TradeEngine({
+      book: this.environment,
+      now: () => this.clock.now(),
+      context: () => this.tradeContext(),
+      onTransition: (transition) => this.recordTradeTransition(transition),
     });
 
     this.orchestrator = new GoatOrchestrator({
@@ -668,7 +726,25 @@ export class BacktestSession {
       return;
     }
 
-    environment.settleOpenPositions();
+    /*
+     * Orders settle before positions, and both before the trackers hear about the
+     * candle.
+     *
+     * The ordering is the whole honesty of a replay:
+     *
+     *   1. resting orders are tested against *this* candle's range, so a fill can
+     *      only come from a price the GOAT was entitled to see;
+     *   2. positions then settle against the same candle, which is what resolves a
+     *      bar whose range spans both an entry and a stop — the stop is checked
+     *      first, so the ambiguity resolves against the trade rather than for it;
+     *   3. only then are trackers told about the candle, so any evidence they
+     *      gather reflects a book that has already been marked to market.
+     *
+     * Settling positions first would have been the natural-looking order and would
+     * have let a GOAT's own orders fill against a bar its risk layer had not yet
+     * seen.
+     */
+    this.tradeEngine.settle();
 
     if (environment.exhausted) {
       this.clock.stop();
@@ -839,51 +915,142 @@ export class BacktestSession {
     const mission = this.orchestrator.mission(this.goal.id);
     const plan = mission?.tradePlan;
     if (!plan || plan.status !== 'READY') return;
-    if (!mission?.mayExecute) return;
-    if (this.executedPlans.has(plan.id)) return;
-    if (this.environment.openPositions().length > 0) return;
 
-    const size = plan.riskCheck?.metrics?.['volumeUnits'];
-    if (typeof size !== 'number' || !(size > 0)) return;
+    // The plan itself has already been through the orchestrator's risk layer; the
+    // engine's job now is price coherence and placement. Both are needed: the
+    // orchestrator sizes against the account, and the engine refuses a plan whose
+    // stop is on the wrong side of its entry — a check no account reading can make.
+    /*
+     * The engine logs its own rejections.
+     *
+     * It has to: a plan can be refused by the price checks here or by the book
+     * during placement, and both are the same fact about the same trade. Logging
+     * again at the call site would print every rejection exactly twice, and a log
+     * that says a thing happened two times is a log nobody trusts about the one
+     * time it happened once.
+     */
+    await this.tradeEngine.submit(plan, this.goal.id);
 
-    const side = plan.direction === 'LONG' ? 'BUY' : 'SELL';
-    const target = plan.takeProfits[0]?.price;
-    const fill = await this.environment.placeMarketOrder({
-      symbol: plan.symbol,
-      side,
-      volume: size,
-      stopLoss: plan.invalidationLevel,
-      ...(typeof target === 'number' ? { takeProfit: target } : {}),
-      comment: 'Simulated from a GOAT trade plan',
+    // Executing is only honest once the order is actually resting.
+    const trade = this.tradeEngine.all().find((candidate) => candidate.planId === plan.id);
+    if (!trade || trade.status !== 'PENDING') return;
+
+    this.record('ORDER_PLACED', {
+      tradeId: trade.id,
+      planId: plan.id,
+      symbol: trade.symbol,
+      side: trade.side,
+      orderType: trade.orderType,
+      entry: trade.proposedEntry,
+      stop: trade.stopLoss,
+      ...(trade.takeProfit !== undefined ? { target: trade.takeProfit } : {}),
+      riskReward: trade.riskReward,
+      simulated: true,
     });
-    if (!fill.success || !fill.positionId) {
-      this.record('ERROR', { message: `A simulated order was refused: ${fill.error ?? 'unknown reason'}` });
-      return;
+    this.orchestrator.applyExecution(plan.id, { status: 'EXECUTING', reason: 'A limit order is resting.' });
+  }
+
+  /**
+   * The account and policy facts a trade decision is made against.
+   *
+   * Read fresh every time rather than captured once, because equity moves as
+   * trades close: a size computed against the opening balance would silently
+   * exceed the strategy's risk budget by the time the fourth trade was placed.
+   *
+   * `valuePerUnit` is 1 by default, which is right for instruments quoted in the
+   * account's own currency and wrong for ones that are not. It is a known
+   * approximation of the sizing layer rather than a claim of accuracy, and the
+   * orchestrator's own `risk.calculatePositionSize` capability remains the
+   * authority for anything that reaches a live venue.
+   */
+  private tradeContext(): TradeContext {
+    const environment = this.environment;
+    const bar = environment?.currentBar();
+    const equity = this.initialBalance;
+    /*
+     * The deployment's own risk policy, read through the live agent rather than a
+     * field on the session — the policy is the agent's, and duplicating it here
+     * would be a second place to forget to update it.
+     */
+    const instance = this.agentId ? this.agentRuntime.getAgent(this.agentId) : undefined;
+    const maxRiskPerTrade = instance?.agent.policy.maxRiskPerTrade ?? 0.01;
+    return {
+      symbol: this.market,
+      currentPrice: bar?.close ?? 0,
+      maxRiskFractionOfEquity: maxRiskPerTrade,
+      equity,
+      valuePerUnit: 1,
+      mayExecute: this.orchestrator?.mission(this.goal?.id ?? '')?.mayExecute ?? false,
+      // One position at a time.
+      //
+      // The conservative default for a strategy whose concurrency was never
+      // stated: two overlapping positions from one thesis is not two trades, it is
+      // one idea counted twice, and it would be reported as diversification.
+      maxConcurrentPositions: 1,
+    };
+  }
+
+  /**
+   * Record one trade lifecycle transition.
+   *
+   * The event type is chosen from the transition rather than passed in, so every
+   * path into a state logs the same kind of line — a fill logged as an order, or a
+   * closure logged as an expiry, is the kind of mismatch that makes a timeline
+   * unreadable exactly when somebody is trying to follow a trade.
+   */
+  private recordTradeTransition(transition: TradeTransition): void {
+    const shared = {
+      tradeId: transition.tradeId,
+      planId: transition.planId,
+      ...(transition.price !== undefined ? { price: transition.price } : {}),
+      ...(transition.reason ? { detail: transition.reason } : {}),
+      simulated: true,
+    };
+
+    switch (transition.to) {
+      case 'PENDING':
+        this.record('ORDER_PLACED', { ...shared, ...(transition.price !== undefined ? { entry: transition.price } : {}) });
+        return;
+      case 'FILLED':
+        this.record('ORDER_FILLED', shared);
+        return;
+      case 'RUNNING':
+        this.record('POSITION_OPENED', shared);
+        return;
+      case 'EXPIRED':
+        this.record('ORDER_EXPIRED', shared);
+        return;
+      case 'CANCELLED':
+        this.record('ORDER_CANCELLED', shared);
+        return;
+      case 'REJECTED':
+        this.record('ORDER_REJECTED', shared);
+        return;
+      case 'TAKE_PROFIT':
+      case 'STOPPED_OUT':
+      case 'EXITED':
+        this.record('TRADE_CLOSED', { ...shared, ...(transition.pnl !== undefined ? { pnl: transition.pnl } : {}) });
+        return;
+      default:
+        return;
     }
+  }
 
-    this.executedPlans.add(plan.id);
-    this.record('ORDER', {
-      symbol: plan.symbol,
-      side,
-      volume: size,
-      entry: plan.entry,
-      stop: plan.invalidationLevel,
-      ...(typeof target === 'number' ? { target } : {}),
-      simulated: true,
-    });
-    this.record('FILL', {
-      symbol: plan.symbol,
-      price: fill.fillPrice,
-      volume: size,
-      simulated: true,
-    });
-    this.record('POSITION_OPENED', {
-      positionId: fill.positionId,
-      symbol: plan.symbol,
-      side,
-      simulated: true,
-    });
-    this.orchestrator.applyExecution(plan.id, { status: 'MANAGING', reason: 'Simulated fill' });
+  /**
+   * The GOAT's trades as *trades* — intention, order, fill, result.
+   *
+   * Distinct from `trades()`, which is the venue's own fill ledger. Both are
+   * useful and they answer different questions: `trades()` says what executed,
+   * this says what the GOAT was trying to do and what became of it, including the
+   * orders that never filled at all.
+   */
+  tradeRecords(): TradeRecord[] {
+    return this.tradeEngine.all();
+  }
+
+  /** Trade statistics, derived on demand from the trades above. */
+  tradeStats(): TradeStatistics {
+    return tradeStatistics(this.tradeEngine.all());
   }
 
   /**
@@ -979,8 +1146,34 @@ export class BacktestSession {
       ...(this.agentId ? { agentId: this.agentId } : {}),
       ...(this.goal && this.orchestrator ? { mission: this.orchestrator.mission(this.goal.id) ?? undefined } : {}),
       ...(this.report ? { report: this.report } : {}),
+      ...(this.tradeEngine ? { tradePhase: this.tradePhase() } : {}),
       ...(this.lastMessage ? { message: this.lastMessage } : {}),
+      ...(this.tradeEngine ? { trades: this.tradeEngine.all() } : {}),
+      ...(this.tradeEngine ? { tradeStats: this.tradeStats() } : {}),
     };
+  }
+
+  /**
+   * What the GOAT is doing, in trade terms.
+   *
+   * Derived from the live trades rather than tracked separately, because a status
+   * kept alongside the trades is a status that can disagree with them — and the
+   * whole complaint about the previous behaviour was a screen that said
+   * "RESEARCHING" while a position was open.
+   *
+   * Order matters: the running position wins over the waiting order, because an
+   * open position is what a reader most needs to know.
+   */
+  tradePhase(): BacktestTradePhase {
+    const trades = this.tradeEngine?.all() ?? [];
+    if (this.currentState === 'COMPLETED') return 'BACKTEST COMPLETE';
+    if (trades.some((trade) => trade.status === 'RUNNING' || trade.status === 'FILLED')) return 'POSITION OPEN';
+    if (trades.some((trade) => trade.status === 'PENDING')) return 'ORDER PENDING';
+    if (trades.some((trade) => trade.status === 'TAKE_PROFIT' || trade.status === 'STOPPED_OUT' || trade.status === 'EXITED')) {
+      return 'SEARCHING FOR NEXT TRADE';
+    }
+    if (this.orchestrator?.mission(this.goal?.id ?? '')?.tradePlan) return 'MANAGING TRADE';
+    return 'RESEARCHING';
   }
 
   /** The agent log, from the same projection the live workspace renders. */

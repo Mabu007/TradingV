@@ -62,6 +62,12 @@ import { TrackerRuntimeError } from '../agents/trackers/runtime';
 import { buildTrackerCapabilities, TrackerSdk, ALL_GOAT_CAPABILITIES } from './trackerSdk';
 import { registerAgentTools, AGENT_TOOL_IDS, AGENT_TOOL_GUIDE } from './agentTools';
 import { isDataRequirement } from '../agents/trackers/registry';
+import {
+  InertRuntime,
+  type DurableRuntime,
+  type RuntimeIdentity,
+  type RuntimeReport,
+} from './durableRuntime';
 import { TRACKER_KINDS } from '../agents/trackers/runtime';
 import { defaultObservationPlan } from '../agents/trackers/contracts';
 import { GoatSkillRegistry, SkillPackage } from './skills';
@@ -380,6 +386,25 @@ export interface GoatDeps {
    * configured venue is used.
    */
   venueEnvironment?: VenueEnvironment;
+  /**
+   * The durable runtime that survives the tab being closed.
+   *
+   * Optional, and absent means "this deployment lives only in this tab". That is a
+   * supported configuration rather than a degraded one — a replay never has one —
+   * and it is why every call site goes through a report instead of assuming a
+   * runtime exists.
+   */
+  runtime?: DurableRuntime;
+  /**
+   * The signed-in user's id, for the durable runtime's identity.
+   *
+   * A function rather than a value so it is read at the moment a deployment
+   * happens: a user can sign in between two deployments, and a value captured at
+   * construction time would register the second one against the first user's
+   * account. Returns undefined when nobody is signed in, which simply means no
+   * durable runtime is registered — see `runtimeIdentity`.
+   */
+  runtimeUserId?: () => string | undefined;
 }
 
 /**
@@ -557,7 +582,17 @@ export class GoatOrchestrator {
     return next;
   }
 
+  /**
+   * The durable runtime, never null.
+   *
+   * Held as a field rather than read from `deps` at each call site, so there is
+   * exactly one place that answers "is there a durable runtime here" and no call
+   * site that can forget to ask.
+   */
+  private readonly runtime: DurableRuntime;
+
   constructor(private readonly deps: GoatDeps) {
+    this.runtime = deps.runtime ?? new InertRuntime();
     this.stores = deps.stores;
     this.steeringStore = deps.stores.steering ?? new SteeringStore('tradinggoats.steering.memory');
     this.capabilities = deps.capabilities ?? capabilityRegistry;
@@ -1849,6 +1884,21 @@ export class GoatOrchestrator {
       },
     });
 
+    /*
+     * Register the durable runtime.
+     *
+     * After the deployment record, not before: the worker's identity includes the
+     * deployment id, so there is nothing to register until the deployment exists.
+     * And after the activity line, because "deployed" is true either way — the
+     * in-tab runtime is already running and the GOAT is already working, so this
+     * extends the deployment's life beyond this tab rather than starting it.
+     *
+     * Not awaited, because `deployGoat` is synchronous and is called from a click
+     * handler. The report is recorded when it lands, so a runtime that could not
+     * be registered is visible rather than merely absent.
+     */
+    void this.activateRuntime(goal.agentId, deployment.id, market, declared.length > 0 ? declared : [timeframe]);
+
     return deployment;
   }
 
@@ -2273,6 +2323,19 @@ export class GoatOrchestrator {
     this.noThesisLooks.delete(goal.agentId);
 
     /*
+     * Release the durable runtime's state for this session.
+     *
+     * A refresh clears the GOAT's *work*, and a runtime's cooldowns and last
+     * evaluation are work: they belong to the session being discarded. Carrying them
+     * into a clean session would make the new one start already muted by decisions
+     * the user just threw away, which is exactly the contamination a refresh is
+     * supposed to prevent. Suspended rather than retired, because the deployment
+     * itself survives — only its session ends.
+     */
+    const liveDeployment = this.stores.deployments.currentFor(goal.agentId);
+    if (liveDeployment) void this.suspendRuntime(liveDeployment, reason);
+
+    /*
      * Reactivate the same deployment rather than creating one.
      *
      * A new deployment id would give the GOAT a second runtime identity, and
@@ -2382,6 +2445,21 @@ export class GoatOrchestrator {
       updatedAt: this.now(),
     };
     this.stores.deployments.save(deployment);
+
+    /*
+     * Register the durable runtime again, on the same identity.
+     *
+     * Idempotent on `(userId, goalId, deploymentId)` — which is the worker's own
+     * identity — so a resume continues the existing runtime with its cooldowns
+     * intact rather than starting a second one. That is the whole reason resume
+     * keeps the deployment record instead of deploying afresh.
+     */
+    void this.activateRuntime(
+      goal.agentId,
+      deployment.id,
+      deployment.marketId,
+      goal.timeframes.length > 0 ? goal.timeframes : ['15m'],
+    );
 
     // The market it was pointed at is part of the deployment, so resuming
     // restores it rather than asking again.
@@ -3430,7 +3508,19 @@ export class GoatOrchestrator {
     const goal = this.stores.goals.get(goalId);
     if (!goal) return;
     const deployment = this.stores.deployments.currentFor(goal.agentId);
-    if (deployment) this.retireDeployment(deployment, reason);
+    if (deployment) {
+      this.retireDeployment(deployment, reason);
+      /*
+       * Retire the durable runtime, and await it.
+       *
+       * Awaited here, unlike the activation on deploy, because undeploying is
+       * already async and already a deliberate act: returning while a retired
+       * deployment's watcher is still registered is exactly the orphan this method
+       * exists to prevent — a runtime that keeps waking for a deployment the user
+       * has just deleted.
+       */
+      await this.retireRuntime(deployment, reason);
+    }
     if (this.deps.agentRuntime.getAgent(goal.agentId)) {
       await this.deps.agentRuntime.stop(goal.agentId);
       this.deps.agentRuntime.unregisterAgent(goal.agentId);
@@ -3446,12 +3536,187 @@ export class GoatOrchestrator {
     });
   }
 
+  /**
+   * Register the durable runtime for a deployment.
+   *
+   * Best effort by construction: the report is recorded and the deployment stands.
+   * A deployment whose runtime could not be registered is still running in this
+   * tab, and telling the user it failed would be wrong — what is true is that it
+   * will not survive this tab, which is a different and much smaller claim.
+   */
+  private async activateRuntime(
+    agentId: string,
+    deploymentId: string,
+    market: string,
+    timeframes: string[],
+  ): Promise<void> {
+    // Goals are keyed by goal id and reached by agent id, so the lookup is by
+    // agent — `getForAgent` exists for exactly this and `get` would silently
+    // return nothing, which is how a runtime ends up unregistered with no error.
+    const goal = this.stores.goals.getForAgent(agentId);
+    const identity: RuntimeIdentity | undefined = this.runtimeIdentity(agentId, deploymentId);
+    if (!goal || !identity) return;
+
+    let report: RuntimeReport;
+    try {
+      report = await this.runtime.activate({
+        ...identity,
+        market,
+        name: goal.name?.trim() || goal.statement.slice(0, 60),
+        configurationVersion: 1,
+        conditionTree: this.runtimeConditionTree(agentId, market, timeframes),
+        timeframes,
+      });
+    } catch (error) {
+      report = { ok: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+
+    if (report.ok) {
+      this.recordActivity({
+        goatId: agentId,
+        deploymentId,
+        agentId,
+        type: 'RUNTIME_REGISTERED',
+        data: { watcherId: report.watcherId, market },
+      });
+      return;
+    }
+    // A skipped runtime is not news — no worker configured is the normal case for
+    // a replay and for a build without one — so it is not logged. A *failed* one
+    // is, because somebody asked for durability and did not get it.
+    if (report.skipped !== true) {
+      this.recordActivity({
+        goatId: agentId,
+        deploymentId,
+        agentId,
+        type: 'RUNTIME_UNAVAILABLE',
+        data: { reason: report.reason, phase: 'activate' },
+      });
+    }
+  }
+
+  /** Stop the durable runtime waking, keeping its state for a resume. */
+  private async suspendRuntime(deployment: GoatDeployment, reason: string): Promise<void> {
+    const identity = this.runtimeIdentity(deployment.goatId, deployment.id);
+    if (!identity) return;
+    try {
+      const report = await this.runtime.suspend(identity);
+      if (!report.ok && report.skipped !== true) {
+        this.recordActivity({
+          goatId: deployment.goatId,
+          deploymentId: deployment.id,
+          agentId: deployment.goatId,
+          type: 'RUNTIME_UNAVAILABLE',
+          data: { reason: report.reason, phase: 'suspend' },
+        });
+      }
+    } catch (error) {
+      this.recordActivity({
+        goatId: deployment.goatId,
+        deploymentId: deployment.id,
+        agentId: deployment.goatId,
+        type: 'RUNTIME_UNAVAILABLE',
+        data: { reason: error instanceof Error ? error.message : String(error), phase: 'suspend' },
+      });
+    }
+    void reason;
+  }
+
+  /** Discard the durable runtime's state entirely. */
+  private async retireRuntime(deployment: GoatDeployment, reason: string): Promise<void> {
+    const identity = this.runtimeIdentity(deployment.goatId, deployment.id);
+    if (!identity) return;
+    try {
+      const report = await this.runtime.retire(identity);
+      if (!report.ok && report.skipped !== true) {
+        this.recordActivity({
+          goatId: deployment.goatId,
+          deploymentId: deployment.id,
+          agentId: deployment.goatId,
+          type: 'RUNTIME_UNAVAILABLE',
+          data: { reason: report.reason, phase: 'retire' },
+        });
+      }
+    } catch {
+      // Deliberately swallowed. The deployment is already retired locally, and a
+      // runtime that outlives it is cleaned up by the worker's own reconciliation;
+      // failing the undeploy instead would leave the user with a half-removed GOAT.
+    }
+    void reason;
+  }
+
+  /**
+   * The worker's identity for a deployment, when there is one to be had.
+   *
+   * Absent without a signed-in user, because the user id is the worker's only
+   * notion of who is asking and it must come from a verified session — never from
+   * a GOAT, a goal record, or anything the caller could supply.
+   */
+  private runtimeIdentity(goalId: string, deploymentId: string): RuntimeIdentity | undefined {
+    const userId = this.deps.runtimeUserId?.();
+    if (!userId) return undefined;
+    return { userId, goalId, deploymentId };
+  }
+
+  /**
+   * The conditions the durable runtime should watch.
+   *
+   * The GOAT's live trackers when it has any, because those are the conditions it
+   * has actually armed — handing the worker a different set would mean it woke for
+   * something this GOAT is not watching. Before the first thesis exists there are
+   * none, so the tree records the market and the resolutions it works across, which
+   * is the honest answer: "watch this market, at these resolutions".
+   */
+  private runtimeConditionTree(agentId: string, market: string, timeframes: string[]): unknown {
+    const trackers = this.trackers
+      .listForAgent(agentId)
+      .filter((tracker) => tracker.lifecycle.status === 'ACTIVE');
+
+    if (trackers.length === 0) {
+      return {
+        schemaVersion: 1,
+        then: 'all',
+        root: {
+          kind: 'GROUP',
+          description: `${market} at ${timeframes.join(', ') || 'the deployment resolution'}`,
+          children: timeframes.map((timeframe) => ({
+            kind: 'NEW_BAR',
+            timeframe,
+            config: {},
+          })),
+        },
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      then: 'all',
+      root: {
+        kind: 'GROUP',
+        children: trackers.map((tracker) => ({
+          kind: tracker.kind,
+          timeframe: tracker.timeframe,
+          config: tracker.config,
+        })),
+      },
+    };
+  }
+
   /** Move an existing deployment to paused, without losing the record. */
   pauseGoat(goalId: string): GoatDeployment | undefined {
     const deployment = this.currentDeployment(goalId);
     if (!deployment) return undefined;
     const paused = { ...deployment, status: 'paused' as const, updatedAt: this.now() };
     this.stores.deployments.save(paused);
+    /*
+     * Suspend, do not retire.
+     *
+     * A paused GOAT keeps its durable state — its cooldowns and its last
+     * evaluation are the record of what it was doing — and a resume continues from
+     * there. Retiring here would throw that away on every pause, which is what
+     * makes a pause indistinguishable from an undeploy.
+     */
+    void this.suspendRuntime(deployment, 'Paused by the operator.');
     return paused;
   }
 
@@ -4038,6 +4303,30 @@ export class GoatOrchestrator {
       },
     });
 
+    /*
+     * What the loop refused, on the record.
+     *
+     * A wake can decide something the loop will not do — an escalation that does not
+     * meet its skills, a trade proposal for a thesis that is not actionable, a
+     * tracker spec this runtime cannot watch. Every one of those refusals used to be
+     * collected into `outcome.rejections` and then dropped on the floor, which is
+     * precisely why the missing escalation went unnoticed: the GOAT looked like it
+     * was thinking and quietly going nowhere, with nothing in the log to say why.
+     *
+     * Recorded as its own line rather than folded into the decision's reason,
+     * because the decision was accepted — it is what the GOAT wanted — and the
+     * refusal is a different fact about a different subject.
+     */
+    for (const rejection of outcome.rejections) {
+      this.recordActivity({
+        goatId: context.agentId,
+        deploymentId: context.deployment.deploymentId,
+        agentId: wake.agentId,
+        type: 'DECISION_REFUSED',
+        data: { kind: decided.kind, reason: rejection, thesisId: wake.thesisId },
+      });
+    }
+
     if (outcome.trackerChanges.length > 0) {
       for (const change of outcome.trackerChanges) {
         this.recordActivity({
@@ -4473,8 +4762,20 @@ export class GoatOrchestrator {
           '- REVISE_THESIS   the hypothesis needs restating',
           '- CREATE_TRACKER  you now need to watch for something else',
           '- REMOVE_TRACKER  you no longer need to watch something',
-          '- PROPOSE_TRADE_IDEA the thesis is actionable',
+          '- ESCALATE_THESIS the evidence now meets your skills\' bar for trading',
+          '- PROPOSE_TRADE_IDEA the thesis is already ACTIONABLE and you can price it',
           '- WAIT            not enough to act on',
+          '',
+          'ESCALATE_THESIS and PROPOSE_TRADE_IDEA are two different steps, not two ways',
+          'of saying the same thing. A thesis is only ACTIONABLE after an escalation,',
+          'so proposing a trade on an investigating thesis will be refused. Escalate',
+          'first; price the trade on a later wake.',
+          '',
+          'Pricing a trade means answering one question: at what price would this',
+          'become attractive? Prefer orderType LIMIT with an entry you would wait',
+          'for — a retest, a level, a pullback — over MARKET, which pays the spread',
+          'to get in now. `invalidationLevel` is the stop: the price at which the',
+          'thesis is wrong, so it must sit beyond the structure you are trading.',
           '',
           'A tracker event is a fact. It is never a buy or a sell.',
           'One decision per wake. If the decision depends on a resolution you were not',
@@ -4674,6 +4975,16 @@ function detailForActivity(type: AgentTimelineEventType, record: Record<string, 
     case 'EVIDENCE_REQUIREMENTS_DEFINED': {
       const requirements = Array.isArray(record.requirements) ? record.requirements.filter((r): r is string => typeof r === 'string') : [];
       if (requirements.length > 0) parts.push(requirements.join(' · '));
+      break;
+    }
+
+    case 'DECISION_REFUSED': {
+      if (typeof record.kind === 'string' && record.kind) parts.push(record.kind);
+      break;
+    }
+
+    case 'RUNTIME_REGISTERED': {
+      if (isFiniteNumber(record.watcherId)) parts.push(String(record.watcherId));
       break;
     }
 
@@ -4937,6 +5248,23 @@ function describeActivity(type: AgentTimelineEventType, data: unknown): string {
         : `Resumed on ${text(record.market)}`;
     case 'GOAT_STOPPED':
       return text(record.reason) ? `Stopped: ${text(record.reason)}` : 'Stopped';
+    /*
+     * The loop's refusal, in the reader's terms.
+     *
+     * "Refused" is the wrong word on its own — it reads as an error, when the
+     * refusal is the runtime declining to do something the GOAT asked for and
+     * saying why. Naming the gate it stopped at is what makes the line useful.
+     */
+    case 'DECISION_REFUSED':
+      return text(record.reason) || 'The runtime declined this decision.';
+    case 'RUNTIME_REGISTERED':
+      return 'Registered with the durable runtime, so it keeps working when this tab closes';
+    case 'RUNTIME_UNAVAILABLE': {
+      const phase = text(record.phase);
+      return `The durable runtime is unavailable${
+        phase ? ` while trying to ${phase}` : ''
+      }. This GOAT keeps working in this tab, but it will stop when the tab closes.`;
+    }
     case 'GOAT_STEERED':
       return text(record.instruction)
         ? `You asked it to reconsider: ${text(record.instruction)}`
@@ -5243,6 +5571,7 @@ function parsePlan(response: AgentModelResponse): AgentPlan | undefined {
     case 'CONFIRM_THESIS':
     case 'WEAKEN_THESIS':
     case 'INVALIDATE_THESIS':
+    case 'ESCALATE_THESIS':
     case 'REVISE_THESIS':
       if (typeof record.thesisId !== 'string') return undefined;
       return {

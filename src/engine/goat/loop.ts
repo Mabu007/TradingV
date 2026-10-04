@@ -650,6 +650,43 @@ export class GoatLoop {
           break;
         }
 
+        case 'ESCALATE_THESIS': {
+          /*
+           * Promotion, through the gate that already exists.
+           *
+           * `reviseThesis` refuses a thesis that does not meet its skills' bar, so
+           * escalation cannot be used to bypass evidence requirements — it can
+           * only express that the model believes the bar is met. A refusal is
+           * reported rather than thrown, because "your skills are not satisfied
+           * yet" is a legitimate answer to a wake, not a crash.
+           *
+           * The wake's own `thesisId` is authoritative and the plan's is ignored.
+           * The wake already says which thesis this reasoning is about; a model that
+           * named a different one would otherwise be able to escalate somebody
+           * else's thesis, which is the same ownership hazard `buildContext` refuses
+           * to even reach.
+           */
+          const thesis = this.deps.theses.get(wake.thesisId);
+          if (!thesis) {
+            outcome.rejections.push(`Thesis ${wake.thesisId} no longer exists.`);
+            break;
+          }
+          if (thesis.state === 'ACTIONABLE') {
+            // Already there. Saying so is better than a redundant write, and the
+            // next wake can price the trade.
+            outcome.thesis = thesis;
+            outcome.rejections.push('This thesis is already actionable.');
+            break;
+          }
+          outcome.evidenceRecorded.push(this.recordWakeEvidence(wake, 'SUPPORTS').id);
+          try {
+            outcome.thesis = this.reviseThesis(wake.thesisId, { state: 'ACTIONABLE' });
+          } catch (error) {
+            outcome.rejections.push(this.describeRejection(error));
+          }
+          break;
+        }
+
         case 'CREATE_TRACKER': {
           try {
             const tracker = this.deps

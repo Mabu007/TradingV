@@ -1946,6 +1946,155 @@ test('refresh: an outstanding model request cannot mutate the fresh runtime', as
 });
 
 // ---------------------------------------------------------------------------
+// 10. Escalation: the step without which a GOAT could never trade
+// ---------------------------------------------------------------------------
+
+test('escalation: a GOAT can promote its own thesis to actionable, and the gate still holds', async () => {
+  /*
+   * THE DEADLOCK THIS CLOSES.
+   *
+   * A trade proposal is only accepted from an ACTIONABLE thesis, and until
+   * ESCALATE_THESIS existed the only way to reach that state was `reviseThesis`,
+   * which no wake path called. So a model that investigated correctly, tracked
+   * correctly and reasoned correctly was refused at the last step of every wake:
+   * the GOAT could not trade at all, not rarely — never.
+   *
+   * The gate itself is not weakened to get here. The shipped skills ask for two
+   * supporting observations before a thesis may act, so this fires two trackers
+   * before escalating — which is the point: the fix gives the GOAT a way to *ask*,
+   * and the gate still decides whether the answer is yes.
+   */
+  const h = makeHarness({
+    // Escalates on both wakes. The first is refused by the skill gate; the second
+    // goes through. A model that gave up after one refusal would be a different
+    // test, and the interesting property here is that the gate is consulted and
+    // then satisfied rather than bypassed.
+    model: new ScriptedModel([
+      INVESTIGATION,
+      '{"kind":"ESCALATE_THESIS","thesisId":"ignored","reason":"the level broke on a completed candle"}',
+      '{"kind":"ESCALATE_THESIS","thesisId":"ignored","reason":"a second observation agrees independently"}',
+    ]),
+    skillIds: ['structural-trend-analysis'],
+  });
+  await h.investigate();
+  assert(h.mission().thesis !== undefined, 'a thesis exists');
+  assert(h.mission().thesis!.state !== 'ACTIONABLE', 'and starts out not yet actionable');
+
+  // The first wake: not enough supporting evidence yet.
+  await fireTracker(h, 1.11);
+  assertEqual(
+    h.mission().thesis!.state !== 'ACTIONABLE',
+    true,
+    'one observation is not a pattern, and the gate refuses',
+  );
+  const refusal = h.agentLog().find((entry) => entry.type === 'DECISION_REFUSED');
+  assert(
+    refusal !== undefined,
+    'and the refusal is on the record rather than swallowed — which is how this deadlock stayed invisible',
+  );
+  assert(
+    (refusal?.headline ?? '').includes('skill constraints'),
+    `naming the gate that stopped it (${refusal?.headline})`,
+  );
+
+  // The second wake: enough evidence, so the escalation goes through.
+  await fireTracker(h, 1.12);
+  assertEqual(
+    h.mission().thesis!.state,
+    'ACTIONABLE',
+    `the GOAT promoted it on the evidence it gathered (refused: ${h
+      .agentLog()
+      .filter((entry) => entry.type === 'DECISION_REFUSED')
+      .map((entry) => `${entry.headline} // ${entry.detail}`)
+      .join('; ')})`,
+  );
+});
+
+test('escalation: the wake owns which thesis is promoted, not the model', async () => {
+  /*
+   * Ownership, asserted.
+   *
+   * The escalation names a different thesis id than the wake it arrived on. If the
+   * plan's id were trusted, this reply would have escalated — or worse, tried to
+   * escalate — a thesis belonging to some other GOAT.
+   */
+  const h = makeHarness({
+    model: new ScriptedModel([
+      INVESTIGATION,
+      '{"kind":"ESCALATE_THESIS","thesisId":"someone_elses_thesis","reason":"promoting someone else"}',
+    ]),
+  });
+  await h.investigate();
+  const before = h.mission().thesis!.id;
+  await fireTracker(h, 1.11);
+
+  const stored = [...Array(50)].reduce<string | undefined>((found) => found ?? before, undefined);
+  assertEqual(h.mission().thesis!.id, stored, 'the GOAT still holds its own thesis');
+  assert(
+    h.orchestrator.stores.theses.get('someone_elses_thesis') === undefined,
+    'and no thesis belonging to anybody else was created or promoted',
+  );
+});
+
+test('escalation: the gate is real, so escalation cannot route around the skills', async () => {
+  /*
+   * The gate, isolated.
+   *
+   * Evidence is written straight to the store rather than produced by a tracker,
+   * because this test is about the gate's arithmetic — "supporting observations ≥
+   * what the skills ask for" — and not about whether a tracker fires. Driving it
+   * through wake machinery would add three ways for the test to fail for reasons
+   * that have nothing to do with the thing being asserted.
+   */
+  const h = makeHarness({ model: new ScriptedModel([INVESTIGATION]), skillIds: ['structural-trend-analysis'] });
+  await h.investigate();
+  const thesisId = h.mission().thesis!.id;
+
+  const supporting = (): number =>
+    h.orchestrator.stores.evidence.listForThesis(thesisId).filter((item) => item.polarity === 'SUPPORTS').length;
+
+  const recordSupport = (summary: string): void => {
+    h.orchestrator.stores.evidence.append({
+      id: `ev_${Math.random().toString(36).slice(2, 10)}`,
+      thesisId,
+      polarity: 'SUPPORTS',
+      summary,
+      source: 'TRACKER',
+      at: h.clock.now(),
+    } as never);
+  };
+
+  const escalate = (): { refused?: Error } => {
+    try {
+      h.orchestrator.loop.reviseThesis(thesisId, { state: 'ACTIONABLE' });
+      return {};
+    } catch (error) {
+      return { refused: error as Error };
+    }
+  };
+
+  const none = escalate();
+  assert(none.refused !== undefined, 'with no supporting evidence, escalation is refused');
+  assert(
+    none.refused.message.includes('skill constraints'),
+    `naming the gate (${none.refused.message})`,
+  );
+  assertEqual(h.mission().thesis!.state !== 'ACTIONABLE', true, 'and the thesis did not move');
+
+  recordSupport('first observation');
+  const one = escalate();
+  if (one.refused !== undefined) {
+    // The skills ask for two, so one is still short and the gate must still refuse.
+    assert(one.refused.message.includes('skill constraints'), 'one is still short, and still refused');
+  }
+
+  recordSupport('second, independent observation');
+  const two = escalate();
+  assertEqual(two.refused, undefined, 'once the bar is met, escalation goes through');
+  assertEqual(h.mission().thesis!.state, 'ACTIONABLE', 'and the thesis is actionable');
+});
+
+// ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
 

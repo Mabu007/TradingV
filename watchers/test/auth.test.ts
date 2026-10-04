@@ -9,7 +9,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { exportJWK, generateKeyPair, SignJWT, type JWK, type KeyLike } from 'jose';
+import { exportJWK, generateKeyPair, SignJWT, type JWK } from 'jose';
 
 import { identifyCaller, resetKeyCache } from '../src/auth';
 import type { Env } from '../src/env';
@@ -17,7 +17,14 @@ import type { Env } from '../src/env';
 const PROJECT_ID = 'tradecode-test';
 const ISSUER = `https://securetoken.google.com/${PROJECT_ID}`;
 
-let privateKey: KeyLike;
+/*
+ * `CryptoKey`, not jose's old `KeyLike`.
+ *
+ * jose 6 dropped the `KeyLike` export in favour of the WebCrypto type, which is
+ * what `generateKeyPair` actually returns here. Naming the real return type keeps
+ * this compiling against the SDK's own signature rather than a shim.
+ */
+let privateKey: CryptoKey;
 let jwk: JWK;
 
 /** Sign a token Firebase would accept. */

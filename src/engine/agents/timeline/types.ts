@@ -14,6 +14,25 @@ export type AgentTimelineEventType =
   | 'POSITION_OPENED'
   | 'POSITION_UPDATE'
   | 'POSITION_CLOSED'
+  /*
+   * The order lifecycle.
+   *
+   * `ORDER` is the instruction leaving; these three are what became of it. They
+   * are separate events rather than fields on one because a resting order that
+   * expires and a resting order that is withdrawn are different facts about the
+   * market and about the GOAT, and a log that merged them would make patience
+   * indistinguishable from indecision.
+   */
+  | 'ORDER_PLACED'
+  | 'ORDER_FILLED'
+  | 'ORDER_EXPIRED'
+  | 'ORDER_CANCELLED'
+  | 'ORDER_REJECTED'
+  | 'TRADE_CLOSED'
+  | 'DECISION_REFUSED'
+  /** The durable runtime behind this deployment, registered or not. */
+  | 'RUNTIME_REGISTERED'
+  | 'RUNTIME_UNAVAILABLE'
   | 'ERROR'
   /*
    * The GOAT lifecycle.

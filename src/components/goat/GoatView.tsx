@@ -45,6 +45,14 @@ export interface GoatViewProps {
    */
   onOpenAISettings?: () => void;
   /**
+   * Hand a prompt to the existing GOAT conversation.
+   *
+   * Used by "AI ANALYSE TRADE", which opens the assistant the product already
+   * has rather than a review-only panel. Optional, so the action hides when no
+   * assistant is mounted instead of failing when pressed.
+   */
+  onAskAI?: (prompt: string) => void;
+  /**
    * Ask this view to re-read the orchestrator.
    *
    * Registered by the view and called by the application when something
@@ -91,6 +99,7 @@ export const GoatView: React.FC<GoatViewProps> = ({
   markets = [],
   onGoalCreated,
   onOpenAISettings,
+  onAskAI,
   onRefreshRequest,
 }) => {
   const [screen, setScreen] = useState<Screen>('home');
@@ -468,19 +477,16 @@ export const GoatView: React.FC<GoatViewProps> = ({
                 and not in a tab of its own. It opens the agentic workspace
                 directly — pressing START puts you in the log, not in a wizard.
               */}
-              <button
-                type="button"
-                onClick={() => {
-                  setError(undefined);
-                  setNotice(undefined);
-                  setScreen('backtest');
-                }}
-                data-testid="open-backtest"
-                className="inline-flex items-center gap-1.5 rounded-lg border border-line px-3 py-2 text-[11px] font-semibold text-ink-2 transition-colors hover:border-accent/50 hover:text-ink"
-              >
-                <History className="h-3.5 w-3.5" aria-hidden="true" />
-                Backtest a GOAT
-              </button>
+              {/*
+                No global "Backtest a GOAT" here.
+
+                A backtest is about a strategy, so it is a question about one GOAT
+                and belongs on that GOAT's own detail page, where its skills,
+                timeframes and market are already known. A global button has to pick
+                a GOAT for the user, which means either guessing or asking — and
+                either way it produces a replay that is not the replay the user
+                meant.
+              */}
             </header>
 
             {/*
@@ -658,6 +664,7 @@ export const GoatView: React.FC<GoatViewProps> = ({
           <BacktestSurface
             markets={markets.length > 0 ? markets : ['EUR/USD']}
             {...(backtestSeed ? { seed: backtestSeed } : {})}
+            {...(onAskAI ? { onAskAI } : {})}
             onExit={goHome}
           />
         )}
