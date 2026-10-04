@@ -31,21 +31,44 @@ const STATUS_TONE: Record<PlanView['status'], string> = {
 
 export interface TradePlanPanelProps {
   plan: PlanView;
+  /**
+   * Why there is nothing to read yet, when there is nothing to read yet.
+   *
+   * "No plan yet" is an absence, and an absence is not an explanation. A GOAT
+   * that is reading the market, or blocked on the model, or waiting for a
+   * resolution it does not have yet, is doing something specific — and saying
+   * so is the difference between a panel that looks broken and one that looks
+   * like an agent at work.
+   */
+  formingNote?: string;
   className?: string;
 }
 
-export const TradePlanPanel: React.FC<TradePlanPanelProps> = ({ plan, className = '' }) => {
+export const TradePlanPanel: React.FC<TradePlanPanelProps> = ({
+  plan,
+  formingNote,
+  className = '',
+}) => {
   if (!plan.exists) {
     return (
       <section
         className={`rounded-2xl border border-line bg-surface px-5 py-4 ${className}`}
         aria-label="Trade plan"
       >
-        <h2 className="font-mono text-[10px] tracking-[0.18em] text-ink-3">TRADE PLAN</h2>
-        <p className="mt-3 text-[11px] leading-relaxed text-ink-4">
-          No plan yet. A plan exists from the moment this GOAT has a
-          hypothesis — it appears here before it is actionable, and before
-          anything could be traded.
+        <header className="flex items-baseline justify-between gap-3">
+          <h2 className="font-mono text-[10px] tracking-[0.18em] text-ink-3">TRADE PLAN</h2>
+          <span
+            className="inline-flex items-center gap-1.5 font-mono text-[10px] tracking-[0.12em] text-accent-ink"
+            data-testid="plan-status"
+            data-status="BUILDING"
+          >
+            <span className="h-1.5 w-1.5 rounded-full bg-accent animate-goat-pulse-dim" aria-hidden="true" />
+            FORMING
+          </span>
+        </header>
+        <p className="mt-3 text-[11.5px] leading-relaxed text-ink-2" data-testid="plan-forming">
+          {formingNote ??
+            'The plan appears here the moment this GOAT has something to believe — what it thinks may happen, what would confirm it, and what it would do.'}
         </p>
       </section>
     );
@@ -104,6 +127,21 @@ export const TradePlanPanel: React.FC<TradePlanPanelProps> = ({ plan, className 
 
       {plan.idea && plan.objective !== plan.idea && (
         <p className="mt-1.5 text-[11px] leading-relaxed text-ink-3">{plan.idea}</p>
+      )}
+
+      {/*
+        What it is still waiting for, in the plan's own words.
+        Shown only while something is outstanding, because "validating" with no
+        list of conditions is a status word where the reader wanted a reason.
+      */}
+      {plan.awaiting && plan.awaiting.length > 0 && (
+        <p className="mt-1.5 text-[11px] leading-relaxed text-ink-3" data-testid="plan-awaiting">
+          Waiting on{' '}
+          {plan.awaiting.length === 1
+            ? plan.awaiting[0]
+            : `${plan.awaiting.slice(0, -1).join(', ')} and ${plan.awaiting[plan.awaiting.length - 1]}`}
+          .
+        </p>
       )}
 
       {plan.research.length > 0 && (

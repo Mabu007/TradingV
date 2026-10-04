@@ -163,7 +163,13 @@ interface Harness {
   investigate(): Promise<void>;
 }
 
-function makeHarness(options: { model?: ScriptedModel; market?: string; skillIds?: string[] } = {}): Harness {
+function makeHarness(options: {
+  model?: ScriptedModel;
+  market?: string;
+  skillIds?: string[];
+  goal?: string;
+  timeframes?: string[];
+} = {}): Harness {
   const clock = makeClock();
   const env = new StubEnvironment();
   const agentRuntime = new AgentRuntime(undefined, undefined, undefined, undefined, new InMemoryAgentTimelineStore());
@@ -187,11 +193,17 @@ function makeHarness(options: { model?: ScriptedModel; market?: string; skillIds
   const goalId = 'goal_surface';
   orchestrator.stores.goals.save({
     id: goalId, agentId,
-    statement: 'Find a long opportunity on EURUSD if the bearish move reverses.',
-    symbols: [], timeframes: [], skillIds: options.skillIds ?? ['structural-trend-analysis'],
+    statement: options.goal ?? 'Find a long opportunity on EURUSD if the bearish move reverses.',
+    symbols: [],
+    timeframes: options.timeframes ?? [],
+    skillIds: options.skillIds ?? ['structural-trend-analysis'],
     status: 'DRAFT', createdAt: clock.now(), updatedAt: clock.now(),
   });
-  orchestrator.deployGoat({ goalId, market: options.market ?? 'EURUSD' });
+  orchestrator.deployGoat({
+    goalId,
+    market: options.market ?? 'EURUSD',
+    ...(options.timeframes ? { timeframes: options.timeframes } : {}),
+  });
 
   return {
     orchestrator, trackers, timeline: agentRuntime.getTimelineStore(), env, clock, model, goalId, agentId,
@@ -561,7 +573,7 @@ test('next action: nothing coming is stated, not implied', async () => {
   const thesisId = h.mission().thesis!.id;
   h.orchestrator.loop.reviseThesis(thesisId, { state: 'INVALIDATED' });
   const afterInvalidation = h.mission().next;
-  assert(/no action from this hypothesis/i.test(afterInvalidation.label),
+  assert(/nothing to act on/i.test(afterInvalidation.label),
     `an invalidated thesis says so: ${afterInvalidation.label}`);
   assert(afterInvalidation.blocked, 'and is not presented as something still coming');
 });
@@ -1002,13 +1014,19 @@ test('timeframes: a GOAT is not pinned to one resolution', async () => {
   assertEqual(created.length, 4, 'a GOAT can watch across several resolutions at once');
 });
 
-test('timeframes: the context read is coarser than the setup, never finer', async () => {
+test('timeframes: every read says what it is for, and context is never mistaken for setup', async () => {
   /*
    * Found by running a real deployment: the log said "Reading EUR/USD across
    * 15m, 1m, 5m" for a 15m setup. The resolution ordering was written
    * coarsest-first, so "higher" selected everything *finer* — a GOAT reading
    * its context off a 1m candle instead of the hour, which is the opposite of
    * the point and silently so.
+   *
+   * The property is now stronger than "context is coarser". A scalper on 1m is
+   * entitled to read finer candles, so what must hold is that each read is
+   * *labelled* for the job it is doing: entry timing, confirmation, structure,
+   * regime, or the setup itself. A resolution with no stated role is the bug
+   * this used to have.
    */
   const h = makeHarness();
   await h.investigate();
@@ -1016,34 +1034,37 @@ test('timeframes: the context read is coarser than the setup, never finer', asyn
   const reads = h.agentLog().filter((entry) => entry.type === 'MARKET_CONTEXT_LOADED');
   assert(reads.length > 0, 'setup recorded market reads');
 
-  /*
-   * The request line, not a sleep line.
-   *
-   * This used to look for a `GOAT_WAITING` message that happened to name the
-   * resolutions, which meant the property being protected — "the context is
-   * coarser than the setup" — was being read off the wording of a line that
-   * was really about something else. The runtime now records what it
-   * submitted, so the resolutions are asserted where they are actually true.
-   */
+  const rank = (timeframe: string) => ['1m', '5m', '15m', '30m', '1h', '4h', '1d'].indexOf(timeframe);
+  for (const read of reads) {
+    const match = /(\d+[mhd]) · ([^·]+?)(?: ·|$)/.exec(`${read.detail ?? ''}`);
+    assert(match !== null, `each read names its resolution and its role: ${read.detail}`);
+    const [, timeframe, role] = match;
+    if (timeframe === '15m') {
+      assertEqual(role, 'setup', 'the resolution the GOAT acts on is the setup');
+      continue;
+    }
+    if (rank(timeframe) > rank('15m')) {
+      assert(
+        role === 'higher-timeframe structure' || role === 'regime',
+        `${timeframe} is higher-timeframe context for a 15m setup, not ${role}`,
+      );
+    } else {
+      assert(
+        role === 'entry timing' || role === 'confirmation',
+        `${timeframe} is finer than the setup, so it is timing — not ${role}`,
+      );
+    }
+  }
+
   const request = h.agentLog().find((entry) => entry.type === 'MODEL_REQUEST');
   assert(request !== undefined, 'the model request is recorded with what was submitted');
-  assert(
-    request!.type === 'MODEL_REQUEST' && /waiting for the model/.test(request!.style.label.toLowerCase()) === false,
-    'a pending request reads as MODEL, not as waiting on the market',
-  );
   const timeframes = [...`${request!.headline} ${request!.detail ?? ''}`.matchAll(/\b(\d+[mhd])\b/g)]
     .map((match) => match[1]);
   assert(timeframes.includes('15m'), `the setup resolution was read: ${request!.detail}`);
-
-  const rank = (timeframe: string) => ['1m', '5m', '15m', '30m', '1h', '4h', '1d'].indexOf(timeframe);
-  const contextReads = timeframes.filter((timeframe) => timeframe !== '15m');
-  assert(contextReads.length > 0, 'and it read context alongside it');
-  for (const context of contextReads) {
-    assert(
-      rank(context) > rank('15m'),
-      `${context} is a higher resolution than the 15m setup, not a lower one`,
-    );
-  }
+  assert(
+    timeframes.some((timeframe) => rank(timeframe) > rank('15m')),
+    'and a higher resolution was read alongside it',
+  );
 });
 
 test('timeframes: the GOAT declares a working set rather than inheriting a default', async () => {
@@ -1474,8 +1495,8 @@ test('progress: a deployment records the work it does before the model is asked'
     'and the request goes out after research is complete',
   );
   assert(
-    at('MODEL_RESPONSE') > at('MODEL_REQUEST'),
-    'the answer follows the request',
+    at('THESIS_FORMED') > at('MODEL_REQUEST'),
+    'and what the request produced follows it',
   );
 
   /*
@@ -1526,42 +1547,50 @@ test('progress: waiting on the model is a state of its own, not watching', async
   );
 });
 
-test('progress: a fast answer produces one line, not a heartbeat', async () => {
+test('progress: model work is one line and one outcome, never a heartbeat', async () => {
   /*
-   * The failure mode this guards against is the opposite one: filling the gap
-   * with reassurance. A request that answered in under a second must leave
-   * exactly one request line and one response line, and no MODEL_WAITING at
-   * all — there is no pending promise to report on.
+   * The failure mode this guards against is filling a gap with reassurance.
+   *
+   * There used to be a "still waiting" line every ten seconds. It was honest
+   * and it was still spam: a reader had already been told the request went out,
+   * and twelve identical lines do not make a GOAT look busier. So a fast answer
+   * must produce exactly one request line and one outcome line, and a slow one
+   * must produce the same two — the difference is carried by the live status,
+   * not by the log.
    */
   const h = makeHarness();
   await h.investigate();
 
   const types = h.agentLog().map((entry) => entry.type);
   assertEqual(types.filter((type) => type === 'MODEL_REQUEST').length, 1, 'one request line');
-  assertEqual(types.filter((type) => type === 'MODEL_RESPONSE').length, 1, 'one response line');
   assertEqual(
-    types.filter((type) => type === 'MODEL_WAITING').length,
-    0,
-    'and nothing pretending to be a wait that never happened',
+    types.filter((type) => type === 'THESIS_FORMED' || type === 'THESIS_REVISED').length,
+    1,
+    'one outcome line: the Trade Plan',
+  );
+  assert(
+    !types.some((type) => /WAITING|MODEL_RESPONSE|MODEL_FAILURE/.test(type)) ||
+      types.includes('MODEL_FAILURE') === false,
+    'nothing claims the model is waiting, answering again, or failing',
   );
 
   /*
-   * No sleep line inside the request window.
+   * No sleep line inside the request window either.
    *
-   * A GOAT *is* entitled to a sleep line once its trackers exist — that is the
-   * genuine "waiting for a qualifying market event" state and it belongs after
-   * the answer. What it must never do is claim to be waiting while it is in
+   * A GOAT *is* entitled to a sleep line once its conditions exist — that is the
+   * genuine "waiting for a qualifying market event" state, and it belongs after
+   * the outcome. What it must never do is claim to be watching while it is in
    * fact blocked on a reply.
    */
   const request = types.indexOf('MODEL_REQUEST');
-  const response = types.indexOf('MODEL_RESPONSE');
+  const outcome = types.indexOf('THESIS_FORMED');
   assert(
-    !types.slice(request, response).includes('GOAT_WAITING'),
-    `nothing claims to be watching between the request and the answer: ${types.join(' → ')}`,
+    !types.slice(request, outcome).includes('GOAT_WAITING'),
+    `nothing claims to be watching between the request and the plan: ${types.join(' → ')}`,
   );
   assert(
-    types.lastIndexOf('GOAT_WAITING') > response,
-    'and the sleep that does exist comes after the thesis exists',
+    types.lastIndexOf('GOAT_WAITING') > outcome,
+    'and the sleep that does exist comes after the plan exists',
   );
 });
 
@@ -1579,6 +1608,215 @@ test('progress: a failure to read the model is followed by a retry that exists',
     h.agentLog().some((entry) => entry.type === 'MODEL_FAILURE'),
     'and the failure that caused it is on the record',
   );
+});
+
+// ---------------------------------------------------------------------------
+// 7. The Trade Plan is the hypothesis, and the model state is one live thing
+// ---------------------------------------------------------------------------
+
+test('plan: the plan and the belief are one record, not two lines', async () => {
+  /*
+   * The correction this test protects.
+   *
+   * A GOAT forming a plan used to write "Thesis: X" and then "Defined what it
+   * needs to see", which is one idea in two vocabularies — and the user-facing
+   * consequence was an architecture that looked more complicated than the
+   * mental model it was supposed to match. What they believe, what would make
+   * it right and what it would do are now one line, in the user's words.
+   */
+  const h = makeHarness();
+  await h.investigate();
+
+  const log = h.agentLog();
+  const plan = log.find((entry) => entry.type === 'THESIS_FORMED');
+  assert(plan !== undefined, 'the plan is recorded');
+  assertEqual(plan!.style.label, 'TRADE PLAN', 'and labelled as the plan, not as a hypothesis');
+  assert(
+    !/hypothesis/i.test(`${plan!.headline} ${plan!.detail ?? ''}`),
+    `nothing about it is called a hypothesis: ${plan!.headline}`,
+  );
+  assert(
+    /\bif\b/i.test(plan!.headline) && /\bthen\b/i.test(plan!.headline),
+    `and it says what must happen and what follows: ${plan!.headline}`,
+  );
+  assert(
+    /conditions to confirm/.test(plan!.detail ?? ''),
+    `with the conditions it is waiting on: ${plan!.detail}`,
+  );
+
+  assertEqual(
+    log.filter((entry) => entry.type === 'EVIDENCE_REQUIREMENTS_DEFINED').length,
+    0,
+    'and there is no second line saying the same thing again',
+  );
+  assertEqual(
+    log.filter((entry) => /research/i.test(entry.style.label) && entry.type === 'THESIS_FORMED').length,
+    0,
+    'the plan is not also filed as research',
+  );
+});
+
+test('plan: the panel shows the consequence before anything is executable', async () => {
+  const h = makeHarness();
+  await h.investigate();
+
+  const plan = buildPlanView(h.mission());
+  assert(plan.exists, 'a plan exists from the moment there is a belief');
+  assertEqual(plan.status, 'RESEARCHING', 'and says it is still validating rather than ready');
+  assert(
+    /then (buy|sell|keeps gathering evidence)/.test(plan.objective ?? ''),
+    `the sentence ends in a consequence the user can act on: ${plan.objective}`,
+  );
+  assertEqual(
+    plan.conditional,
+    undefined,
+    'while the executable block stays absent — intent is not permission',
+  );
+  assertEqual(
+    (plan.awaiting ?? []).length,
+    plan.research.length,
+    'and the outstanding conditions are named rather than implied',
+  );
+});
+
+test('model state: the pulsing state carries the waiting, and the log stays quiet', async () => {
+  /*
+   * The whole point of removing the heartbeat.
+   *
+   * The live state says what the GOAT is doing for as long as it is doing it,
+   * and the log records what happened rather than what time did. A slow request
+   * and a fast one produce the same two lines.
+   */
+  const gate = new GatedModel();
+  const h = makeHarness({ model: gate as unknown as ScriptedModel });
+  const running = h.orchestrator.investigateGoal(h.goalId);
+
+  let mission: GoatMission | undefined;
+  for (let attempt = 0; attempt < 400 && mission?.modelPending === undefined; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    mission = h.mission();
+  }
+
+  assert(mission?.modelPending !== undefined, 'the runtime knows a request is outstanding');
+  assertEqual(mission!.modelPending!.phase, 'FORMING', 'and which kind of thinking it is');
+  assertEqual(
+    statusFor(mission!, h.clock.now()),
+    'WAITING_FOR_MODEL',
+    'the status is the model state, not watching',
+  );
+
+  /*
+   * Held open for the length of several heartbeat intervals, and still one
+   * request line. This is the assertion the old heartbeat could not survive.
+   */
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const during = h.agentLog();
+  assertEqual(
+    during.filter((entry) => entry.type === 'MODEL_REQUEST').length,
+    1,
+    'one request line while the request is outstanding',
+  );
+  assertEqual(
+    during.filter((entry) => /waiting/i.test(entry.headline) && entry.type.startsWith('MODEL')).length,
+    0,
+    'and nothing repeating that it is waiting',
+  );
+
+  gate.letGo();
+  await running;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const after = h.agentLog();
+  assert(
+    after.some((entry) => entry.type === 'THESIS_FORMED'),
+    'the outcome arrives as one semantic line',
+  );
+  assertEqual(
+    after.filter((entry) => entry.type.startsWith('MODEL')).length,
+    1,
+    'and the model contributed exactly one line in total',
+  );
+});
+
+test('model state: the runtime measures latency without writing a line for it', async () => {
+  const h = makeHarness();
+  await h.investigate();
+
+  const stats = h.orchestrator.modelCallStats(h.agentId);
+  assertEqual(stats.calls, 1, 'one call was made');
+  assert(stats.totalMs >= 0, 'and its cost is measured');
+  assertEqual(stats.slowestMs, stats.totalMs, 'with one call, the slowest is the total');
+  /*
+   * The cost appears at most once, on the plan itself.
+   *
+   * A duration attached to the outcome is information — "this took four
+   * seconds" is a fact about the plan. What is not information is a line that
+   * exists only because time passed, which is why the count is one rather than
+   * zero.
+   */
+  const timed = h.agentLog().filter((entry) => /\d+(\.\d+)?s\b/.test(entry.detail ?? ''));
+  assert(timed.length <= 1, `at most one timing note in the log: ${timed.length}`);
+  for (const entry of timed) {
+    assertEqual(entry.type, 'THESIS_FORMED', 'and it rides on the outcome, never on the request');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 8. Resolutions belong to the GOAT, and the replay inherits them
+// ---------------------------------------------------------------------------
+
+test('timeframes: a GOAT declared to work on 1m and 5m deploys on exactly those', async () => {
+  /*
+   * The scalping regression.
+   *
+   * "Scalp USD/JPY using 1m and 5m" used to become a 15m GOAT: the deployment
+   * wrote one resolution and the model was handed the whole menu regardless.
+   * That is not a slower version of the same agent, it is a different agent with
+   * the same objective.
+   */
+  const h = makeHarness({
+    timeframes: ['1m', '5m'],
+    goal: 'Scalp USD/JPY using 1m and 5m.',
+  });
+
+  const goal = h.orchestrator.getGoal(h.goalId)!;
+  assertEqual(
+    goal.timeframes.join(','),
+    '5m,1m',
+    'the deployment is on the middle declared resolution, with the set behind it',
+  );
+
+  await h.investigate();
+  const reads = h.agentLog().filter((entry) => entry.type === 'MARKET_CONTEXT_LOADED');
+  assert(reads.length > 0, 'it read its declared resolutions');
+  for (const read of reads) {
+    assert(
+      /\b(1m|5m)\b/.test(read.detail ?? '') && !/\b(15m|1h|4h)\b/.test(read.detail ?? ''),
+      `no resolution nobody declared was read: ${read.detail}`,
+    );
+  }
+  assertEqual(
+    h.mission().timeframes.join(','),
+    '5m,1m',
+    'and the mission carries the whole set, because a replay needs it',
+  );
+});
+
+test('timeframes: an objective that names its resolutions is not overruled', async () => {
+  const { timeframesInStatement, resolveTimeframePlan } = await import('./timeframes');
+
+  assertEqual(
+    timeframesInStatement('Scalp USD/JPY using 1m and 5m.').join(','),
+    '1m,5m',
+    'the resolutions the user wrote are found',
+  );
+  assertEqual(timeframesInStatement('Watch the market.').length, 0, 'and nothing is invented');
+
+  const plan = resolveTimeframePlan({
+    declared: timeframesInStatement('Analyze across 1m, 5m and 15m.'),
+  });
+  assertEqual(plan.reads.map((read) => read.timeframe).join(','), '1m,5m,15m', 'and all three are read');
+  assertEqual(plan.setup, '5m', 'acting on the middle one');
 });
 
 // ---------------------------------------------------------------------------

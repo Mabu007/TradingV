@@ -229,7 +229,7 @@ export const GoatCommandCenter: React.FC<GoatCommandCenterProps> = ({
           <div className="rounded-xl bg-accent-soft p-2 text-accent">
             <Target className="h-4 w-4" />
           </div>
-          <h3 className="text-sm font-bold text-ink">Thesis</h3>
+          <h3 className="text-sm font-bold text-ink">Trade Plan</h3>
         </header>
 
         {mission.thesis ? (
@@ -290,7 +290,7 @@ export const GoatCommandCenter: React.FC<GoatCommandCenterProps> = ({
           </div>
         ) : (
           <p className="px-5 py-4 text-[11px] leading-relaxed text-ink-3">
-            No active thesis. The GOAT is still working out what it believes, which is the correct
+            No Trade Plan yet. The GOAT is still working out what it believes, which is the correct
             state before it has one — not an error.
           </p>
         )}
@@ -312,7 +312,7 @@ export const GoatCommandCenter: React.FC<GoatCommandCenterProps> = ({
 
         {trackers.length === 0 ? (
           <p className="px-5 py-4 text-[11px] leading-relaxed text-ink-3">
-            Nothing is being watched yet. A GOAT deploys trackers once it has a thesis, and goes
+            Nothing is being watched yet. A GOAT sets its conditions once it has a Trade Plan, and goes
             quiet between them.
           </p>
         ) : (
@@ -573,7 +573,7 @@ const ActivityLog: React.FC<{ orchestrator: GoatOrchestrator; mission: GoatMissi
         <div className="px-5 py-4">
           <p className="flex items-start gap-2 text-[11px] leading-relaxed text-ink-3">
             <Activity className="mt-px h-3.5 w-3.5 shrink-0" />
-            Nothing yet. A GOAT forms a thesis, deploys trackers, and then waits for one of them to
+            Nothing yet. A GOAT forms a Trade Plan, sets its conditions, and then waits for one to
             fire. Every line above that point will appear here.
           </p>
         </div>

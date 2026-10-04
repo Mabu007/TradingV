@@ -110,25 +110,6 @@ export type AgentTimelineEventType =
    */
   | 'MODEL_REQUEST'
   /*
-   * The request is still outstanding.
-   *
-   * Honest latency, measured against a real elapsed time, emitted only while
-   * the request is genuinely pending and never more often than
-   * `MODEL_WAIT_HEARTBEAT_MS`. Deliberately not a filler: there is no "still
-   * thinking" fiction here, only an unfinished promise the reader was already
-   * told about.
-   */
-  | 'MODEL_WAITING'
-  /*
-   * The model answered.
-   *
-   * Written whatever the answer was — a hypothesis, a plan, or an unreadable
-   * reply — because "it replied and that is all it said" is information, and
-   * an agent log that only records successes hides the turns that found
-   * nothing.
-   */
-  | 'MODEL_RESPONSE'
-  /*
    * A bounded retry was scheduled after a failure.
    *
    * Pairs with the failure it follows. Emitted only when a retry timer was

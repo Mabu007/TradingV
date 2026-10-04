@@ -73,7 +73,7 @@ export const MISSION_STAGE_LABELS: Record<MissionStage, string> = {
   UNDEPLOYED: 'Not deployed',
   UNDERSTANDING: 'Understanding your objective',
   RESEARCHING: 'Researching the market',
-  WAITING_FOR_MODEL: 'Waiting for the model',
+  WAITING_FOR_MODEL: 'Working on its Trade Plan',
   ANALYZING: 'Analyzing what it found',
   FORMING_THESIS: 'Forming a thesis',
   COLLECTING_EVIDENCE: 'Collecting evidence',
@@ -153,7 +153,16 @@ export interface GoatMission {
 
   deployment?: GoatDeployment;
   market?: string;
+  /** The resolution this GOAT acts on. */
   timeframe?: string;
+  /**
+   * Every resolution this GOAT may read, setup first.
+   *
+   * Carried whole rather than as a single resolution because that is what a
+   * GOAT is: a scalper works on 1m and 5m, a swing GOAT on 15m and 1h, and
+   * anything that needs to replay or explain the GOAT has to know the difference.
+   */
+  timeframes: string[];
   mode?: GoatDeployment['mode'];
   environment?: GoatDeployment['venueEnvironment'];
   /** False when the deployment cannot act on a plan. */
@@ -217,7 +226,7 @@ export interface GoatMission {
    * Exposed so a surface can say what it is waiting for instead of rendering
    * an idle agent and an empty log as the same thing.
    */
-  modelPending?: { at: number; intent: string; contract?: string };
+  modelPending?: { at: number; intent: string; contract?: string; phase?: 'FORMING' | 'UPDATING' };
 
   steering: { total: number; pending: number; notes: SteeringNote[] };
   updatedAt: number;
@@ -247,7 +256,7 @@ export interface MissionInput {
    * last event would eventually be wrong in the direction that matters most:
    * reporting a stuck agent as busy.
    */
-  modelPending?: { intent: string; contract?: string };
+  modelPending?: { intent: string; contract?: string; phase?: 'FORMING' | 'UPDATING' };
   now: number;
 }
 
@@ -274,14 +283,6 @@ export const FAILURE_EVENTS: ReadonlySet<string> = new Set(['MODEL_FAILURE', 'ER
 export const BOOKKEEPING_EVENTS: ReadonlySet<string> = new Set([
   'GOAT_WAITING',
   'TRACKER_EVALUATED',
-  /*
-   * The model heartbeat, for the same reason the sleep line is here.
-   *
-   * A request that answers and answers again — a wake, then a heartbeat, then
-   * a response — must not have the response treated as bookkeeping, and a
-   * failure followed by heartbeats must not be retired by them.
-   */
-  'MODEL_WAITING',
 ]);
 
 /** A tracker fires at most this often, so "just woke" means just. */
@@ -317,7 +318,7 @@ function deriveNext(input: {
   }
   if (liveThesis && isTerminal(liveThesis)) {
     return {
-      label: `Thesis ${liveThesis.state.toLowerCase()} \u2014 no action from this hypothesis`,
+      label: `Trade Plan ${liveThesis.state.toLowerCase()} \u2014 nothing to act on from it`,
       detail: liveThesis.invalidation,
       blocked: true,
     };
@@ -329,7 +330,10 @@ function deriveNext(input: {
      * during that window would be told the one thing that is untrue.
      */
     return {
-      label: 'Waiting for the model',
+      label:
+        source.modelPending?.phase === 'UPDATING'
+          ? 'Updating its Trade Plan'
+          : 'Building its Trade Plan',
       detail: source.modelPending?.intent,
       blocked: false,
     };
@@ -340,11 +344,16 @@ function deriveNext(input: {
   if (stage === 'EXECUTING' || stage === 'MANAGING') {
     return { label: stage === 'EXECUTING' ? 'Working an order' : 'Managing an open position', blocked: false };
   }
+  /*
+   * No plan yet. Not "blocked", because something is in flight — a deployment is
+   * reading the market or waiting on the model — and telling a reader that
+   * nothing is coming is the one thing that would be untrue here.
+   */
   if (!liveThesis) {
     return {
-      label: `Read ${market ?? 'the market'} and form a hypothesis`,
-      detail: activeTrackers.length === 0 ? 'No thesis yet.' : undefined,
-      blocked: true,
+      label: `Reading ${market ?? 'the market'} to form a Trade Plan`,
+      detail: activeTrackers.length === 0 ? 'No Trade Plan yet.' : undefined,
+      blocked: false,
     };
   }
   if (activeTrackers.length > 0) {
@@ -430,6 +439,7 @@ export function buildMission(input: MissionInput): GoatMission {
     deployment,
     market,
     timeframe,
+    timeframes: [...(goal.timeframes ?? [])],
     mode: deployment?.mode,
     environment: deployment?.venueEnvironment,
     mayExecute: deployment?.execution.canExecute === true,
@@ -469,6 +479,7 @@ export function buildMission(input: MissionInput): GoatMission {
             at: now,
             intent: input.modelPending.intent,
             ...(input.modelPending.contract ? { contract: input.modelPending.contract } : {}),
+            ...(input.modelPending.phase ? { phase: input.modelPending.phase } : {}),
           },
         }
       : {}),
@@ -578,24 +589,23 @@ function deriveActivity(input: {
         return `Reading ${market} before forming a view.`;
       case 'WAITING_FOR_MODEL':
         /*
-         * The blocked-on-external-dependency state, named as such. "Reading
-         * the market" while a request is outstanding would be false: the
-         * reads are finished.
+         * The blocked-on-external-dependency state, named as what it is doing.
+         * "Reading the market" while a request is outstanding would be false —
+         * the reads are finished — and "thinking" would be a claim about a
+         * private process nobody can verify.
          */
-        return source.modelPending?.intent
-          ? `${source.modelPending.intent}. Waiting for the model.`
-          : 'Waiting for the model to answer.';
+        return source.modelPending?.intent ?? 'Working on its Trade Plan';
       case 'FORMING_THESIS':
         return liveThesis
-          ? `Building a thesis on ${market}.`
-          : `Working out what to believe about ${market}.`;
+          ? `Building its Trade Plan on ${market}.`
+          : `Working out what it believes about ${market}.`;
       case 'COLLECTING_EVIDENCE':
         return liveThesis
-          ? `Gathering evidence: ${liveThesis.statement}`
+          ? `Waiting for its Trade Plan to be confirmed: ${liveThesis.statement}`
           : `Gathering evidence on ${market}.`;
       case 'MONITORING':
         return liveThesis
-          ? `Monitoring ${market}. Believing: ${liveThesis.statement}`
+          ? `Monitoring ${market} against its Trade Plan: ${liveThesis.statement}`
           : `Monitoring ${market}.`;
       case 'RE_EVALUATING':
         return 'A tracker fired. Re-reading the thesis against it.';
@@ -627,10 +637,10 @@ function deriveActivity(input: {
       return rejections;
     }
     if (stage === 'RESEARCHING' && activeTrackers.length === 0) {
-      return 'No thesis yet.';
+      return 'No Trade Plan yet.';
     }
     if (stage === 'WAITING_FOR_MODEL') {
-      return 'Market context prepared and submitted.';
+      return 'Market context prepared and submitted. Waiting on the answer, not on the market.';
     }
     return '';
   })();

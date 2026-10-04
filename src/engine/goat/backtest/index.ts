@@ -41,6 +41,7 @@ export {
   DEFAULT_BACKTEST_WARMUP_MINUTES,
   BACKTEST_WAKE_TIMEOUT_MS,
   type BacktestRequest,
+  type BacktestHistory,
   type BacktestSnapshot,
   type BacktestState,
   type BacktestCostModel,

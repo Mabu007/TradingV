@@ -72,7 +72,8 @@ export interface AgentLogProps {
    *
    * A separate state rather than a flavour of `live`, because the reader's
    * question changes with it: "is it working" versus "is it waiting on
-   * something it cannot control".
+   * something it cannot control". It is the one state that pulses here, and it
+   * is the reason the log does not need to keep saying so.
    */
   waitingForModel?: boolean;
   /**
@@ -188,7 +189,7 @@ export const AgentLog: React.FC<AgentLogProps> = ({
   const headline = entries.length === 0
     ? 'Nothing recorded yet.'
     : waitingForModel
-      ? 'Waiting on the model — market context prepared and submitted'
+      ? 'Working on the Trade Plan — market context prepared and submitted'
       : live
         ? 'Events arriving'
         : watching

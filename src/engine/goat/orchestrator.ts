@@ -65,6 +65,17 @@ import { isDataRequirement } from '../agents/trackers/registry';
 import { TRACKER_KINDS } from '../agents/trackers/runtime';
 import { defaultObservationPlan } from '../agents/trackers/contracts';
 import { GoatSkillRegistry, SkillPackage } from './skills';
+import {
+  DEFAULT_GOAT_TIMEFRAME as CANONICAL_DEFAULT_TIMEFRAME,
+  SUPPORTED_TIMEFRAMES,
+  TIMEFRAME_ROLE_LABELS,
+  isSupportedTimeframe,
+  parseTimeframes,
+  resolveTimeframePlan,
+  timeframesInStatement,
+  type TimeframeRole,
+  type TimeframeStrategy,
+} from './timeframes';
 import { GOAT_BUILTIN_SKILLS } from './builtinSkills';
 import { STARTER_GOATS } from './starterGoats';
 import { InMemoryDeploymentStore, DeploymentStore, PersistentDeploymentStore } from './deployments';
@@ -171,16 +182,14 @@ const MIN_INTERPRETATION_LENGTH = 24;
 export const MAX_UNPROMPTED_RECONSIDERATIONS = 3;
 
 /**
- * How often a genuinely outstanding model request says so.
+ * How many extra rounds of context a first pass may buy.
  *
- * Not a thinking animation and not a progress bar: a measurement of real
- * elapsed time against a real pending promise. Ten seconds is chosen because
- * it is the point at which silence stops looking like work — below it a
- * reader would not have wondered, and above it the line arrives once a
- * second. A request that answers in 300ms produces exactly one MODEL line and
- * no heartbeat at all.
+ * Two, because the useful case is "I need the hour" and "I need 1m as well",
+ * and the useless case is a model that keeps asking. The bound is what makes
+ * dynamic acquisition safe to offer at all: an unbounded version is a way for
+ * one deployment to spend its budget on data acquisition.
  */
-export const MODEL_WAIT_HEARTBEAT_MS = 10_000;
+export const MAX_CONTEXT_ROUNDS = 2;
 
 /**
  * A model request that is outstanding right now.
@@ -197,6 +206,29 @@ export interface PendingModelRequest {
   intent: string;
   /** The contract asked for: INVESTIGATION, PLAN, … */
   contract: string;
+  /**
+   * Which kind of thinking this is.
+   *
+   * The live state needs to say "BUILDING TRADE PLAN" or "UPDATING TRADE PLAN"
+   * rather than one vague word, and parsing that back out of a sentence is how a
+   * status indicator starts lying.
+   */
+  phase: 'FORMING' | 'UPDATING';
+}
+
+/**
+ * One resolution read for a pass, with the job it is doing.
+ *
+ * The role and reason travel with the context all the way into the prompt and
+ * the log, because "read 1h" and "read 1h for regime" are different claims and
+ * only one of them is checkable by a reader.
+ */
+export interface TimeframeContext {
+  context: MarketContext;
+  role: TimeframeRole;
+  reason: string;
+  /** Whether the resolutions were the user's or the agent's choice. */
+  strategy: TimeframeStrategy;
 }
 
 /**
@@ -453,6 +485,19 @@ export class GoatOrchestrator {
    * "waiting for the model".
    */
   private readonly pendingModels = new Map<string, PendingModelRequest>();
+  /**
+   * How long each model call actually took, per agent.
+   *
+   * Kept out of the log on purpose. Latency is real and worth knowing, but a
+   * line per call to report a number nobody asked for is the same noise problem
+   * as the heartbeat, and the number is only interesting in aggregate — "this
+   * replay spent nine seconds waiting on the model across thirty calls" — which
+   * is a report question, not a log question.
+   *
+   * Bounded, and it is the runtime's own measurement rather than something a
+   * surface infers from timestamps.
+   */
+  private readonly modelCalls = new Map<string, Array<{ at: number; elapsedMs: number; phase: 'FORMING' | 'UPDATING' }>>();
 
   constructor(private readonly deps: GoatDeps) {
     this.stores = deps.stores;
@@ -551,6 +596,35 @@ export class GoatOrchestrator {
   }
 
   /**
+   * Whether *any* GOAT is waiting on a model right now.
+   *
+   * The per-agent question is the one a surface normally asks, because a screen
+   * is about one GOAT. This exists for the window before an agent exists — a
+   * first pass whose goal is still being interpreted — and for a replay, where
+   * "is the run holding for its agent" is a fact about the run rather than about
+   * an id the run has not been given yet.
+   */
+  hasPendingModelRequest(): boolean {
+    return this.pendingModels.size > 0;
+  }
+
+  /**
+   * What this GOAT's model calls cost, in real time.
+   *
+   * Exposed for the report a replay produces. Empty rather than zero-filled for
+   * an agent that has never been asked anything, so "no model calls" cannot be
+   * mistaken for "the model was instantaneous".
+   */
+  modelCallStats(agentId: string): { calls: number; totalMs: number; slowestMs: number } {
+    const calls = this.modelCalls.get(agentId) ?? [];
+    return {
+      calls: calls.length,
+      totalMs: calls.reduce((sum, call) => sum + call.elapsedMs, 0),
+      slowestMs: calls.reduce((slowest, call) => Math.max(slowest, call.elapsedMs), 0),
+    };
+  }
+
+  /**
    * Ask the model, and make the waiting visible while it happens.
    *
    * Every reasoning step in this system goes through here, which is the only
@@ -558,8 +632,7 @@ export class GoatOrchestrator {
    * around the call, and each corresponds to a real transition:
    *
    *   MODEL_REQUEST   the request went out, with what was in it
-   *   MODEL_WAITING   it is still outstanding, after a real interval
-   *   MODEL_RESPONSE  it came back, and what came back
+   *   MODEL_FAILURE   it came back unreadable, with the cause
    *
    * The pending entry is registered before the call and cleared in a `finally`,
    * so a surface can render "waiting for the model" for exactly as long as
@@ -570,47 +643,46 @@ export class GoatOrchestrator {
   private async callModel(options: {
     agentId: string;
     deploymentId?: string;
+    /** Forming a plan for the first time, or updating one after evidence. */
+    phase: 'FORMING' | 'UPDATING';
     /** What this request is for, in words a reader would use. */
     intent: string;
     /** What was submitted, for the log's detail line. */
     submitted: Record<string, number | string>;
     request: AgentModelRequest;
   }): Promise<{ response: AgentModelResponse; report: ModelCallReport }> {
-    const { agentId, deploymentId, intent, submitted, request } = options;
+    const { agentId, deploymentId, phase, intent, submitted, request } = options;
 
     const startedAt = Date.now();
     this.pendingModels.set(agentId, {
       startedAt,
       intent,
+      phase,
       contract: request.contract ?? 'DECISION',
     });
 
+    /*
+     * One line, on the way out. Nothing on the way back unless it failed.
+     *
+     * There used to be a heartbeat here, one line every ten seconds for as long
+     * as the call took. It was honest — a real elapsed time against a real
+     * pending request — and it was still noise: the reader had already been told
+     * the request went out, and a dozen identical lines do not make a GOAT look
+     * busier, they make the log unreadable. So the waiting is carried by the
+     * live state instead, which pulses for exactly as long as this promise is
+     * outstanding, and the log is left with the events that changed something.
+     *
+     * The outcome line is the caller's to write, because only the caller knows
+     * what the answer meant: a plan, a revision, a refusal. A generic "answered"
+     * line beside it would be the second description of one event.
+     */
     this.recordActivity({
       goatId: agentId,
       deploymentId,
       agentId,
       type: 'MODEL_REQUEST',
-      data: { intent, contract: request.contract ?? 'DECISION', ...submitted },
+      data: { intent, phase, contract: request.contract ?? 'DECISION', ...submitted },
     });
-
-    /*
-     * A real interval, cleared in the same `finally` as the pending entry.
-     * It measures elapsed time against the call it surrounds; it does not
-     * estimate, and it never fires for a request that answered first.
-     */
-    const heartbeat = setInterval(() => {
-      this.recordActivity({
-        goatId: agentId,
-        deploymentId,
-        agentId,
-        type: 'MODEL_WAITING',
-        data: {
-          intent,
-          elapsedMs: Date.now() - startedAt,
-          elapsedSeconds: Math.round((Date.now() - startedAt) / 1000),
-        },
-      });
-    }, MODEL_WAIT_HEARTBEAT_MS);
 
     try {
       const response = await this.model.run(request);
@@ -619,16 +691,26 @@ export class GoatOrchestrator {
         Date.now() - startedAt,
         request.contract ?? 'DECISION',
       );
-      this.recordActivity({
-        goatId: agentId,
-        deploymentId,
-        agentId,
-        type: report.failed ? 'MODEL_FAILURE' : 'MODEL_RESPONSE',
-        data: { intent, outcome: report.outcome, elapsedMs: report.elapsedMs, ...(report.code ? { code: report.code } : {}) },
-      });
+      this.recordModelCall(agentId, report.elapsedMs, phase);
+      if (report.failed) {
+        this.recordActivity({
+          goatId: agentId,
+          deploymentId,
+          agentId,
+          type: 'MODEL_FAILURE',
+          data: {
+            intent,
+            phase,
+            outcome: report.outcome,
+            elapsedMs: report.elapsedMs,
+            ...(report.code ? { code: report.code } : {}),
+          },
+        });
+      }
       return { response, report };
     } catch (error) {
       const elapsedMs = Date.now() - startedAt;
+      this.recordModelCall(agentId, elapsedMs, phase);
       this.recordActivity({
         goatId: agentId,
         deploymentId,
@@ -636,6 +718,7 @@ export class GoatOrchestrator {
         type: 'MODEL_FAILURE',
         data: {
           intent,
+          phase,
           outcome: 'The request threw before it could be read.',
           code: 'REQUEST_THREW',
           elapsedMs,
@@ -644,9 +727,20 @@ export class GoatOrchestrator {
       // Re-thrown, so the caller's own failure handling stays in charge.
       throw error;
     } finally {
-      clearInterval(heartbeat);
       this.pendingModels.delete(agentId);
     }
+  }
+
+  /** One measured call, kept so a report can talk about time honestly. */
+  private recordModelCall(
+    agentId: string,
+    elapsedMs: number,
+    phase: 'FORMING' | 'UPDATING',
+  ): void {
+    const calls = this.modelCalls.get(agentId) ?? [];
+    calls.push({ at: Date.now(), elapsedMs, phase });
+    if (calls.length > 500) calls.splice(0, calls.length - 500);
+    this.modelCalls.set(agentId, calls);
   }
 
   /**
@@ -1358,6 +1452,25 @@ export class GoatOrchestrator {
 
     goal.interpretation = interpretation.understood;
     /*
+     * The resolutions this GOAT works across, kept.
+     *
+     * The model was asked which timeframes the objective implies and answered,
+     * and the answer used to be thrown away — which is how "scalp using 1m and
+     * 5m" became a 15m GOAT. Two sources are unioned rather than one chosen:
+     * the resolutions the objective literally names, and the ones the model's
+     * reading proposed. The literal parse runs first because a model is a
+     * reader, not a guarantee: if the user wrote "1m and 5m", that is the
+     * request, and it should survive whatever the interpretation said.
+     *
+     * Nothing is invented here — only canonical resolutions that were either
+     * written by the user or proposed by the agent for this goal.
+     */
+    const declared = [
+      ...timeframesInStatement(statement),
+      ...parseTimeframes(interpretation.timeframes).accepted,
+    ];
+    goal.timeframes = SUPPORTED_TIMEFRAMES.filter((timeframe) => declared.includes(timeframe));
+    /*
      * What the agent could not resolve is kept, but it no longer decides
      * anything.
      *
@@ -1538,6 +1651,15 @@ export class GoatOrchestrator {
     goalId: string;
     market: string;
     timeframe?: string;
+    /**
+     * The resolutions this deployment may read.
+     *
+     * Optional, and the goal's own set is the default. A GOAT whose objective
+     * said "1m and 5m" arrives with those already recorded, so this exists for
+     * the case where a deployment genuinely differs from the goal — a replay
+     * that must use 1m because that is what the data can serve, say.
+     */
+    timeframes?: string[];
     mode?: GoatDeploymentMode;
     accountId?: string;
     execution?: Partial<ExecutionPermissions>;
@@ -1551,7 +1673,23 @@ export class GoatOrchestrator {
       throw new Error('A deployment needs a market.');
     }
 
-    const timeframe = input.timeframe?.trim() || DEFAULT_GOAT_TIMEFRAME;
+    /*
+     * The setup resolution, and the set it belongs to.
+     *
+     * The set comes from the goal unless the deployment overrides it, and the
+     * setup is the deployment's explicit choice when there is one — otherwise
+     * the middle of the declared set, which for {1m, 5m} is 5m and for
+     * {15m, 1h} is 1h. Picking the finest would force every GOAT into
+     * microstructure; picking the coarsest would make a scalper wait a day.
+     */
+    const declared = [...new Set(
+      [...goal.timeframes, ...(input.timeframes ?? [])].filter(isSupportedTimeframe),
+    )];
+    const timeframe = isSupportedTimeframe(input.timeframe?.trim())
+      ? (input.timeframe?.trim() as string)
+      : declared.length > 0
+        ? declared[Math.floor(declared.length / 2)]
+        : DEFAULT_GOAT_TIMEFRAME;
     const mode: GoatDeploymentMode = input.mode ?? 'SHADOW';
     const accountId = input.accountId?.trim() || 'paper';
 
@@ -1617,6 +1755,7 @@ export class GoatOrchestrator {
       goal: goal.statement,
       market,
       timeframe,
+      ...(declared.length > 0 ? { timeframes: declared } : {}),
       skillIds: goal.skillIds,
       policy: {
         allowTrading: mode !== 'SHADOW',
@@ -1632,7 +1771,9 @@ export class GoatOrchestrator {
     this.stores.goals.save({
       ...goal,
       symbols: [market],
-      timeframes: [timeframe],
+      // The whole set, with the setup resolution first so `timeframes[0]` still
+      // means "the one this deployment acts on".
+      timeframes: [timeframe, ...declared.filter((option) => option !== timeframe)],
       status: 'MONITORING',
       updatedAt: this.now(),
     });
@@ -1741,7 +1882,7 @@ export class GoatOrchestrator {
           message:
             live[0].state === 'INVESTIGATING'
               ? 'This GOAT is investigating and waiting on its trackers.'
-              : `This GOAT already has a ${live[0].state.toLowerCase()} thesis and wakes on its trackers.`,
+              : `This GOAT already has a Trade Plan that is ${live[0].state.toLowerCase()}, and it wakes on its own conditions.`,
         };
       }
     }
@@ -1756,7 +1897,8 @@ export class GoatOrchestrator {
 
     this.investigating.add(goal.agentId);
     try {
-      const proposal = await this.proposeInvestigation(goal, deployment);
+      const investigation = await this.proposeInvestigation(goal, deployment);
+      const proposal = investigation;
 
       if (proposal.unavailable) {
         /*
@@ -1818,8 +1960,8 @@ export class GoatOrchestrator {
           outcome: 'NO_THESIS_YET',
           deployed: true,
           message: this.stores.deployments.currentFor(goal.agentId)
-            ? `This GOAT is deployed on ${deployment.marketId} and reviewed the market, but it does not yet have a strong enough thesis to act on. It will look again on its own in about an hour, up to a few times, and it will wake you here the moment it has one.`
-            : `This GOAT is deployed on ${deployment.marketId} and reviewed the market, but it does not yet have a strong enough thesis to act on.`,
+            ? `This GOAT is deployed on ${deployment.marketId} and reviewed the market, but it does not yet have a Trade Plan it can act on. It will look again on its own in about an hour, up to a few times, and it will wake you here the moment it has one.`
+            : `This GOAT is deployed on ${deployment.marketId} and reviewed the market, but it does not yet have a Trade Plan it can act on.`,
         };
       }
 
@@ -1837,9 +1979,20 @@ export class GoatOrchestrator {
        * requires a number the model may have invented. It is recorded as
        * defaulted so the feed never claims it was the model's idea.
        */
+      /*
+       * The runtime's own watcher, whenever the model armed nothing usable.
+       *
+       * This used to trigger only when the model proposed nothing at all. When
+       * it proposed conditions and every one was refused, the GOAT was left with
+       * a belief and no way to re-read it — alive, holding a view, and unable to
+       * wake. That is worse than the proposal being refused silently, and it
+       * becomes likelier rather than rarer now that a GOAT can declare its own
+       * resolutions: a model that answers with a 15m condition for a 1m scalper
+       * has proposed nothing the runtime can actually watch.
+       */
       const proposedTrackers = proposal.proposed.trackers;
       const defaulted =
-        proposedTrackers.length === 0
+        proposedTrackers.length === 0 || proposal.proposed.dropped === proposedTrackers.length
           ? defaultObservationPlan(timeframeFor(goal))
           : [];
       const plan = proposedTrackers.length > 0 ? proposedTrackers : defaulted;
@@ -1879,6 +2032,20 @@ export class GoatOrchestrator {
           statement: proposal.proposed.thesis.statement,
           direction: proposal.proposed.thesis.direction,
           market: deployment.marketId,
+          /*
+           * The conditions, on the plan's own record.
+           *
+           * They used to be a second line — "Thesis: X" followed by "Defined
+           * what it needs to see" — which is one idea split across two
+           * vocabularies. A Trade Plan is the belief *and* the conditions *and*
+           * the consequence, so it is one line that says all three.
+           */
+          requirements: proposal.proposed.thesis.requiredConfirmation ?? [],
+          watches: outcome.trackerIds.length,
+          ...(proposal.elapsedMs !== undefined ? { modelMs: proposal.elapsedMs } : {}),
+          ...(proposal.acquiredTimeframes && proposal.acquiredTimeframes.length > 0
+            ? { acquired: proposal.acquiredTimeframes.join(', ') }
+            : {}),
         },
       });
       for (const trackerId of outcome.trackerIds) {
@@ -1897,33 +2064,13 @@ export class GoatOrchestrator {
         });
       }
       /*
-       * What it decided it needs to see.
+       * What it decided it needs to see is no longer a second record.
        *
-       * The event type existed and nothing ever wrote it, which is why an
-       * agent log could show a thesis being formed and then jump straight to
-       * the trackers without ever saying what the thesis was waiting for.
-       * That list is the whole difference between a hypothesis and a
-       * position, so it is recorded the moment the thesis exists.
-       *
-       * Recorded only when the model actually stated requirements — an empty
-       * list is not a plan, and announcing "it needs nothing" would be a
-       * claim the runtime cannot support.
+       * It used to be one, and the log showed a Trade Plan and then a separate
+       * line about the conditions, which is the same fact twice. The conditions
+       * now ride on the plan's own record, where they belong — a reader sees
+       * what the agent thinks and what would make it right on one line.
        */
-      const requirements = this.stores.theses.get(outcome.thesisId ?? '')?.requiredConfirmation ?? [];
-      if (outcome.thesisId && requirements.length > 0) {
-        this.recordActivity({
-          goatId: goal.agentId,
-          deploymentId: deployment.id,
-          agentId: goal.agentId,
-          type: 'EVIDENCE_REQUIREMENTS_DEFINED',
-          data: {
-            thesisId: outcome.thesisId,
-            requirements,
-            statement: proposal.proposed.thesis.statement,
-            market: deployment.marketId,
-          },
-        });
-      }
       if (outcome.trackerIds.length > 0) {
         this.recordActivity({
           goatId: goal.agentId,
@@ -2337,48 +2484,42 @@ export class GoatOrchestrator {
   /**
    * Read the resolutions worth reading for this pass, and say which.
    *
-   * Context, setup and trigger are usually not the same resolution, and a
-   * GOAT reasoning about a breakout needs the higher one to agree with. So a
-   * pass reads the setup resolution plus the higher context, rather than a
-   * single hard-coded one — and records a line per resolution read, because
-   * "which timeframes is this thing using" is a question the user asked and
-   * one that used to have no answer.
+   * Context, setup and trigger are usually not the same resolution, and a GOAT
+   * reasoning about a breakout needs the higher one to agree with. What that
+   * means changed once: the set is no longer "the setup plus whatever is
+   * coarser".
    *
-   * The set is derived from the agent's declared menu, not from a constant,
-   * so narrowing it for a specific goal narrows what gets read.
+   * It is now the agent's own declared menu, resolved through the canonical
+   * timeframe model, and every resolution comes back with the job it is doing —
+   * regime, structure, setup, confirmation, entry. So a scalper that declared
+   * 1m and 5m reads exactly those two and calls 1m entry timing, while a
+   * swing GOAT on 15m reads the hour as structure and the 5m as confirmation.
+   * Neither is given a resolution it did not ask for, and the reason each one
+   * was read is in the prompt and the log rather than implied by its size.
+   *
+   * The menu is the agent's, not a constant, so narrowing it for a goal narrows
+   * what gets read, and an empty menu means "choose", which resolves to the
+   * setup resolution and its nearest neighbours.
    */
   private async readMarketAcrossTimeframes(
     symbol: string,
     instance: AgentInstance,
     setupTimeframe: string,
-  ): Promise<MarketContext[]> {
-    const menu = agentTimeframes(instance.agent);
-    /*
-     * Finest to coarsest, so a *larger* index is a *higher* resolution.
-     *
-     * This array was briefly written coarsest-first, which made the filter
-     * below select everything finer than the setup — a 15m GOAT read 1m and
-     * 5m as its "context" and never looked at an hour. Found by running a real
-     * deployment and reading the log, which said so plainly.
-     */
-    const order = ['1m', '5m', '15m', '30m', '1h', '4h', '1d'];
-    const setupRank = order.indexOf(setupTimeframe);
-    const higher = menu.filter(
-      (timeframe) => {
-        const rank = order.indexOf(timeframe);
-        return rank >= 0 && setupRank >= 0 && rank > setupRank;
-      },
-    );
+    options: { extra?: string[] } = {},
+  ): Promise<TimeframeContext[]> {
+    const plan = resolveTimeframePlan({
+      declared: [...agentTimeframes(instance.agent), ...(options.extra ?? [])],
+      setup: setupTimeframe,
+    });
 
-    // Bounded on purpose: reading seven resolutions on every wake is slower
-    // than the reasoning is worth, and the two nearest context resolutions
-    // are the ones that carry the structure a setup depends on.
-    const chosen = [setupTimeframe, ...higher.slice(0, 2)];
-    const unique = [...new Set(chosen)];
-
-    const contexts: MarketContext[] = [];
-    for (const timeframe of unique) {
-      contexts.push(await this.readMarket(symbol, instance, timeframe));
+    const contexts: TimeframeContext[] = [];
+    for (const read of plan.reads) {
+      contexts.push({
+        context: await this.readMarket(symbol, instance, read.timeframe),
+        role: read.role,
+        reason: read.reason,
+        strategy: plan.strategy,
+      });
     }
     return contexts;
   }
@@ -2386,19 +2527,22 @@ export class GoatOrchestrator {
   /**
    * Render several resolutions of one market into the prompt.
    *
-   * One block per timeframe with its candle range, so the model can tell
-   * "no structure on 1h" from "structure on 15m" instead of reading a single
-   * merged number and assuming it applies everywhere.
+   * One block per timeframe with its candle range and the role it is playing,
+   * so the model can tell "no structure on 1h" from "structure on 15m" instead
+   * of reading a single merged number and assuming it applies everywhere — and
+   * so it knows that a 1m read is entry timing while a 5m read is confirmation.
+   * The role is stated rather than implied, because the same candles support
+   * different conclusions depending on what the agent is trying to learn from
+   * them.
    */
-  private renderTimeframeContexts(contexts: MarketContext[], setupTimeframe: string): string {
+  private renderTimeframeContexts(contexts: TimeframeContext[]): string {
     return contexts
-      .map((context) => {
-        const role = context.timeframe === setupTimeframe ? 'setup' : 'context';
+      .map(({ context, role, reason }) => {
         const lines = renderMarketContext(context)
           .split('\n')
           .filter((line) => !/^(Symbol|Timeframe):/.test(line));
         return [
-          `${context.symbol} · ${context.timeframe} (${role})`,
+          `${context.symbol} · ${context.timeframe} — ${TIMEFRAME_ROLE_LABELS[role]} (${reason})`,
           ...lines.map((line) => `  ${line}`),
         ].join('\n');
       })
@@ -2569,6 +2713,10 @@ export class GoatOrchestrator {
         goal: goal.statement,
         market: deployment.marketId,
         timeframe: goal.timeframes[0] ?? DEFAULT_GOAT_TIMEFRAME,
+        // The goal's whole set, not just its first resolution: a resumed GOAT
+        // that lost its 1m context would be a different agent from the one the
+        // user deployed.
+        ...(goal.timeframes.length > 0 ? { timeframes: goal.timeframes } : {}),
         skillIds: goal.skillIds,
         policy: {
           allowTrading: deployment.mode !== 'SHADOW',
@@ -2611,6 +2759,10 @@ export class GoatOrchestrator {
      * recorded as one.
      */
     modelFailed?: boolean;
+    /** Real milliseconds the deciding call took, when one was made. */
+    elapsedMs?: number;
+    /** Resolutions the GOAT asked for and had to wait for before it could plan. */
+    acquiredTimeframes?: string[];
   }> {
     const instance = this.deps.agentRuntime.getAgent(goal.agentId);
     if (!instance) {
@@ -2658,114 +2810,107 @@ export class GoatOrchestrator {
      * Read once, here, and reused: the setup resolution feeds the observation
      * below rather than being fetched a second time.
      */
-    const setupContexts = await this.readMarketAcrossTimeframes(
+    const reads = await this.readMarketAcrossTimeframes(
       deployment.marketId,
       instance,
       timeframe,
     );
-    const market = setupContexts[0];
-    const observation = await this.buildObservation(instance, {
-      symbol: deployment.marketId,
-      skillIds: goal.skillIds,
-      timeframe,
-      market,
-      ...(setupContexts.length > 1 ? { extraTimeframes: setupContexts.slice(1) } : {}),
-    });
-
     const steering = this.steeringFor(goal.id);
 
-    for (const read of setupContexts) {
-      this.recordActivity({
-        goatId: goal.agentId,
-        deploymentId: deployment.id,
-        agentId: goal.agentId,
-        type: 'MARKET_CONTEXT_LOADED',
-        data: {
-          ...marketContextEvidence(read),
-          role: read.timeframe === timeframe ? 'setup' : 'context',
-          read: true,
-        },
-      });
-    }
+    this.recordReads(goal, deployment, reads, timeframe);
 
     /*
-     * The deterministic research pass is over.
+     * Ask, read more if the answer says it needs more, then ask again.
      *
-     * Every tool has now run against every resolution above, so this is where
-     * "reading the market" ends and "waiting on the model" begins. Recorded
-     * from what was actually collected — resolutions, candles, whether the
-     * indicators came back, what could not be read — because a GOAT that
-     * could not read its own indicators has to be able to say so at the point
-     * it starts waiting, not discover it later.
+     * This is the difference between an agent given a fixed blob and an agent
+     * that works out what it needs. A GOAT that cannot tell a 5m setup from a
+     * 15m one asks for the resolution it is missing; the runtime reads it,
+     * records that it did, and asks again with the wider context. Bounded, so a
+     * model that keeps asking cannot spend a deployment on data acquisition.
      */
-    this.recordActivity({
-      goatId: goal.agentId,
-      deploymentId: deployment.id,
-      agentId: goal.agentId,
-      type: 'MARKET_CONTEXT_PREPARED',
-      data: {
-        market: deployment.marketId,
-        timeframes: setupContexts.map((context) => context.timeframe),
-        resolutions: setupContexts.length,
-        candles: market.bars.received,
-        indicators: Object.keys(market.indicators).length,
-        limitations: market.limitations.length,
-      },
+    const requested: string[] = [];
+    const first = await this.askForTradePlan({
+      goal,
+      deployment,
+      instance,
+      timeframe,
+      reads,
+      steering,
+      instructions,
+      round: 0,
     });
+    let response = first.response;
+    // The deciding call is the last one, so its elapsed time is the one that
+    // describes how long forming this plan actually took.
+    let elapsedMs = first.elapsedMs;
 
-    const { response } = await this.callModel({
-      agentId: goal.agentId,
-      deploymentId: deployment.id,
-      intent: `Form a hypothesis on ${deployment.marketId}`,
-      submitted: {
-        symbol: deployment.marketId,
-        setupTimeframe: timeframe,
-        timeframes: setupContexts.map((context) => context.timeframe).join(', '),
-        candles: market.bars.received,
-        indicators: Object.keys(market.indicators).length,
-        objective: goal.statement,
-      },
-      request: {
-      agent: instance.agent,
-      observation,
-      contract: 'INVESTIGATION',
-      instructions: [
-        `You are deployed on ${deployment.marketId} at ${timeframe}.`,
-        '',
-        'MARKET CONTEXT — measured by deterministic tools, not estimated:',
-        renderMarketContext(market),
-        '',
-        steering.length > 0
-          ? `OPERATOR STEERING (runtime guidance, applies to this and later wakeups):\n${steering
-              .slice(-3)
-              .map((note) => `- ${note.text}`)
-              .join('\n')}`
-          : '',
-        'This is your first pass on this market. Investigate and decide what to believe.',
-        '',
-        'Rules for this answer:',
-        '- A thesis is a hypothesis, not a trade. It may be wrong.',
-        '- `invalidation` is required. Without it you do not have a hypothesis.',
-        '- Deploy two to four trackers. Fewer is not thorough; more is not persistence.',
-        '- Each tracker\'s config must match its published contract exactly. One wrong',
-        '  field and the tracker is refused.',
-        '- NEW_BAR needs no number and is never refused. Reach for it first, and add a',
-        '  level-based tracker only when the runtime has actually given you a level.',
-        '- SESSION_START, SESSION_END, position and order kinds are not available to you.',
-        '  Their config can only be written once the venue or the account supplies it.',
-        '- Never state a price, candle, indicator value or volume that was not provided.',
-        '- You may read this market. Whether this deployment may submit an order is a',
-        '  separate matter and has no bearing on your investigation.',
-        '- If you genuinely cannot form a hypothesis from what you have been given, say so',
-        '  in "thought" and return no "thesis" key. That is an acceptable answer and is not',
-        '  a failure — but a hypothesis you can actually test is better.',
-      ].join('\n'),
-      skillsInstructions: instructions,
-      toolHistory: [],
-      iteration: 0,
-      wakeReason: 'DEPLOYED',
-      },
-    });
+    for (let round = 0; round < MAX_CONTEXT_ROUNDS; round += 1) {
+      if (response.unavailable || response.malformed || response.toolCall) break;
+
+      const { accepted, rejected } = parseTimeframes(response.payload?.['requestTimeframes']);
+      const missing = accepted.filter((timeframe) => !reads.some((read) => read.context.timeframe === timeframe));
+      if (missing.length === 0) {
+        /*
+         * Nothing new was asked for. Two reasons are possible and they deserve
+         * different treatment: the model asked for resolutions it already has,
+         * or it asked for something this product cannot read. The second is
+         * said out loud, because a silent refusal looks like the agent decided
+         * it did not need it.
+         */
+        if (rejected.length > 0) {
+          this.recordActivity({
+            goatId: goal.agentId,
+            deploymentId: deployment.id,
+            agentId: goal.agentId,
+            type: 'MARKET_CONTEXT_PREPARED',
+            data: {
+              market: deployment.marketId,
+              timeframes: reads.map((read) => read.context.timeframe),
+              resolutions: reads.length,
+              unsupported: rejected.join(', '),
+              limitations: 0,
+            },
+          });
+        }
+        break;
+      }
+
+      for (const timeframe of missing) {
+        this.recordActivity({
+          goatId: goal.agentId,
+          deploymentId: deployment.id,
+          agentId: goal.agentId,
+          type: 'MARKET_CONTEXT_PREPARED',
+          data: {
+            market: deployment.marketId,
+            reason: `The GOAT asked for ${timeframe} before it could form a Trade Plan`,
+            requested: timeframe,
+          },
+        });
+      }
+
+      const extra = await this.readMarketAcrossTimeframes(deployment.marketId, instance, timeframe, {
+        extra: [...requested, ...missing],
+      });
+      for (const read of extra.filter((candidate) => missing.includes(candidate.context.timeframe as never))) {
+        reads.push(read);
+      }
+      requested.push(...missing);
+      this.recordReads(goal, deployment, reads, timeframe, { acquired: missing });
+
+      const next = await this.askForTradePlan({
+        goal,
+        deployment,
+        instance,
+        timeframe,
+        reads,
+        steering,
+        instructions,
+        round: round + 1,
+      });
+      response = next.response;
+      elapsedMs = elapsedMs + next.elapsedMs;
+    }
 
     if (response.unavailable) {
       return {
@@ -2810,17 +2955,175 @@ export class GoatOrchestrator {
 
     const proposed = parseInvestigation(response);
 
-    if (proposed) {
+    /*
+     * A research line only when research produced nothing.
+     *
+     * When the answer holds a hypothesis, the Trade Plan record that follows is
+     * the record of it — and two lines saying the same thing in two vocabularies
+     * is the duplication this product is trying not to have. The research line
+     * earns its place in the other case: the market was read, and the reading
+     * did not yet support a plan.
+     */
+    if (!proposed) {
       this.recordActivity({
         goatId: goal.agentId,
         deploymentId: deployment.id,
         agentId: goal.agentId,
         type: 'MARKET_RESEARCH_COMPLETED',
-        data: { formedThesis: true, trackers: proposed.trackers.length },
+        data: { formedThesis: false, rounds: requested.length + 1 },
       });
     }
 
-    return { proposed };
+    return {
+      proposed,
+      elapsedMs,
+      ...(requested.length > 0 ? { acquiredTimeframes: requested } : {}),
+    };
+  }
+
+  /**
+   * One pass at the Trade Plan, with the context this GOAT has so far.
+   *
+   * Split out of the investigation so that dynamic acquisition can call it again
+   * with a wider context: the prompt is assembled from the reads it is given, so
+   * asking twice is asking with more evidence rather than re-asking the same
+   * question a different way.
+   */
+  private async askForTradePlan(input: {
+    goal: Goal;
+    deployment: GoatDeployment;
+    instance: AgentInstance;
+    timeframe: string;
+    reads: TimeframeContext[];
+    steering: SteeringNote[];
+    instructions: string;
+    round: number;
+  }): Promise<{ response: AgentModelResponse; elapsedMs: number }> {
+    const { goal, deployment, instance, timeframe, reads, steering, instructions, round } = input;
+    const market = reads[0].context;
+    const observation = await this.buildObservation(instance, {
+      symbol: deployment.marketId,
+      skillIds: goal.skillIds,
+      timeframe,
+      market,
+      ...(reads.length > 1
+        ? { extraTimeframes: reads.slice(1).map((read) => read.context) }
+        : {}),
+    });
+
+    this.recordActivity({
+      goatId: goal.agentId,
+      deploymentId: deployment.id,
+      agentId: goal.agentId,
+      type: 'MARKET_CONTEXT_PREPARED',
+      data: {
+        market: deployment.marketId,
+        timeframes: reads.map((read) => read.context.timeframe).join(', '),
+        resolutions: reads.length,
+        roles: reads.map((read) => `${read.context.timeframe} ${TIMEFRAME_ROLE_LABELS[read.role]}`).join(', '),
+        chosenBy: reads[0].strategy === 'DECLARED' ? 'the goal' : 'the GOAT',
+        candles: market.bars.received,
+        indicators: Object.keys(market.indicators).length,
+        limitations: market.limitations.length,
+        ...(round > 0 ? { round } : {}),
+      },
+    });
+
+    const { response, report } = await this.callModel({
+      agentId: goal.agentId,
+      deploymentId: deployment.id,
+      phase: 'FORMING',
+      intent: `Building the Trade Plan for ${deployment.marketId}`,
+      submitted: {
+        symbol: deployment.marketId,
+        setupTimeframe: timeframe,
+        timeframes: reads.map((read) => read.context.timeframe).join(', '),
+        candles: market.bars.received,
+        indicators: Object.keys(market.indicators).length,
+        objective: goal.statement,
+      },
+      request: {
+        agent: instance.agent,
+        observation,
+        contract: 'INVESTIGATION',
+        instructions: [
+          `You are deployed on ${deployment.marketId}.`,
+          '',
+          'MARKET CONTEXT — measured by deterministic tools, not estimated.',
+          'Each resolution is labelled with the job it is doing for you:',
+          this.renderTimeframeContexts(reads),
+          '',
+          steering.length > 0
+            ? `OPERATOR STEERING (runtime guidance, applies to this and later wakeups):\n${steering
+                .slice(-3)
+                .map((note) => `- ${note.text}`)
+                .join('\n')}`
+            : '',
+          'This is your first pass on this market. Investigate and decide what to believe.',
+          '',
+          'What you produce is ONE Trade Plan. In this product the plan and the',
+          'hypothesis are the same object: what you believe could happen, what',
+          'must happen for you to be right, and what you will do if it is.',
+          '',
+          'Rules for this answer:',
+          '- `invalidation` is required. Without it you do not have a plan.',
+          '- Deploy two to four conditions to watch. Fewer is not thorough; more is not persistence.',
+          '- Each condition\'s config must match its published contract exactly. One wrong',
+          '  field and it is refused.',
+          '- NEW_BAR needs no number and is never refused. Reach for it first, and add a',
+          '  level-based condition only when the runtime has actually given you a level.',
+          '- SESSION_START, SESSION_END, position and order kinds are not available to you.',
+          '  Their config can only be written once the venue or the account supplies it.',
+          '- Never state a price, candle, indicator value or volume that was not provided.',
+          `- You may read any of these resolutions: ${SUPPORTED_TIMEFRAMES.join(', ')}.`,
+          '- If the context you were given cannot support a plan — because a resolution you need',
+          '  is missing — return {"requestTimeframes": ["1h"]} and nothing else. The runtime will',
+          '  read it and ask you again. Do that instead of guessing.',
+          '- If you genuinely cannot form a plan from what you have, say so in "thought" and',
+          '  return no "thesis" key. That is an acceptable answer and is not a failure.',
+        ].join('\n'),
+        skillsInstructions: instructions,
+        toolHistory: [],
+        iteration: round,
+        wakeReason: 'DEPLOYED',
+      },
+    });
+
+    return { response, elapsedMs: report.elapsedMs };
+  }
+
+  /**
+   * One line per resolution read, with the job it was doing.
+   *
+   * The role is on the line rather than left to be inferred from the size,
+   * because "read 1h" and "read 1h for regime" are different claims, and only
+   * one of them can be checked against what the agent then did.
+   */
+  private recordReads(
+    goal: Goal,
+    deployment: GoatDeployment,
+    reads: TimeframeContext[],
+    setupTimeframe: string,
+    options: { acquired?: string[] } = {},
+  ): void {
+    for (const read of reads) {
+      if (options.acquired && !options.acquired.includes(read.context.timeframe as never)) continue;
+      this.recordActivity({
+        goatId: goal.agentId,
+        deploymentId: deployment.id,
+        agentId: goal.agentId,
+        type: 'MARKET_CONTEXT_LOADED',
+        data: {
+          ...marketContextEvidence(read.context),
+          timeframe: read.context.timeframe,
+          role: TIMEFRAME_ROLE_LABELS[read.role],
+          reason: read.reason,
+          chosenBy: read.strategy === 'DECLARED' ? 'the goal' : 'the GOAT',
+          setup: read.context.timeframe === setupTimeframe,
+          ...(options.acquired ? { acquired: true } : {}),
+        },
+      });
+    }
   }
 
   /**
@@ -2854,7 +3157,7 @@ export class GoatOrchestrator {
           exhausted: true,
           looks,
           message:
-            'This GOAT looked several times and found nothing it could act on. It is deployed and will wake you if a condition you gave it fires.',
+            'This GOAT looked several times and found nothing it could act on. It is deployed and will wake you if a condition it set fires.',
         },
       });
       return;
@@ -2881,7 +3184,7 @@ export class GoatOrchestrator {
         trackers: 0,
         looks,
         reconsiderInMs: GOAT_RECONSIDER_AFTER_MS,
-        message: `No thesis on look ${looks} of ${MAX_UNPROMPTED_RECONSIDERATIONS}; will look again on its own shortly.`,
+        message: `No Trade Plan on look ${looks} of ${MAX_UNPROMPTED_RECONSIDERATIONS}; it will look again on its own shortly.`,
       },
     });
 
@@ -3274,7 +3577,22 @@ export class GoatOrchestrator {
     const phaseInstructions = this.skills.compilePhase(goal.skillIds, 'GOAL_INTERPRETATION');
 
     try {
-      const response = await this.model.run({
+      /*
+       * Instrumented like every other reasoning step, because it is one.
+       *
+       * It used to be the only model call that went around the front door, so
+       * the composer could sit silent for seconds with nothing in the log and no
+       * pulsing state to say why. It is now a MODEL line, a pending state while
+       * it is outstanding, and a recorded measurement — and the run genuinely
+       * does stop while it is in flight, so a replay holding for its agent
+       * includes this window.
+       */
+      const { response } = await this.callModel({
+        agentId: goal.agentId,
+        phase: 'FORMING',
+        intent: 'Reading the objective you gave this GOAT',
+        submitted: { objective: goal.statement.slice(0, 120) },
+        request: {
         agent,
         // A GOAT that has not been deployed has no market, but it always has
         // an objective — and that is the only thing this call is reading.
@@ -3297,6 +3615,7 @@ export class GoatOrchestrator {
         iteration: 0,
         wakeReason: 'GOAL_CREATED',
         contract: 'INTERPRETATION',
+        },
       });
 
       /*
@@ -3847,21 +4166,26 @@ export class GoatOrchestrator {
      * it claims to be breaking, and recording each read is what makes "which
      * timeframes is this using" answerable from the log instead of guessed.
      */
-    const contexts = await this.readMarketAcrossTimeframes(symbol, instance, timeframe);
-    const market = contexts[0];
+    const reads = await this.readMarketAcrossTimeframes(symbol, instance, timeframe);
+    const market = reads[0].context;
 
-    for (const read of contexts) {
-      this.recordActivity({
-        goatId: context.agentId,
-        deploymentId: context.deployment.deploymentId,
-        agentId: instance.agent.id,
-        type: 'MARKET_CONTEXT_LOADED',
-        data: {
-          ...marketContextEvidence(read),
-          role: read.timeframe === timeframe ? 'setup' : 'context',
-          read: true,
-        },
-      });
+    if (goal) {
+      this.recordReads(goal, context.deployment as unknown as GoatDeployment, reads, timeframe);
+    } else {
+      for (const read of reads) {
+        this.recordActivity({
+          goatId: context.agentId,
+          deploymentId: context.deployment.deploymentId,
+          agentId: instance.agent.id,
+          type: 'MARKET_CONTEXT_LOADED',
+          data: {
+            ...marketContextEvidence(read.context),
+            timeframe: read.context.timeframe,
+            role: TIMEFRAME_ROLE_LABELS[read.role],
+            reason: read.reason,
+          },
+        });
+      }
     }
 
     const observation = await this.buildObservation(instance, {
@@ -3876,7 +4200,7 @@ export class GoatOrchestrator {
     /*
      * The same boundary as a first pass: research is over, and the GOAT is
      * now blocked on the model. Without this line a wake rendered as one
-     * quiet gap between "a tracker fired" and "the thesis was revised", which
+     * quiet gap between "a tracker fired" and "the plan was updated", which
      * is exactly the gap during which the agent appears frozen.
      */
     this.recordActivity({
@@ -3886,8 +4210,9 @@ export class GoatOrchestrator {
       type: 'MARKET_CONTEXT_PREPARED',
       data: {
         market: symbol,
-        timeframes: contexts.map((read) => read.timeframe),
-        resolutions: contexts.length,
+        timeframes: reads.map((read) => read.context.timeframe).join(', '),
+        resolutions: reads.length,
+        roles: reads.map((read) => `${read.context.timeframe} ${TIMEFRAME_ROLE_LABELS[read.role]}`).join(', '),
         candles: market.bars.received,
         indicators: Object.keys(market.indicators).length,
         limitations: market.limitations.length,
@@ -3898,11 +4223,12 @@ export class GoatOrchestrator {
       const { response } = await this.callModel({
         agentId: context.agentId,
         deploymentId: context.deployment.deploymentId,
-        intent: `Interpret the fired condition for ${symbol}`,
+        phase: 'UPDATING',
+        intent: `Updating the Trade Plan for ${symbol}`,
         submitted: {
           symbol,
           setupTimeframe: timeframe,
-          timeframes: contexts.map((read) => read.timeframe).join(', '),
+          timeframes: reads.map((read) => read.context.timeframe).join(', '),
           candles: market.bars.received,
           objective: goal?.statement ?? context.goal,
         },
@@ -3930,8 +4256,9 @@ export class GoatOrchestrator {
               : 'nothing'
           }`,
           '',
-          'MARKET CONTEXT — measured now, by deterministic tools:',
-          renderMarketContext(market),
+          'MARKET CONTEXT — measured now, by deterministic tools.',
+          'Each resolution is labelled with the job it is doing for you:',
+          this.renderTimeframeContexts(reads),
           '',
           steering.length > 0
             ? `OPERATOR STEERING (runtime guidance):\n${steering
@@ -3951,8 +4278,8 @@ export class GoatOrchestrator {
           '- WAIT            not enough to act on',
           '',
           'A tracker event is a fact. It is never a buy or a sell.',
-          'One decision per wake. You do not get to ask for more data in a loop:',
-          'if you need something you cannot see, name it and CREATE_TRACKER for it.',
+          'One decision per wake. If the decision depends on a resolution you were not',
+          `given, return {"requestTimeframes": ["1h"]} instead of a decision (${SUPPORTED_TIMEFRAMES.join(', ')}).`,
         ].join('\n'),
         skillsInstructions: phaseInstructions,
         toolHistory: [],
@@ -4105,19 +4432,45 @@ function detailForActivity(type: AgentTimelineEventType, record: Record<string, 
   const parts: string[] = [];
 
   switch (type) {
+    /*
+     * Resolution and role first, numbers after.
+     *
+     * The pair is the claim — "5m, entry timing" — and it leads so a reader
+     * scanning the log can see what the agent was looking at without reading
+     * every line. The numbers follow as the evidence for it.
+     */
     case 'MARKET_CONTEXT_LOADED':
+      if (typeof record.timeframe === 'string' && record.timeframe) {
+        parts.push(
+          typeof record.role === 'string' && record.role ? `${record.timeframe} · ${record.role}` : record.timeframe,
+        );
+      }
       if (isFiniteNumber(record.candles)) parts.push(`${record.candles} candles`);
       if (isFiniteNumber(record.rsi)) parts.push(`RSI ${round(record.rsi)}`);
       if (isFiniteNumber(record.atr)) parts.push(`ATR ${round(record.atr)}`);
-      if (typeof record.timeframe === 'string' && record.timeframe) parts.push(record.timeframe);
+      if (record.acquired === true) parts.push('the GOAT asked for this resolution');
       break;
 
+    /*
+     * The numbers, not the sentence.
+     *
+     * The headline is the conditional sentence and repeating it here would make
+     * every plan line a paragraph. What belongs under it is what the plan needs
+     * and how far through it is.
+     */
     case 'THESIS_FORMED':
-    case 'THESIS_REVISED':
-      if (typeof record.direction === 'string' && record.direction) parts.push(record.direction.toLowerCase());
+    case 'THESIS_REVISED': {
       if (typeof record.state === 'string' && record.state) parts.push(record.state.toLowerCase());
-      if (typeof record.statement === 'string' && record.statement) parts.push(record.statement);
+      const requirements = Array.isArray(record.requirements)
+        ? record.requirements.filter((entry): entry is string => typeof entry === 'string')
+        : [];
+      if (requirements.length > 0) parts.push(`${requirements.length} conditions to confirm`);
+      if (isFiniteNumber(record.modelMs)) parts.push(`${(record.modelMs / 1000).toFixed(1)}s to form`);
+      if (typeof record.watches !== 'number') {
+        // Intentionally empty: nothing measured to report yet.
+      }
       break;
+    }
 
     case 'EVIDENCE_REQUIREMENTS_DEFINED': {
       const requirements = Array.isArray(record.requirements) ? record.requirements.filter((r): r is string => typeof r === 'string') : [];
@@ -4211,16 +4564,6 @@ function detailForActivity(type: AgentTimelineEventType, record: Record<string, 
       if (isFiniteNumber(record.candles)) parts.push(`${record.candles} candles`);
       if (isFiniteNumber(record.indicators)) parts.push(`${record.indicators} indicator sets`);
       if (text(record.objective)) parts.push(text(record.objective));
-      if (isFiniteNumber(record.elapsedMs)) parts.push(`${Math.round(record.elapsedMs / 1000)}s`);
-      break;
-
-    case 'MODEL_WAITING':
-      if (isFiniteNumber(record.elapsedSeconds)) parts.push(`${record.elapsedSeconds}s elapsed`);
-      break;
-
-    case 'MODEL_RESPONSE':
-      if (isFiniteNumber(record.elapsedMs)) parts.push(`${Math.round(record.elapsedMs / 1000)}s`);
-      if (isFiniteNumber(record.trackers)) parts.push(count(record.trackers, 'condition'));
       break;
 
     case 'MODEL_RETRY':
@@ -4310,6 +4653,68 @@ export function describeDuration(ms: number): string {
   return restHours > 0 ? `${days}d ${restHours}h` : `${days}d`;
 }
 
+/**
+ * One Trade Plan as one sentence.
+ *
+ * `X may be doing Y. If A, and B, then C.` — assembled from the recorded
+ * statement, the recorded requirements and the recorded direction. It never
+ * paraphrases the model and never adds a number nobody supplied: everything in
+ * it came from the records this line is reporting, so a reader can check it
+ * against the plan panel beside it.
+ *
+ * When there are no requirements yet, the sentence says so rather than
+ * pretending the plan is conditional when it is not.
+ */
+function conditionalSentence(record: Record<string, unknown>): string {
+  const market = text(record.market);
+  const statement = text(record.statement);
+  if (!statement) return 'Trade Plan formed';
+
+  const belief = statement.trim().replace(/\.$/, '');
+  /*
+   * The subject, unless the statement already opens with it.
+   *
+   * Models write "USD/JPY holds its range" as often as they write "the range
+   * holds", and prefixing unconditionally produced "USD/JPY USD/JPY holds its
+   * range" on the log's most important line.
+   */
+  const opens = market !== '' && belief.toUpperCase().startsWith(market.toUpperCase());
+  const subject = opens ? '' : market || 'The market';
+  const requirements = Array.isArray(record.requirements)
+    ? record.requirements.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    : [];
+  const action = directionAction(text(record.direction));
+
+  if (requirements.length === 0) return `${subject ? `${subject} ` : ''}${belief}.`;
+
+  const shown = requirements.slice(0, 3).map((entry) => lower(entry.trim().replace(/\.$/, '')));
+  const remaining = requirements.length - shown.length;
+  const conditions = `${lower(shown[0])}${shown
+    .slice(1)
+    .map((entry) => `, and ${lower(entry)}`)
+    .join('')}${remaining > 0 ? `, and ${remaining} more condition${remaining === 1 ? '' : 's'}` : ''}`;
+
+  return `${subject ? `${subject} ` : ''}${belief}. If ${conditions}, then ${action}.`;
+}
+
+/**
+ * What the plan says it will do, from the direction it recorded.
+ *
+ * NEUTRAL gets no verb, because a GOAT that has not taken a side has not said
+ * it will buy or sell, and a plan that implies otherwise is the plan lying on
+ * the user's behalf.
+ */
+function directionAction(direction: string): string {
+  const value = direction.toUpperCase();
+  if (value === 'BULLISH') return 'it buys';
+  if (value === 'BEARISH') return 'it sells';
+  return 'it keeps gathering evidence';
+}
+
+function lower(value: string): string {
+  return value.length > 0 ? value[0].toLowerCase() + value.slice(1) : value;
+}
+
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
@@ -4388,22 +4793,16 @@ function describeActivity(type: AgentTimelineEventType, data: unknown): string {
         : 'Research complete — the request is ready';
 
     /*
-     * The request, and what was in it.
+     * The one line that says the GOAT is thinking.
      *
-     * Deliberately not phrased as progress. It is an outbound call to an
-     * external dependency, and saying so is the only honest description of
-     * what the runtime is doing while it waits.
+     * Phrased as the work rather than as the call, because "forming a
+     * hypothesis" and "converting it into a plan" are one activity to a user
+     * and two only to the architecture. What the agent is doing while this is
+     * outstanding is carried by the live status above the log, which pulses for
+     * exactly as long as the request is in flight.
      */
     case 'MODEL_REQUEST':
-      return `${text(record.intent) || 'Model request'} — request started`;
-
-    case 'MODEL_WAITING':
-      return isFiniteNumber(record.elapsedSeconds)
-        ? `Still waiting for a response \u00b7 ${record.elapsedSeconds}s`
-        : 'Waiting for a response';
-
-    case 'MODEL_RESPONSE':
-      return `Answered \u2014 ${text(record.outcome) || 'the model replied'}`;
+      return text(record.intent) || 'Building the Trade Plan';
 
     case 'MODEL_RETRY':
       return text(record.message) || 'Bounded retry scheduled';
@@ -4420,19 +4819,28 @@ function describeActivity(type: AgentTimelineEventType, data: unknown): string {
     case 'BACKTEST_COMPLETED':
       return 'Backtest complete';
     case 'MARKET_RESEARCH_COMPLETED':
-      return record.formedThesis === true
-        ? 'Finished its first pass and formed a hypothesis'
-        : 'Finished its first pass with no hypothesis it could test';
+      return `Read ${text(record.market) || 'the market'} and could not form a Trade Plan yet`;
+
+    /*
+     * The Trade Plan, in one sentence.
+     *
+     * What the agent believes could happen, what would make it right, and what
+     * it will do. Not a label followed by the belief, and not "hypothesis" —
+     * a user reads this line and should not need to know that the architecture
+     * has a separate word for the same thing.
+     */
     case 'THESIS_FORMED':
-      return `Thesis: ${text(record.statement)}`;
+      return conditionalSentence(record);
     case 'THESIS_REVISED':
-      return `Thesis revised to ${text(record.state)}`;
+      return text(record.statement)
+        ? `Trade Plan updated — ${conditionalSentence(record)}`
+        : `Trade Plan updated — ${text(record.state).toLowerCase() || 'the belief changed'}`;
     case 'THESIS_INVALIDATED':
-      return `Thesis invalidated: ${text(record.reason)}`;
+      return `Trade Plan abandoned — ${text(record.reason) || 'the conditions it required did not hold'}`;
     case 'NO_THESIS_YET':
-      return `Reviewed ${text(record.market)} and formed no thesis yet`;
+      return `Read ${text(record.market)} and could not form a Trade Plan yet`;
     case 'EVIDENCE_REQUIREMENTS_DEFINED':
-      return `Defined what it needs to see`;
+      return `What the Trade Plan needs to see`;
     case 'TRACKER_CREATED':
       return `Watching: ${text(record.purpose) || text(record.trackerId)}${
         record.defaulted === true ? ' (the runtime\'s own watcher)' : ''

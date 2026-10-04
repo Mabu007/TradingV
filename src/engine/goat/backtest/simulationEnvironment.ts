@@ -49,26 +49,25 @@ import type {
 } from '../../agents/types';
 import type { ExecutionRejection } from '../../execution/errors';
 import type { SimulationClock } from './clock';
+import { rankOf, timeframeSeconds } from '../timeframes';
 
-/** Resolution of the replay itself. One minute is the base everything derives from. */
+/**
+ * The finest resolution a replay defaults to.
+ *
+ * One minute, because it is the resolution every coarser one can be built from
+ * and the one a scalper needs. It is a default and not a requirement: a dataset
+ * that only exists at 5m can still be replayed, and the environment then says so
+ * rather than inventing candles it does not have.
+ */
 export const SIMULATION_BASE_TIMEFRAME = '1m';
 
-const TIMEFRAME_SECONDS: Readonly<Record<string, number>> = {
-  '1m': 60,
-  '5m': 300,
-  '15m': 900,
-  '30m': 1800,
-  '1h': 3600,
-  '4h': 14400,
-  '1d': 86400,
-};
-
-/** What a timeframe means, in seconds. Rejects anything it cannot express. */
-export function timeframeSeconds(timeframe: string): number {
-  const seconds = TIMEFRAME_SECONDS[timeframe];
-  if (!seconds) throw new Error(`A simulation cannot read ${timeframe}: unsupported timeframe.`);
-  return seconds;
-}
+/**
+ * What a timeframe means, in seconds.
+ *
+ * Re-exported from the canonical timeframe model rather than redeclared, so a
+ * resolution cannot be readable here and not in the rest of the product.
+ */
+export { timeframeSeconds, isSupportedTimeframe, SUPPORTED_TIMEFRAMES } from '../timeframes';
 
 /**
  * A point-in-time venue fact.
@@ -93,6 +92,14 @@ export interface SimulationMarketConfig {
    * stops at the clock.
    */
   bars: Bar[];
+  /**
+   * The resolution the dataset itself is at.
+   *
+   * Defaults to 1m. A venue that will not serve a year of 1m candles can serve
+   * 5m, and replaying that is honest; synthesising 1m candles from it would not
+   * be. A dataset is only ever aggregated upwards from here.
+   */
+  baseTimeframe?: string;
   /** Hourly funding readings, if the dataset carries them. */
   funding?: SimulationFact[];
   /** Open-interest readings, if the dataset carries them. */
@@ -137,6 +144,7 @@ export class SimulationEnvironment implements ITradingEnvironment {
   private readonly symbol: string;
   private readonly bars: Bar[];
   private readonly baseSeconds: number;
+  private readonly baseTimeframe: string;
   private readonly initialBalance: number;
 
   private readonly spreadPrice: number;
@@ -169,7 +177,8 @@ export class SimulationEnvironment implements ITradingEnvironment {
   constructor(clock: SimulationClock, config: SimulationMarketConfig) {
     this.clock = clock;
     this.symbol = config.symbol;
-    this.baseSeconds = timeframeSeconds(SIMULATION_BASE_TIMEFRAME);
+    this.baseTimeframe = config.baseTimeframe ?? SIMULATION_BASE_TIMEFRAME;
+    this.baseSeconds = timeframeSeconds(this.baseTimeframe);
 
     if (!Array.isArray(config.bars) || config.bars.length === 0) {
       throw new Error('A simulation needs historical bars. There is nothing to replay.');
@@ -265,6 +274,21 @@ export class SimulationEnvironment implements ITradingEnvironment {
     return this.bars.length === 0 ? 1 : this.visibleCount / this.bars.length;
   }
 
+  /**
+   * Whether this simulation can read a resolution at all.
+   *
+   * The only thing that makes one unavailable is the dataset: everything
+   * coarser than the base is aggregated from it, and nothing finer exists.
+   */
+  supports(timeframe: string): boolean {
+    return rankOf(timeframe) >= rankOf(this.baseTimeframe);
+  }
+
+  /** The resolution the dataset is at. The finest thing this replay can read. */
+  get resolution(): string {
+    return this.baseTimeframe;
+  }
+
   /** Base bars consumed so far. A one-minute tick consumes one. */
   barsConsumed(): number {
     this.catchUpTo(this.clock.now());
@@ -308,6 +332,20 @@ export class SimulationEnvironment implements ITradingEnvironment {
   async getMarketBars(symbol: string, timeframe: string, count: number): Promise<Bar[]> {
     this.assertSymbol(symbol);
     if (!Number.isInteger(count) || count <= 0) throw new Error('Bar count must be a positive integer.');
+    if (!this.supports(timeframe)) {
+      /*
+       * Refused rather than approximated.
+       *
+       * Asking a 5m dataset for 1m candles would otherwise be answered by
+       * bucketing 5m bars into 1m buckets, which manufactures a resolution the
+       * data does not contain and would hand the agent five identical candles
+       * per period. A capability that cannot be read says so, and the context
+       * layer turns that into a limitation the GOAT is told about.
+       */
+      throw new Error(
+        `This replay's data is at ${this.baseTimeframe}, so ${timeframe} cannot be read from it.`,
+      );
+    }
     const seconds = timeframeSeconds(timeframe);
     const visible = this.visibleBars();
     if (visible.length === 0) return [];

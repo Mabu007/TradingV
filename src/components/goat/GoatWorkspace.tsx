@@ -23,7 +23,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Compass, Loader2, Pause, Play, Rocket, Send, Trash2 } from 'lucide-react';
+import { Compass, History, Loader2, Pause, Play, Rocket, Send, Trash2 } from 'lucide-react';
 
 import type { GoatOrchestrator } from '../../engine/goat/orchestrator';
 import type { AgentEventView } from '../../engine/goat/agentEvents';
@@ -46,6 +46,16 @@ export interface GoatWorkspaceProps {
   onChanged: () => void;
   onDismissError?: () => void;
   onDeploy: () => void;
+  /**
+   * Replay this GOAT against history.
+   *
+   * Offered on every GOAT rather than as a separate product elsewhere, because
+   * "what would this GOAT have done" is a question about *this* GOAT — its
+   * objective, its skills, its market, its resolutions. A backtest entry point
+   * that made the user re-enter any of that would be answering a different
+   * question.
+   */
+  onBacktest?: () => void;
   onArchive?: () => void;
 }
 
@@ -57,6 +67,7 @@ export const GoatWorkspace: React.FC<GoatWorkspaceProps> = ({
   onChanged,
   onDismissError,
   onDeploy,
+  onBacktest,
   onArchive,
 }) => {
   /*
@@ -172,6 +183,7 @@ export const GoatWorkspace: React.FC<GoatWorkspaceProps> = ({
         onStop={() => void orchestrator.stopGoat(mission.goalId).then(onChanged)}
         onPlay={() => void orchestrator.resumeGoat(mission.goalId).then(onChanged)}
         onDeploy={onDeploy}
+        onBacktest={onBacktest}
         onArchive={onArchive ? () => setConfirmDelete(true) : undefined}
       />
 
@@ -200,7 +212,13 @@ export const GoatWorkspace: React.FC<GoatWorkspaceProps> = ({
        */}
       <div className="grid gap-4 lg:grid-cols-[minmax(0,26rem)_minmax(0,1fr)] lg:items-start">
         <div className="space-y-4 lg:sticky lg:top-4">
-          <TradePlanPanel plan={plan} />
+          {/*
+            The forming note is the mission's own headline, so the plan panel and
+            the status line above it cannot disagree about what the GOAT is
+            doing. A plan that does not exist yet still has an owner, and it is
+            the same owner.
+          */}
+          <TradePlanPanel plan={plan} formingNote={mission.activity.headline} />
           {steeringOpen && (
             <SteerComposer
               value={steeringText}
@@ -252,6 +270,7 @@ interface GoatHeaderProps {
   onStop: () => void;
   onPlay: () => void;
   onDeploy: () => void;
+  onBacktest?: () => void;
   onArchive?: () => void;
 }
 
@@ -263,7 +282,7 @@ interface GoatHeaderProps {
  * that is the order the questions arrive in.
  */
 const GoatHeader: React.FC<GoatHeaderProps> = ({
-  mission, now, live, steeringPending, busy, onSteer, onStop, onPlay, onDeploy, onArchive,
+  mission, now, live, steeringPending, busy, onSteer, onStop, onPlay, onDeploy, onBacktest, onArchive,
 }) => {
   const stopped = mission.runtime === 'STOPPED' || mission.runtime === 'PAUSED';
   return (
@@ -288,6 +307,23 @@ const GoatHeader: React.FC<GoatHeaderProps> = ({
         ) : (
           <ControlButton onClick={onDeploy} disabled={busy} primary icon={<Rocket className="h-3 w-3" />}>
             Deploy
+          </ControlButton>
+        )}
+        {/*
+          Backtest, beside Deploy.
+          Same weight, same place: the two actions a GOAT's owner reaches for
+          when they want to know whether it works. It is offered whether or not
+          the GOAT is deployed — replaying an undeployed GOAT is how you find out
+          what it would do before pointing it at a real market.
+        */}
+        {onBacktest && (
+          <ControlButton
+            onClick={onBacktest}
+            disabled={busy}
+            icon={<History className="h-3 w-3" />}
+            testId="goat-backtest"
+          >
+            Backtest
           </ControlButton>
         )}
         <ControlButton onClick={onSteer} icon={<Compass className="h-3 w-3" />}>
@@ -383,16 +419,19 @@ interface ControlButtonProps {
   primary?: boolean;
   /** Icon-only, with the name available to assistive tech. */
   label?: string;
+  /** Named for the flows that assert on a control by its role. */
+  testId?: string;
 }
 
 const ControlButton: React.FC<ControlButtonProps> = ({
-  onClick, children, icon, disabled, primary, label,
+  onClick, children, icon, disabled, primary, label, testId,
 }) => (
   <button
     type="button"
     onClick={onClick}
     disabled={disabled}
     aria-label={label}
+    data-testid={testId}
     className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 font-mono text-[10px] tracking-[0.1em] transition-colors disabled:opacity-40 ${
       primary
         ? 'border-accent/40 bg-accent-soft/40 text-accent-ink'

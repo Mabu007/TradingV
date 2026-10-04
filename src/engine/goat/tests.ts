@@ -2480,7 +2480,20 @@ test('integration: creating a GOAT produces a goal, not a strategy definition', 
   // A GOAT is a goal and its skills. Nothing else, and in particular no
   // market: creation is not where a user is asked to choose one.
   assertEqual(result.goal.symbols.length, 0, 'the goal carries no market of its own');
-  assertEqual(result.goal.timeframes.length, 0, 'and no timeframe');
+
+  /*
+   * The resolutions the reading proposed are kept.
+   *
+   * This used to assert none were, and the model's own reading of the objective
+   * — which had just said "check whether 15m momentum is recovering" — was thrown
+   * away. That is how "scalp on 1m and 5m" became a 15m GOAT: the intent was
+   * understood, stated back in the interpretation, and then discarded. What is
+   * *not* kept is a market, and what is not decided here is which resolution the
+   * GOAT acts on — deployment still chooses that, and still has to be pointed
+   * somewhere first.
+   */
+  assertEqual(result.goal.timeframes.join(','), '15m', 'the resolutions the reading proposed are kept');
+  assertEqual(result.goal.status, 'UNDEPLOYED', 'and the goal is still undeployed, so none of them is acting yet');
   assertEqual(h.agentRuntime.getAgent(result.agentId), undefined, 'nothing is running until it is deployed');
   assertEqual(h.trackerRegistry.listForAgent(result.agentId).length, 0, 'no user-defined trackers exist');
 });

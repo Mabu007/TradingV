@@ -52,15 +52,30 @@ export type PlanStatus =
   | 'NONE';
 
 export interface PlanView {
-  /** Whether there is anything to show at all. */
+  /**
+   * Whether there is a plan to read.
+   *
+   * True from the moment a hypothesis exists, which is deliberately earlier
+   * than an executable plan: what the GOAT believes, what it needs and what it
+   * would do are one object, and a panel that says "no plan yet" while the agent
+   * is holding a view hides the only thing the user came to read.
+   */
   exists: boolean;
   market?: string;
-  /** The hypothesis in one phrase. */
+  /** The direction the plan leans, in one phrase. */
   direction?: string;
-  /** The thesis statement: what the GOAT believes. */
+  /** What the GOAT believes could happen. */
   idea?: string;
   status: PlanStatus;
   statusLabel: string;
+  /**
+   * What the plan still needs before it can act, when there is a plan.
+   *
+   * A plan with no requirement met is not "nearly there" — it is waiting for
+   * something specific, and naming it is what turns a status word into an
+   * answer.
+   */
+  awaiting?: string[];
 
   /**
    * The plan in one sentence, written as a conditional objective.
@@ -202,7 +217,7 @@ function statusFor(mission: GoatMission): PlanStatus {
 }
 
 const STATUS_LABELS: Record<PlanStatus, string> = {
-  BUILDING: 'Building',
+  BUILDING: 'Forming',
   RESEARCHING: 'Researching',
   VALIDATING: 'Validating',
   WAITING: 'Waiting',
@@ -264,6 +279,20 @@ function lower(value: string): string {
   return value.length > 0 ? value[0].toLowerCase() + value.slice(1) : value;
 }
 
+/**
+ * The consequence a direction implies, in the reader's own terms.
+ *
+ * "buy" and "sell" rather than "LONG"/"SHORT" because this sentence is prose,
+ * and a NEUTRAL direction gets no verb at all — a GOAT that has not taken a side
+ * has not promised anything, and a plan that implied otherwise would be
+ * promising on its behalf.
+ */
+function directionAction(direction: Thesis['direction']): string | undefined {
+  if (direction === 'BULLISH') return 'buy';
+  if (direction === 'BEARISH') return 'sell';
+  return undefined;
+}
+
 function isInvalidated(thesis: Thesis): boolean {
   return thesis.state === 'INVALIDATED' || thesis.state === 'ABANDONED' || thesis.state === 'COMPLETED';
 }
@@ -296,9 +325,19 @@ export function buildPlanView(mission: GoatMission): PlanView {
     };
   })();
 
+  /*
+   * What the plan says it will do, available before it is executable.
+   *
+   * The consequence is part of a plan from the moment the plan exists, and
+   * leaving it out until the risk layer has approved something meant the
+   * sentence ended in "then act on it" — which tells a reader nothing about the
+   * one decision they came for. A recorded direction is enough to state the
+   * consequence honestly, and NEUTRAL is stated as the absence of one rather
+   * than dressed up as a side.
+   */
   const action = mission.tradePlan
     ? `${mission.tradePlan.direction} ${mission.tradePlan.orderType.toLowerCase()}`
-    : undefined;
+    : directionAction(thesis?.direction);
   const objective = conditionalObjective({
     market: mission.market,
     ...(thesis?.direction ? { direction: thesis.direction.toLowerCase() } : {}),
@@ -307,9 +346,12 @@ export function buildPlanView(mission: GoatMission): PlanView {
     ...(action ? { action } : {}),
   });
 
+  const awaiting = research.filter((item) => item.state === 'pending').map((item) => item.label);
+
   return {
     exists: thesis !== undefined || mission.tradePlan !== undefined,
     ...(objective ? { objective } : {}),
+    ...(awaiting.length > 0 ? { awaiting: awaiting.slice(0, 3) } : {}),
     market: mission.market,
     ...(thesis?.direction ? { direction: thesis.direction.toLowerCase() } : {}),
     ...(thesis ? { idea: thesis.statement } : {}),

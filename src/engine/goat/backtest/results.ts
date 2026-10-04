@@ -143,24 +143,20 @@ export function summarisePerformance(trades: Trade[], initialBalance: number, eq
 export function summariseBehaviour(
   events: AgentTimelineEvent[],
   bounds: { startAt: number; endAt: number },
+  options: { modelLatencyMs?: number } = {},
 ): BacktestBehaviour {
   const scoped = events.filter((event) => event.timestamp >= bounds.startAt && event.timestamp <= bounds.endAt);
 
   let modelCalls = 0;
   let modelFailures = 0;
-  let modelLatencyMs = 0;
 
   for (const event of scoped) {
     switch (event.type) {
       case 'MODEL_REQUEST':
         modelCalls += 1;
         break;
-      case 'MODEL_RESPONSE':
-        modelLatencyMs += elapsedOf(event.data);
-        break;
       case 'MODEL_FAILURE':
         modelFailures += 1;
-        modelLatencyMs += elapsedOf(event.data);
         break;
       default:
         break;
@@ -204,7 +200,13 @@ export function summariseBehaviour(
     waits: countOf(scoped, 'GOAT_WAITING'),
     modelCalls,
     modelFailures,
-    modelLatencyMs: Math.round(modelLatencyMs),
+    /*
+     * Latency comes from the runtime's own measurement rather than from this
+     * log, because the log deliberately does not carry a line per call: the
+     * number is interesting in aggregate, and only the runtime knows how long
+     * each request really took.
+     */
+    modelLatencyMs: Math.round(options.modelLatencyMs ?? 0),
     simulatedMinutes: Math.max(0, Math.round((bounds.endAt - bounds.startAt) / 60_000)),
     longestSilenceMinutes: Math.round(longestSilenceMinutes),
   };
@@ -212,12 +214,6 @@ export function summariseBehaviour(
 
 function countOf(events: AgentTimelineEvent[], type: AgentTimelineEvent['type']): number {
   return events.filter((event) => event.type === type).length;
-}
-
-function elapsedOf(data: unknown): number {
-  if (typeof data !== 'object' || data === null) return 0;
-  const value = (data as { elapsedMs?: unknown }).elapsedMs;
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
 function round2(value: number): number {

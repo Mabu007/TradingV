@@ -55,7 +55,17 @@ import {
   isSimulationSpeed,
   type SimulationSpeed,
 } from './clock';
-import { SimulationEnvironment, timeframeSeconds } from './simulationEnvironment';
+import {
+  SimulationEnvironment,
+  SIMULATION_BASE_TIMEFRAME,
+  timeframeSeconds as baseSeconds,
+} from './simulationEnvironment';
+import {
+  TIMEFRAME_ROLE_LABELS,
+  resolveTimeframePlan,
+  timeframesInStatement,
+  type TimeframePlan,
+} from '../timeframes';
 import { summariseBehaviour, summarisePerformance, type BacktestReport } from './results';
 
 /**
@@ -107,8 +117,30 @@ export interface BacktestRequest {
   goal: string;
   name?: string;
   market: string;
-  /** The setup resolution. The agent chooses its own context resolutions. */
+  /**
+   * The setup resolution.
+   *
+   * Optional, and not the same thing as the GOAT's working set: this is the one
+   * resolution the replay acts on, and the set below is what it may read.
+   */
   timeframe?: string;
+  /**
+   * Every resolution this GOAT may read.
+   *
+   * Inherited from the GOAT being replayed, so "scalp on 1m and 5m" is replayed
+   * on 1m and 5m rather than quietly becoming a 15m backtest. Omitted, the
+   * setup resolution plus its nearest neighbours is used — never a fixed
+   * default the GOAT did not ask for.
+   */
+  timeframes?: string[];
+  /**
+   * The resolution the historical data is at, when it is known.
+   *
+   * Passed through rather than assumed, because it is the provider's answer and
+   * not the product's: a venue that will not serve 1m candles for a year can
+   * still serve 5m, and pretending otherwise would fail at load time.
+   */
+  baseTimeframe?: string;
   /** Historical instant the replay begins at, epoch ms. */
   start: number;
   /** Historical instant the replay ends at, epoch ms. */
@@ -140,6 +172,31 @@ export interface BacktestRequest {
   costModel?: BacktestCostModel;
 }
 
+/**
+ * What the data source could actually give.
+ *
+ * Reported rather than assumed, because the honest answer to "backtest three
+ * years" is sometimes "the source has one year". A replay that silently used
+ * the year it was given, without saying so, would be a result about a different
+ * period than the one that was asked for.
+ */
+export interface BacktestHistory {
+  /** The window the request asked for, epoch ms. */
+  requestedStart: number;
+  requestedEnd: number;
+  /** The window the dataset actually covers. */
+  availableStart?: number;
+  availableEnd?: number;
+  /** Bars the dataset holds, at the replay's resolution. */
+  bars: number;
+  /** The resolution the data is at. The finest thing the replay can read. */
+  resolution: string;
+  /** Resolutions this replay cannot serve, and why. */
+  unsupported: string[];
+  /** What was asked for that the source could not provide, in words. */
+  note?: string;
+}
+
 export interface BacktestSnapshot {
   state: BacktestState;
   /** The simulated instant, epoch ms. */
@@ -152,6 +209,16 @@ export interface BacktestSnapshot {
   simulatedMinutes: number;
   /** Fraction of the dataset revealed, [0,1]. */
   progress: number;
+  /**
+   * True while the GOAT is mid-decision and the replay is holding for it.
+   *
+   * The replay's market does not advance while a request is outstanding. That
+   * is the whole determinism story: an agent reasoning about 10:43 must not be
+   * handed 10:44 by a fast clock, so the clock waits — and says that it is
+   * waiting rather than looking stalled.
+   */
+  agentBusy: boolean;
+  history?: BacktestHistory;
   goalId?: string;
   agentId?: string;
   mission?: GoatMission;
@@ -161,6 +228,12 @@ export interface BacktestSnapshot {
 
 export class BacktestSession {
   readonly market: string;
+  /**
+   * The resolution a replay acts on, once resolved.
+   *
+   * An alias of the plan's setup, kept as a field because the tracker
+   * deliveries need it before they have anything else to go on.
+   */
   readonly timeframe: string;
   /** Historical instant the replay begins at. The clock starts here. */
   readonly replayStart: number;
@@ -168,6 +241,15 @@ export class BacktestSession {
 
   private readonly request: BacktestRequest;
   private readonly clock: SimulationClock;
+  /**
+   * Which resolutions this replay reads, and what each is for.
+   *
+   * Resolved once, at construction, from the GOAT being replayed. Everything
+   * downstream — the deployment, the initial context, the tracker deliveries —
+   * reads this rather than re-deciding, so the replay and the GOAT's own idea
+   * of its working set cannot disagree.
+   */
+  private readonly plan: TimeframePlan;
   private readonly warmupMs: number;
   private readonly initialBalance: number;
   private readonly stores: GoatStores;
@@ -191,12 +273,37 @@ export class BacktestSession {
   constructor(request: BacktestRequest) {
     this.request = request;
     this.market = request.market;
+    /*
+     * Kept as the fallback for deliveries when the GOAT has armed nothing: it
+     * is the plan's setup resolution once the plan is resolved below, and the
+     * setup resolution is the right thing to watch in the absence of a
+     * declared condition.
+     */
     this.timeframe = request.timeframe ?? '15m';
     this.replayStart = request.start;
     this.end = request.end;
     this.warmupMs = (request.warmupMinutes ?? DEFAULT_BACKTEST_WARMUP_MINUTES) * 60_000;
 
     this.initialBalance = request.costModel?.initialBalance ?? 10_000;
+
+    /*
+     * The working set.
+     *
+     * The declared set wins, and the objective's own words are unioned into it:
+     * a GOAT whose goal says "scalp on 1m and 5m" should be replayed on 1m and
+     * 5m even if its stored set was written before the user said so. Neither
+     * source can invent a resolution — both are limited to the supported set —
+     * and with neither, the setup resolution and its neighbours are used, which
+     * is a choice the GOAT can still widen at runtime.
+     */
+    const declared = [
+      ...(request.timeframes ?? []),
+      ...timeframesInStatement(request.goal),
+    ];
+    this.plan = resolveTimeframePlan({
+      declared,
+      setup: request.timeframe ?? declared[Math.floor(declared.length / 2)],
+    });
 
     this.clock = new SimulationClock({
       start: request.start,
@@ -269,6 +376,7 @@ export class BacktestSession {
       symbol: this.market,
       bars: loaded,
       initialBalance: this.initialBalance,
+      ...(this.request.baseTimeframe ? { baseTimeframe: this.request.baseTimeframe } : {}),
       ...(this.request.costModel?.spreadPrice !== undefined
         ? { spreadPrice: this.request.costModel.spreadPrice }
         : {}),
@@ -338,6 +446,14 @@ export class BacktestSession {
     const created = await this.orchestrator.createGoat({
       goal: this.request.goal.trim() || `Trade ${this.market}.`,
       ...(this.request.name?.trim() ? { name: this.request.name.trim() } : {}),
+      /*
+       * The GOAT's own skills, inherited.
+       *
+       * A skill is a capability grant: a GOAT replayed without its skills is a
+       * different agent with the same objective, and a comparison between the
+       * two would be meaningless. So the replay runs the GOAT the user is
+       * actually looking at, not a bare agent in a costume.
+       */
       ...(this.request.skillIds && this.request.skillIds.length > 0
         ? { skillIds: this.request.skillIds }
         : {}),
@@ -347,12 +463,43 @@ export class BacktestSession {
 
     this.record('BACKTEST_STARTED', {
       symbol: this.market,
-      timeframe: this.timeframe,
+      timeframe: this.plan.setup,
       range: `${new Date(this.replayStart).toISOString()} → ${new Date(this.end).toISOString()}`,
       candles: loaded.length,
       speed: this.clock.speed,
       environment: 'BACKTEST',
+      /*
+       * The working set and its roles, on the first line of the run.
+       *
+       * A reader who wants to know what this replay can see should not have to
+       * infer it from four market reads, and "1m entry timing, 5m setup" is a
+       * different claim from "1m, 5m".
+       */
+      timeframes: this.plan.reads
+        .map((read) => `${read.timeframe} ${TIMEFRAME_ROLE_LABELS[read.role]}`)
+        .join(', '),
+      chosenBy: this.plan.strategy === 'DECLARED' ? 'the GOAT' : 'the GOAT',
+      ...(this.request.skillIds && this.request.skillIds.length > 0
+        ? { skills: this.request.skillIds.length }
+        : {}),
     });
+
+    /*
+     * What the data source could actually give.
+     *
+     * Recorded only when it differs from the request. A replay that silently
+     * covered a different period than the one that was asked for would report
+     * results about that period, and nothing in the log would say so.
+     */
+    const history = this.history();
+    if (history.note) {
+      this.record('BACKTEST_STARTED', {
+        symbol: this.market,
+        resolution: history.resolution,
+        note: history.note,
+        message: history.note,
+      });
+    }
 
     /*
      * DEMO rather than SHADOW.
@@ -367,7 +514,8 @@ export class BacktestSession {
     this.orchestrator.deployGoat({
       goalId: created.goal.id,
       market: this.market,
-      timeframe: this.timeframe,
+      timeframe: this.plan.setup,
+      timeframes: this.plan.reads.map((read) => read.timeframe),
       mode: 'DEMO',
       accountId: 'simulation',
     });
@@ -609,7 +757,7 @@ export class BacktestSession {
     for (const tracker of this.trackers.listForAgent(this.agentId)) {
       if (tracker.lifecycle.status === 'ACTIVE' && tracker.timeframe) timeframes.add(tracker.timeframe);
     }
-    if (timeframes.size === 0) timeframes.add(this.timeframe);
+    if (timeframes.size === 0) timeframes.add(this.plan.setup);
 
     for (const timeframe of timeframes) {
       const bars = await this.environment.getMarketBars(this.market, timeframe, 200);
@@ -826,6 +974,7 @@ export class BacktestSession {
       ...(bar ? { price: bar.close } : {}),
       simulatedMinutes: Math.max(0, Math.round((now - this.replayStart) / 60_000)),
       progress: this.environment?.progress ?? 0,
+      agentBusy: this.isAgentBusy(),
       ...(this.goal ? { goalId: this.goal.id } : {}),
       ...(this.agentId ? { agentId: this.agentId } : {}),
       ...(this.goal && this.orchestrator ? { mission: this.orchestrator.mission(this.goal.id) ?? undefined } : {}),
@@ -855,6 +1004,83 @@ export class BacktestSession {
   /** Events the runtime wrote during this run, for behaviour analysis. */
   events(): AgentTimelineEvent[] {
     return this.agentRuntime.getTimelineStore().snapshotByGoat?.(this.agentId ?? '', 5000) ?? [];
+  }
+
+  /**
+   * Whether the replay is holding for the GOAT.
+   *
+   * Either a wake is being applied or a model request is outstanding. Both mean
+   * the market is deliberately not advancing, and both are worth saying: a clock
+   * that stops without explanation looks like a bug, and this one is a promise
+   * that the agent will not be shown a market it has already answered about.
+   */
+  private isAgentBusy(): boolean {
+    if (this.wakeInFlight > 0) return true;
+    // Any agent, not just the recorded one: during the first pass the goal is
+    // still being interpreted, so there is an id to ask about yet — and that
+    // window is exactly when the run is holding.
+    return this.orchestrator?.hasPendingModelRequest() === true;
+  }
+
+  /**
+   * What the data source could give, against what was asked for.
+   *
+   * The note is the important field. "You asked for three years and the source
+   * has one" is a sentence this product must be able to say, because the
+   * alternative — replaying a year and calling it three — is the failure mode
+   * every historical claim is prone to.
+   */
+  history(): BacktestHistory {
+    /*
+     * Readable before the replay starts.
+     *
+     * The dataset arrives with the request in the common case, and a surface
+     * wants to know what it got before it presses start — including whether the
+     * window it asked for is one the source can serve. Waiting for `start` to
+     * find that out would mean loading a year of candles to be told the source
+     * has a month.
+     */
+    const dataset = this.environment?.dataset() ?? this.request.bars ?? [];
+    const resolution = this.environment?.resolution ?? SIMULATION_BASE_TIMEFRAME;
+    const unsupported = this.plan.reads
+      .map((read) => read.timeframe)
+      .filter((timeframe) => this.environment ? !this.environment.supports(timeframe) : false);
+
+    const availableStart = dataset.length > 0 ? dataset[0].time * 1000 : undefined;
+    const availableEnd = dataset.length > 0
+      ? (dataset[dataset.length - 1].time + baseSeconds(this.environment?.resolution ?? resolution)) * 1000
+      : undefined;
+
+    const missingStart = availableStart !== undefined && availableStart > this.request.start + 60 * 60_000;
+    const missingEnd = availableEnd !== undefined && availableEnd < this.request.end - 60 * 60_000;
+
+    return {
+      requestedStart: this.request.start,
+      requestedEnd: this.request.end,
+      ...(availableStart !== undefined ? { availableStart } : {}),
+      ...(availableEnd !== undefined ? { availableEnd } : {}),
+      bars: dataset.length,
+      resolution,
+      unsupported,
+      ...(missingStart || missingEnd || unsupported.length > 0
+        ? {
+            note: [
+              missingStart ? `The source has nothing before ${new Date(availableStart ?? 0).toISOString().slice(0, 10)}.` : '',
+              missingEnd ? `The source has nothing after ${new Date(availableEnd ?? 0).toISOString().slice(0, 10)}.` : '',
+              unsupported.length > 0
+                ? `Unavailable at ${resolution}: ${unsupported.join(', ')}. Those resolutions are reported to the GOAT as missing rather than approximated.`
+                : '',
+            ]
+              .filter(Boolean)
+              .join(' '),
+          }
+        : {}),
+    };
+  }
+
+  /** Which resolutions this replay reads, and what each one is for. */
+  get timeframes(): TimeframePlan {
+    return this.plan;
   }
 
   /** The simulated market, for a test that needs to inspect the boundary. */

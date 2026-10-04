@@ -39,7 +39,11 @@ import type { Bar } from '../../../types/trading';
 import { GoatOrchestrator, createGoatStores } from '../orchestrator';
 import { BacktestSession } from './session';
 import { SimulationClock } from './clock';
-import { SimulationEnvironment, latestAtOrBefore } from './simulationEnvironment';
+import { SimulationEnvironment, latestAtOrBefore, timeframeSeconds } from './simulationEnvironment';
+import {
+  resolveTimeframePlan,
+  timeframesInStatement,
+} from '../timeframes';
 
 // ---------------------------------------------------------------------------
 // Assertions
@@ -174,6 +178,90 @@ function makeEnvironment(options: { dataset?: Bar[]; start?: number } = {}): {
   return { clock, environment, bars };
 }
 
+/**
+ * A model that asks for the resolution it is missing, then answers.
+ *
+ * The first pass answers with `requestTimeframes` and no thesis, which is the
+ * documented way for an agent to say "I cannot plan this from 15m alone". The
+ * runtime reads what was asked for and asks again — so the second answer is the
+ * one that produces a plan, and the log has to show both reads.
+ */
+/**
+ * A scalper's answer: a plan and two conditions on the resolution it declared.
+ *
+ * Deliberately at the declared resolution rather than the default 15m, because
+ * a GOAT that declared 1m and 5m and then armed a 15m condition would be
+ * refused — and the runtime says so rather than quietly accepting a watch on a
+ * resolution it will not evaluate.
+ */
+const SCALP_INVESTIGATION = JSON.stringify({
+  thought: 'The range is holding on 1m while 5m stays flat.',
+  thesis: {
+    statement: 'USD/JPY holds its 1m range inside a flat 5m structure.',
+    direction: 'BULLISH',
+    invalidation: 'A completed 1m close below the range low.',
+    requiredConfirmation: ['a new 1m bar', 'a reclaim of the 1m range high'],
+  },
+  trackers: [
+    { purpose: 'Watch for a new 1m bar', kind: 'NEW_BAR', config: {}, timeframe: '1m' },
+    { purpose: 'Detect price crossing 157.9', kind: 'PRICE_CROSS', config: { direction: 'ABOVE', level: 157.9 }, timeframe: '1m' },
+  ],
+});
+
+class ScalpModel implements IAgentModel {
+  calls = 0;
+
+  async run(request: { contract?: string }) {
+    this.calls += 1;
+    if (request.contract === 'INVESTIGATION') return normalizeModelReply(SCALP_INVESTIGATION);
+    if (request.contract === 'INTERPRETATION') {
+      return normalizeModelReply(
+        JSON.stringify({ thought: 'Scalp USD/JPY on 1m and 5m.', symbols: ['USD/JPY'], timeframes: ['1m', '5m'], investigationPlan: [], openQuestions: [], actionable: true }),
+      );
+    }
+    return normalizeModelReply(JSON.stringify({ kind: 'WAIT', reason: 'Not enough yet.' }));
+  }
+}
+
+class AcquiringModel extends ScriptedBacktestModel {
+  asked = 0;
+
+  async run(request: { contract?: string; instructions: string; wakeReason?: string }) {
+    if (request.contract === 'INVESTIGATION' && this.asked === 0) {
+      this.asked += 1;
+      this.calls += 1;
+      return normalizeModelReply(JSON.stringify({ requestTimeframes: ['1h'] }));
+    }
+    return super.run(request);
+  }
+}
+
+/**
+ * A model that holds its reply until the test lets it go.
+ *
+ * The replay's determinism claim is about the interval in which a request is
+ * outstanding, so the test needs that interval to exist rather than to be
+ * measured in milliseconds of luck.
+ */
+class GatedModel implements IAgentModel {
+  private release?: () => void;
+  private readonly answered = new Promise<void>((resolve) => {
+    this.release = resolve;
+  });
+
+  async run(request: { contract?: string; instructions: string; wakeReason?: string }) {
+    if (request.contract === 'INVESTIGATION' || request.contract === 'INTERPRETATION') {
+      await this.answered;
+      return normalizeModelReply(INVESTIGATION);
+    }
+    return normalizeModelReply(JSON.stringify({ kind: 'WAIT', reason: 'Nothing yet.' }));
+  }
+
+  letGo(): void {
+    this.release?.();
+  }
+}
+
 interface Fixture {
   session: BacktestSession;
   clock: SimulationClock;
@@ -182,7 +270,16 @@ interface Fixture {
   model: ScriptedBacktestModel;
 }
 
-async function makeSession(options: { dataset?: Bar[]; market?: string } = {}): Promise<Fixture> {
+async function makeSession(options: {
+  dataset?: Bar[];
+  market?: string;
+  goal?: string;
+  timeframes?: string[];
+  timeframe?: string;
+  name?: string;
+  skillIds?: string[];
+  warmupMinutes?: number;
+} = {}): Promise<Fixture> {
   const bars = options.dataset ?? makeDataset();
   const market = options.market ?? 'USD/JPY';
   // The replay starts a third of the way in, so there is warm-up behind it.
@@ -191,10 +288,13 @@ async function makeSession(options: { dataset?: Bar[]; market?: string } = {}): 
   const model = new ScriptedBacktestModel();
 
   const session = new BacktestSession({
-    goal: 'Trade a USD/JPY range while the higher timeframe stays neutral.',
-    name: 'Range replay',
+    goal: options.goal ?? 'Trade a USD/JPY range while the higher timeframe stays neutral.',
+    name: options.name ?? 'Range replay',
     market,
-    timeframe: '15m',
+    ...(options.timeframe ? { timeframe: options.timeframe } : {}),
+    ...(options.timeframes ? { timeframes: options.timeframes } : {}),
+    ...(options.skillIds ? { skillIds: options.skillIds } : {}),
+    ...(options.warmupMinutes !== undefined ? { warmupMinutes: options.warmupMinutes } : {}),
     start,
     end: bars[bars.length - 1].time * 1000,
     bars,
@@ -715,6 +815,380 @@ test('facts: funding and open interest are read as of the simulated instant', as
     undefined,
     'a reading from the future is not a reading',
   );
+});
+
+// ---------------------------------------------------------------------------
+// Resolutions: 1m, 5m, and arbitrary supported combinations
+// ---------------------------------------------------------------------------
+
+test('timeframes: a scalper GOAT is replayed on 1m and 5m', async () => {
+  const { session } = await makeSession({
+    goal: 'Scalp USD/JPY on 1m and 5m while the higher context stays neutral.',
+    timeframes: ['1m', '5m'],
+    timeframe: '5m',
+  });
+
+  /*
+   * The declared set, honoured exactly.
+   *
+   * This is the regression that matters for scalping: a GOAT that said 1m and 5m
+   * used to be replayed as a 15m GOAT, which is not a slower version of the same
+   * agent — it is a different agent with the same objective.
+   */
+  const plan = session.timeframes;
+  assertEqual(plan.setup, '5m', 'the replay acts on the resolution the GOAT declared as its setup');
+  assertEqual(
+    plan.reads.map((read) => read.timeframe).join(','),
+    '1m,5m',
+    'and reads exactly the two it was given — no 15m nobody asked for',
+  );
+  assertEqual(plan.strategy, 'DECLARED', 'recorded as declared rather than chosen');
+  assertEqual(plan.reads[0].role, 'ENTRY', '1m is entry timing for a 5m setup');
+  assertEqual(plan.reads[1].role, 'SETUP', 'and 5m is the setup');
+
+  await session.start();
+  const reads = session.agentLog(500).filter((entry) => entry.type === 'MARKET_CONTEXT_LOADED');
+  assert(reads.length > 0, 'the replay read its declared resolutions');
+  for (const read of reads) {
+    assert(
+      /\b(1m|5m)\b/.test(`${read.detail ?? ''}`) && !/\b(15m|1h|4h)\b/.test(`${read.detail ?? ''}`),
+      `only the declared resolutions were read: ${read.detail}`,
+    );
+  }
+});
+
+test('timeframes: arbitrary supported combinations each mean something different', () => {
+  /*
+   * The setup is the middle of the declared set, and the roles follow from it:
+   * a scalper's 5m setup has entry timing below it, a swing GOAT's 4m setup has
+   * structure above it, and a GOAT given all six gets the hour as its setup with
+   * the day as its regime.
+   */
+  const cases: Array<{ declared: string[]; expect: Record<string, string> }> = [
+    { declared: ['1m', '5m'], expect: { '1m': 'ENTRY', '5m': 'SETUP' } },
+    { declared: ['5m', '15m', '1h'], expect: { '5m': 'CONFIRMATION', '15m': 'SETUP', '1h': 'STRUCTURE' } },
+    { declared: ['1h', '4h', '1d'], expect: { '1h': 'CONFIRMATION', '4h': 'SETUP', '1d': 'REGIME' } },
+    { declared: ['1m', '5m', '15m', '1h', '4h', '1d'], expect: { '1m': 'ENTRY', '1h': 'SETUP', '4h': 'STRUCTURE', '1d': 'REGIME' } },
+    { declared: ['15m', '1h', '4h'], expect: { '15m': 'CONFIRMATION', '1h': 'SETUP', '4h': 'STRUCTURE' } },
+  ];
+
+  for (const entry of cases) {
+    const plan = resolveTimeframePlan({ declared: entry.declared });
+    for (const [timeframe, role] of Object.entries(entry.expect)) {
+      const read = plan.reads.find((candidate) => candidate.timeframe === timeframe);
+      assert(read !== undefined, `${entry.declared.join('+')} reads ${timeframe}`);
+      assertEqual(read!.role, role, `${timeframe} on ${entry.declared.join('+')}`);
+      assert(read!.reason.length > 0, `and says why: ${timeframe}`);
+    }
+  }
+});
+
+test('timeframes: every supported resolution is readable and shares one clock', async () => {
+  /*
+   * The invariant behind every multi-resolution claim in the product.
+   *
+   * At one simulated instant, each resolution must report the newest candle that
+   * had actually closed — never a partial one, and never the same instant for
+   * two resolutions when their boundaries differ.
+   */
+  const bars = makeDataset({ count: 2_000 });
+  const { clock, environment } = makeEnvironment({ dataset: bars, start: bars[1_500].time * 1000 });
+
+  clock.advanceTo((bars[1_600].time + 60) * 1000);
+  const horizonSeconds = clock.now() / 1000;
+
+  for (const timeframe of ['1m', '5m', '15m', '30m', '1h', '4h', '1d'] as const) {
+    const seconds = timeframeSeconds(timeframe);
+    const barsFor = await environment.getMarketBars('USD/JPY', timeframe, 5);
+    for (const bar of barsFor) {
+      assert(
+        bar.time + seconds <= horizonSeconds,
+        `${timeframe} returned a candle closing at ${bar.time + seconds}, after the simulated ${horizonSeconds}`,
+      );
+    }
+    const newest = barsFor[barsFor.length - 1];
+    const gap = horizonSeconds - ((newest?.time ?? 0) + seconds);
+    assert(
+      gap >= 0 && gap < seconds,
+      `${timeframe} newest close is the one due at this instant (off by ${gap}s)`,
+    );
+  }
+});
+
+test('timeframes: a 1m tracker fires on 1m boundaries, not on the clock', async () => {
+  /*
+   * The regression the previous implementation found, kept honest at every
+   * resolution.
+   *
+   * A tracker delivery is stamped with the candle's own open time. Stamped with
+   * its close instead, the evaluator's bucket check puts the delivery in the
+   * *next* bucket, concludes there is no new bar, and the watch stays silent
+   * forever — which looks exactly like a GOAT ignoring its own condition.
+   */
+  const bars = makeDataset({ count: 1_500 });
+  const session = new BacktestSession({
+    goal: 'Scalp USD/JPY using 1m and 5m.',
+    market: 'USD/JPY',
+    timeframe: '1m',
+    timeframes: ['1m', '5m'],
+    start: bars[1_000].time * 1000,
+    end: bars[bars.length - 1].time * 1000,
+    bars,
+    model: new ScalpModel(),
+    speed: 1,
+    costModel: { initialBalance: 10_000, spreadPrice: 0.001, pipSize: 0.01 },
+  });
+  await session.start();
+
+  const mission = session.snapshot().mission;
+  assert(mission?.thesis !== undefined, 'the GOAT formed a Trade Plan');
+  assertEqual(
+    mission.activeTrackerCount > 0,
+    true,
+    'and armed at least one condition, on a resolution it actually reads',
+  );
+  assertEqual(mission.timeframes.join(','), '1m,5m', 'and reads exactly the resolutions it declared');
+
+  await session.advance(20 * 60_000);
+
+  const log = session.agentLog(500);
+  assert(
+    log.some((entry) => entry.type === 'TRACKER_FIRED'),
+    `a 1m watch fired inside twenty simulated minutes: ${log.slice(-8).map((entry) => entry.type).join(' → ')}`,
+  );
+});
+
+test('timeframes: the objective\'s own resolution list survives into the replay', async () => {
+  /*
+   * User intent, preserved.
+   *
+   * A GOAT whose objective says "scalp on 1m and 5m" is replayed on 1m and 5m
+   * even if its stored set was written before the sentence was. The parse is
+   * literal on purpose — only canonical resolution strings count — because
+   * expanding an adjective like "short-term" into resolutions would be the
+   * system inventing an intent nobody stated.
+   */
+  assertEqual(
+    timeframesInStatement('Scalp USD/JPY using 1m and 5m.').join(','),
+    '1m,5m',
+    'the resolutions the user wrote are found',
+  );
+  assertEqual(
+    timeframesInStatement('Analyze across 15m, 1h and 4h.').join(','),
+    '15m,1h,4h',
+    'and an arbitrary combination is preserved in order',
+  );
+  assertEqual(timeframesInStatement('Trade it.').length, 0, 'no resolutions means none are invented');
+  assertEqual(
+    timeframesInStatement('There were 1000 candles and 15 orders.').length,
+    0,
+    'a bare number is not a resolution',
+  );
+
+  const { session } = await makeSession({ goal: 'Scalp USD/JPY using 1m and 5m.' });
+  assertEqual(
+    session.timeframes.reads.map((read) => read.timeframe).join(','),
+    '1m,5m',
+    'and the replay reads them',
+  );
+});
+
+test('timeframes: what the GOAT cannot read is refused, never approximated', async () => {
+  /*
+   * A dataset that is not at 1m cannot answer a 1m question.
+   *
+   * The tempting alternative is to bucket 5m bars into 1m buckets, which
+   * manufactures a resolution the data does not contain — five identical
+   * candles per minute — and hands it to an agent as though it were observed.
+   */
+  const bars = makeDataset({ count: 200, startSeconds: 1_767_225_600 }).filter((_, index) => index % 5 === 0);
+  assert(bars.length > 20, 'the fixture produced a 5m dataset long enough to test with');
+  const clock = new SimulationClock({ start: bars[10].time * 1000, speed: 1 });
+  const environment = new SimulationEnvironment(clock, {
+    symbol: 'USD/JPY',
+    bars,
+    baseTimeframe: '5m',
+  });
+
+  assertEqual(environment.resolution, '5m', 'the dataset is at 5m');
+  assertEqual(environment.supports('1m'), false, 'so 1m cannot be read');
+  assertEqual(environment.supports('15m'), true, 'and 15m can, by aggregation');
+  assertEqual(
+    environment.supports('5m'),
+    true,
+    'and so can its own resolution',
+  );
+
+  let refused = false;
+  try {
+    await environment.getMarketBars('USD/JPY', '1m', 10);
+  } catch (error) {
+    refused = error instanceof Error && /cannot be read/.test(error.message);
+  }
+  assert(refused, 'and asking for 1m is refused with a reason rather than approximated');
+
+  const fifteen = await environment.getMarketBars('USD/JPY', '15m', 3);
+  assert(fifteen.length > 0, 'while the resolutions it does have are aggregated as usual');
+  for (const bar of fifteen) {
+    assert(bar.time + 900 <= clock.now() / 1000, 'still bounded by the clock');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Historical range, honestly
+// ---------------------------------------------------------------------------
+
+test('history: a window the source cannot cover is reported, not silently narrowed', async () => {
+  const bars = makeDataset({ count: 600 });
+  const { session } = await makeSession({ dataset: bars });
+
+  /*
+   * Asked for a period the dataset does not reach. The replay uses what it has,
+   * and says so — because a result about a window nobody chose is not a result
+   * about the question that was asked.
+   */
+  const history = session.history();
+  assertEqual(history.requestedStart > 0, true, 'the request is on the record, before the replay even starts');
+  assert(
+    history.availableStart !== undefined && history.availableEnd !== undefined,
+    'and so is what the source actually gave',
+  );
+  assertEqual(history.bars, bars.length, 'with the number of bars it really has');
+  assertEqual(history.resolution, '1m', 'and the resolution they are at');
+
+  const shortSession = new BacktestSession({
+    goal: 'Replay a period far longer than the data covers, across three years.',
+    market: 'USD/JPY',
+    start: bars[100].time * 1000,
+    end: (bars[bars.length - 1].time + 86_400 * 365 * 3) * 1000,
+    bars,
+    model: new ScriptedBacktestModel(),
+    speed: 1,
+  });
+  const honest = shortSession.history();
+  assert(
+    honest.note !== undefined && /source has nothing after/.test(honest.note),
+    `a three-year request against an hour of data is called out: ${honest.note}`,
+  );
+});
+
+test('history: a long range never becomes a long prompt', async () => {
+  /*
+   * The dataset can be enormous; the agent's context cannot.
+   *
+   * This is the difference that matters at three years of 1m data: the replay
+   * holds the whole period, and every prompt is built from the bounded context
+   * the environment is willing to serve. If a prompt ever scaled with the
+   * dataset, this would be the assertion that caught it.
+   */
+  const bars = makeDataset({ count: 5_000 });
+  const { session, model } = await makeSession({ dataset: bars });
+  await session.start();
+
+  const prompts = model.requests.map((request) => request.instructions);
+  assert(prompts.length > 0, 'the model was asked something');
+  for (const prompt of prompts) {
+    assert(
+      prompt.length < 20_000,
+      `a prompt stays a prompt's length even with ${bars.length} bars of history: ${prompt.length} characters`,
+    );
+    assert(
+      !/\d{4}-\d{2}-\d{2}T/.test(prompt.split('\n').slice(0, 3).join('\n')),
+      'and carries no serialised dataset',
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Agentic acquisition and the busy clock
+// ---------------------------------------------------------------------------
+
+test('acquisition: a GOAT that needs another resolution asks, and the read is on the record', async () => {
+  /*
+   * The agent deciding what data it needs, rather than being handed a fixed set.
+   *
+   * The model answers a first pass by naming the resolution it is missing. The
+   * runtime reads it, records that it did, and asks again — which is the whole of
+   * dynamic acquisition, and it is bounded so one deployment cannot spend itself
+   * on data.
+   */
+  const bars = makeDataset({ count: 1_500 });
+  const model = new AcquiringModel();
+  const session = new BacktestSession({
+    goal: 'Trade USD/JPY while the higher timeframe stays neutral.',
+    market: 'USD/JPY',
+    timeframe: '15m',
+    timeframes: ['15m', '30m'],
+    start: bars[1_000].time * 1000,
+    end: bars[bars.length - 1].time * 1000,
+    bars,
+    model,
+    speed: 1,
+    costModel: { initialBalance: 10_000, spreadPrice: 0.001, pipSize: 0.01 },
+  });
+
+  await session.start();
+
+  assertEqual(model.asked, 1, 'the GOAT asked for the resolution it was missing');
+  assertEqual(model.calls >= 2, true, 'and was asked again once it had it');
+
+  const log = session.agentLog(500);
+  const loaded = log.filter((entry) => entry.type === 'MARKET_CONTEXT_LOADED');
+  assert(
+    loaded.some((entry) => /\b1h\b/.test(entry.detail ?? '') && /asked for this resolution/.test(entry.detail ?? '')),
+    `the acquired read is on the record, labelled as acquired: ${loaded
+      .map((entry) => entry.detail)
+      .join(' | ')}`,
+  );
+  assert(
+    log.some((entry) => entry.type === 'THESIS_FORMED'),
+    'and the plan was formed once the context was complete',
+  );
+});
+
+test('acquisition: the replay holds the clock while the GOAT decides', async () => {
+  /*
+   * Determinism is a promise about what the agent can see.
+   *
+   * The market does not advance while a request is outstanding: an agent
+   * reasoning about 10:43 must not be handed 10:44 by a fast clock. The snapshot
+   * says so while it happens, because a clock that stops without explanation
+   * looks like a fault.
+   */
+  const { session } = await makeSession();
+  await session.start();
+
+  const gate = new GatedModel();
+  const replay = new BacktestSession({
+    goal: 'Watch USD/JPY and act when the evidence supports one.',
+    market: 'USD/JPY',
+    timeframe: '15m',
+    start: session.snapshot().now,
+    end: session.snapshot().now + 6 * 60 * 60 * 1000,
+    bars: makeDataset({ count: 1_200 }),
+    model: gate,
+    speed: 30,
+    costModel: { initialBalance: 10_000, spreadPrice: 0.001, pipSize: 0.01 },
+  });
+  const starting = replay.start();
+
+  let busySeen = false;
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    if (replay.snapshot().agentBusy) busySeen = true;
+  }
+
+  assertEqual(busySeen, true, 'the snapshot reports that the GOAT is mid-decision');
+  gate.letGo();
+  await starting;
+  assertEqual(replay.snapshot().agentBusy, false, 'and clears once the answer lands');
+
+  /*
+   * Nothing moved while it was deciding. The clock is the same one the
+   * environment is read through, so a future candle cannot have been revealed.
+   */
+  const horizon = replay.simulation.horizon();
+  assert(horizon <= replay.simulatedClock.now(), 'and the data boundary held throughout');
 });
 
 // ---------------------------------------------------------------------------

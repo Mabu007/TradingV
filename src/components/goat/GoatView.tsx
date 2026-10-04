@@ -103,6 +103,14 @@ export const GoatView: React.FC<GoatViewProps> = ({
   const [creatingStarter, setCreatingStarter] = useState<string | undefined>();
   const [tab, setTab] = useState<Tab>('mine');
   const [revision, setRevision] = useState(0);
+  /**
+   * The GOAT a replay is about, when the replay was started from one.
+   *
+   * Held as a mission rather than a goal id so the surface can inherit the
+   * objective, the skills, the market and the resolutions without re-reading
+   * the orchestrator and hoping nothing changed in between.
+   */
+  const [backtestSeed, setBacktestSeed] = useState<GoatMission | undefined>();
 
   const busy = activity !== 'idle';
   const viewToken = useRef(0);
@@ -138,6 +146,23 @@ export const GoatView: React.FC<GoatViewProps> = ({
     setNotice(undefined);
     setEditing(undefined);
   }, []);
+
+  /**
+   * Replay this GOAT.
+   *
+   * The mental model is GOAT first: you open a GOAT, you press Backtest, and the
+   * replay inherits that GOAT rather than asking you to rebuild it. Nothing
+   * here prompts for a strategy, because there is no strategy to choose.
+   */
+  const backtestGoat = useCallback(
+    (mission: GoatMission) => {
+      setBacktestSeed(mission);
+      setError(undefined);
+      setNotice(undefined);
+      setScreen('backtest');
+    },
+    [],
+  );
 
   const openGoat = useCallback(
     (goalId: string) => {
@@ -630,7 +655,11 @@ export const GoatView: React.FC<GoatViewProps> = ({
         )}
 
         {screen === 'backtest' && (
-          <BacktestSurface markets={markets.length > 0 ? markets : ['EUR/USD']} onExit={goHome} />
+          <BacktestSurface
+            markets={markets.length > 0 ? markets : ['EUR/USD']}
+            {...(backtestSeed ? { seed: backtestSeed } : {})}
+            onExit={goHome}
+          />
         )}
 
         {mission && screen === 'deploy' && (
@@ -658,6 +687,7 @@ export const GoatView: React.FC<GoatViewProps> = ({
               onDismissError={() => setError(undefined)}
               onChanged={refresh}
               onDeploy={() => setScreen('deploy')}
+              onBacktest={() => backtestGoat(mission)}
               onArchive={() => void archive(mission.goalId)}
             />
           </>

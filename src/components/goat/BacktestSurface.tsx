@@ -35,9 +35,16 @@ import {
   SIMULATION_SPEEDS,
   formatSimulatedDate,
   formatSimulatedTime,
+  type BacktestHistory,
   type BacktestSnapshot,
   type SimulationSpeed,
 } from '../../engine/goat/backtest';
+import {
+  SUPPORTED_TIMEFRAMES,
+  resolveTimeframePlan,
+  type Timeframe,
+} from '../../engine/goat/timeframes';
+import type { GoatMission } from '../../engine/goat/mission';
 import { buildPlanView } from '../../engine/goat/planView';
 import type { AgentEventView } from '../../engine/goat/agentEvents';
 import { historicalMarketDataProvider } from '../../engine/backtester/historical';
@@ -48,13 +55,58 @@ import { TradePlanPanel } from './TradePlanPanel';
 /** How much history a replay covers by default: six hours of 1m bars. */
 const DEFAULT_WINDOW_HOURS = 6;
 
+/**
+ * One sentence saying what the replay will read.
+ *
+ * The roles are in it because "1m, 5m" and "1m entry timing, 5m setup" are
+ * different claims, and a user choosing between a scalp preset and a swing
+ * preset needs to know which one they are getting before they press start.
+ */
+function describePlan(preset: string, seed: GoatMission | undefined): string {
+  const workingSet = TIMEFRAME_PRESETS.find((option) => option.id === preset)?.timeframes ?? [];
+  const declared = workingSet.length > 0 ? workingSet : (seed?.timeframes ?? []);
+  const plan = resolveTimeframePlan({
+    declared,
+    ...(seed?.timeframe ? { setup: seed.timeframe } : {}),
+  });
+  const source =
+    workingSet.length > 0
+      ? 'you chose these'
+      : declared.length > 0
+        ? 'this GOAT declared these'
+        : 'nothing was declared, so the GOAT chooses';
+  return `${plan.summary}. ${source[0].toUpperCase()}${source.slice(1)}. Available: ${SUPPORTED_TIMEFRAMES.join(', ')}.`;
+}
+
 export interface BacktestSurfaceProps {
   /** Markets the user can replay. The first is offered as the default. */
   markets: string[];
+  /**
+   * The GOAT being replayed.
+   *
+   * Present when the replay was started from a GOAT's own page, which is the
+   * normal way in. Everything the GOAT is — its objective, its skills, its
+   * market, the resolutions it works across — is inherited rather than asked
+   * for again, because a user pressing "backtest this GOAT" is answering one
+   * question about one GOAT and should not be handed a form.
+   */
+  seed?: GoatMission;
   /** Where history comes from. Injected so a demo or a test can supply its own. */
   loadBars?: (request: { market: string; start: number; end: number }) => Promise<Bar[]>;
   onExit: () => void;
 }
+
+/** How long the replay covers by default when started from a GOAT: two days. */
+const DEFAULT_SEED_WINDOW_HOURS = 48;
+
+/** Resolution presets offered as one click, rather than a picker to configure. */
+const TIMEFRAME_PRESETS: Array<{ id: string; label: string; timeframes: Timeframe[] }> = [
+  { id: 'declared', label: 'THE GOAT OWN', timeframes: [] },
+  { id: 'scalp', label: 'SCALP 1m·5m', timeframes: ['1m', '5m'] },
+  { id: 'intraday', label: '5m·15m·1h', timeframes: ['5m', '15m', '1h'] },
+  { id: 'swing', label: '15m·1h·4h', timeframes: ['15m', '1h', '4h'] },
+  { id: 'position', label: '4h·1d', timeframes: ['4h', '1d'] },
+];
 
 /**
  * A window that has already happened, rounded to whole minutes.
@@ -65,10 +117,10 @@ export interface BacktestSurfaceProps {
  * minute is still forming, and a replay that began inside it would be
  * replaying an unfinished candle.
  */
-function defaultWindow(now = Date.now()): { start: number; end: number } {
+function defaultWindow(now = Date.now(), hours = DEFAULT_WINDOW_HOURS): { start: number; end: number } {
   const minute = 60_000;
   const end = Math.floor(now / minute) * minute - minute;
-  return { start: end - DEFAULT_WINDOW_HOURS * 60 * minute, end };
+  return { start: end - hours * 60 * minute, end };
 }
 
 /** `datetime-local` wants a local wall-clock string, not an epoch. */
@@ -85,17 +137,38 @@ function fromLocalInput(value: string): number {
 
 export const BacktestSurface: React.FC<BacktestSurfaceProps> = ({
   markets,
+  seed,
   loadBars,
   onExit,
 }) => {
-  const initial = useMemo(() => defaultWindow(), []);
-  const [market, setMarket] = useState(markets[0] ?? 'EUR/USD');
-  const [goal, setGoal] = useState(
-    'Watch this market and form a hypothesis, then act when the evidence supports one.',
-  );
+  /*
+   * Defaults from the GOAT, not from the form.
+   *
+   * A replay started from a GOAT's page inherits that GOAT's market, objective,
+   * name and working resolutions, and offers only the three things that genuinely
+   * cannot be inherited: the historical window, the speed, and — when the user
+   * wants to override it — the resolutions. Everything else about it is the GOAT.
+   */
+  const seedTimeframes = seed?.timeframes ?? [];
+  const initial = useMemo(() => {
+    if (!seed) return defaultWindow();
+    // A longer default for a GOAT that trades on a coarser resolution: replaying
+    // six hours of 4h bars is three candles.
+    const hours = seedTimeframes.some((timeframe) => ['1h', '4h', '1d'].includes(timeframe))
+      ? DEFAULT_WINDOW_HOURS * 24
+      : DEFAULT_WINDOW_HOURS;
+    return defaultWindow(Date.now(), hours);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seed?.goalId]);
+
+  const [market, setMarket] = useState(seed?.market ?? markets[0] ?? 'EUR/USD');
+  const [goal, setGoal] = useState(seed?.goal ?? 'Watch this market and act when the evidence supports one.');
+  const [name, setName] = useState(seed?.name ?? '');
   const [from, setFrom] = useState(toLocalInput(initial.start));
   const [to, setTo] = useState(toLocalInput(initial.end));
   const [speed, setSpeed] = useState<SimulationSpeed>(10);
+  const [preset, setPreset] = useState('declared');
+  const [history, setHistory] = useState<BacktestHistory | undefined>();
 
   const [session, setSession] = useState<BacktestSession | undefined>();
   const [snapshot, setSnapshot] = useState<BacktestSnapshot | undefined>();
@@ -170,10 +243,19 @@ export const BacktestSurface: React.FC<BacktestSurfaceProps> = ({
       if (!startAt || !endAt || endAt <= startAt) {
         throw new Error('Choose a historical window that ends after it starts.');
       }
+      const workingSet = TIMEFRAME_PRESETS.find((option) => option.id === preset)?.timeframes ?? [];
+      const plan = resolveTimeframePlan({
+        declared: workingSet.length > 0 ? workingSet : (seed?.timeframes ?? []),
+        ...(seed?.timeframe ? { setup: seed.timeframe } : {}),
+      });
+
       const next = new BacktestSession({
         goal,
         market,
-        timeframe: '15m',
+        timeframe: plan.setup,
+        timeframes: plan.reads.map((read) => read.timeframe),
+        ...(name.trim() ? { name: name.trim() } : {}),
+        ...(seed ? { skillIds: seed.skillIds } : {}),
         start: startAt,
         end: endAt,
         speed,
@@ -188,6 +270,7 @@ export const BacktestSurface: React.FC<BacktestSurfaceProps> = ({
         costModel: { initialBalance: 10_000, spreadPrice: 0.001, pipSize: 0.01 },
       });
       setSession(next);
+      setHistory(next.history());
       /*
        * Into the workspace immediately, and only then start.
        *
@@ -235,6 +318,11 @@ export const BacktestSurface: React.FC<BacktestSurfaceProps> = ({
               BACKTEST
             </span>
             <span className="font-mono text-[13px] text-ink">{session?.market ?? market}</span>
+            {(seed?.name || name) && (
+              <span className="truncate text-[11px] text-ink-3" data-testid="backtest-goat-name">
+                {seed?.name || name}
+              </span>
+            )}
           </div>
 
           {session && (
@@ -247,6 +335,12 @@ export const BacktestSurface: React.FC<BacktestSurfaceProps> = ({
                 {formatSimulatedTime(snapshot?.now ?? session.simulatedClock.now())}
               </span>
               <span className="text-ink-4">{session.simulatedClock.speedLabel}</span>
+              <span
+                className="hidden text-ink-4 sm:inline"
+                data-testid="backtest-resolutions"
+              >
+                {session.timeframes.summary}
+              </span>
             </div>
           )}
         </div>
@@ -399,8 +493,44 @@ export const BacktestSurface: React.FC<BacktestSurfaceProps> = ({
             </div>
           </div>
 
+          {/*
+            Timeframes, as presets rather than a picker.
+
+            The question a user has is "replay this GOAT the way it is" or
+            "replay it the way a scalper would", and a list of seven checkboxes
+            answers neither. The presets are the common sets; the GOAT's own
+            working set is the first of them and the default, because overriding
+            it should be a deliberate act.
+          */}
+          <div className="mt-3">
+            <span className="font-mono text-[9px] tracking-[0.18em] text-ink-4">TIMEFRAMES</span>
+            <div className="mt-1 flex flex-wrap gap-1.5">
+              {TIMEFRAME_PRESETS.map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  onClick={() => setPreset(option.id)}
+                  data-testid={`backtest-preset-${option.id}`}
+                  data-active={preset === option.id}
+                  className={`rounded-lg border px-2.5 py-1 font-mono text-[10px] transition-colors ${
+                    preset === option.id
+                      ? 'border-accent/50 bg-accent-soft/40 text-accent-ink'
+                      : 'border-line text-ink-3 hover:border-accent/40'
+                  }`}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+            <p className="mt-1.5 text-[10.5px] leading-relaxed text-ink-4" data-testid="backtest-timeframe-plan">
+              {describePlan(preset, seed)}
+            </p>
+          </div>
+
           <label className="mt-3 block">
-            <span className="font-mono text-[9px] tracking-[0.18em] text-ink-4">GOAL</span>
+            <span className="font-mono text-[9px] tracking-[0.18em] text-ink-4">
+              OBJECTIVE {seed ? '· INHERITED FROM THIS GOAT' : ''}
+            </span>
             <input
               value={goal}
               onChange={(event) => setGoal(event.target.value)}
@@ -408,6 +538,15 @@ export const BacktestSurface: React.FC<BacktestSurfaceProps> = ({
               className="mt-1 w-full rounded-lg border border-line bg-surface-2 px-3 py-2 text-[12px] text-ink outline-none focus:border-accent/50"
             />
           </label>
+
+          {seed && (
+            <p className="mt-2 text-[10.5px] leading-relaxed text-ink-4" data-testid="backtest-inherited">
+              Replaying <span className="text-ink-2">{seed.name || 'this GOAT'}</span>
+              {seed.skillIds.length > 0 ? ` · ${seed.skillIds.length} skills` : ''}
+              {seed.environment ? ` · ${seed.environment}` : ''}. Its objective, skills and market
+              are the GOAT&apos;s own; only the historical window and the speed are yours.
+            </p>
+          )}
 
           <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-line/60 pt-3">
             <p className="text-[10.5px] leading-relaxed text-ink-4">
@@ -437,7 +576,48 @@ export const BacktestSurface: React.FC<BacktestSurfaceProps> = ({
       {session && (
         <div className="grid gap-4 lg:grid-cols-[minmax(0,26rem)_minmax(0,1fr)] lg:items-start">
           <div className="space-y-4 lg:sticky lg:top-4">
-            {plan && <TradePlanPanel plan={plan} />}
+            {plan && (
+              <TradePlanPanel
+                plan={plan}
+                formingNote={mission?.activity.headline}
+              />
+            )}
+
+            {/*
+              The clock is holding for the GOAT.
+
+              The replay deliberately does not advance the market while a request
+              is outstanding — an agent reasoning about 10:43 must not be handed
+              10:44 — so the clock pausing is the mechanism, not a fault. Saying so
+              is the difference between a replay that looks stuck and one that
+              looks like it is waiting for its agent.
+            */}
+            {snapshot?.agentBusy && (
+              <p
+                className="rounded-2xl border border-accent/30 bg-accent-soft/20 px-4 py-3 text-[11px] leading-relaxed text-accent-ink"
+                data-testid="backtest-agent-busy"
+              >
+                The replay is holding while this GOAT decides. Historical time does not move during
+                a decision, so nothing it reasons about can be from the future.
+              </p>
+            )}
+
+            {/*
+              What the source could give, against what was asked for.
+              Rendered whenever the two differ, which is the only time it is
+              interesting: a replay that quietly used a different period than the
+              one requested would otherwise be reporting results about a window
+              nobody chose.
+            */}
+            {history?.note && (
+              <p
+                className="rounded-2xl border border-warn/40 bg-warn/[0.06] px-4 py-3 text-[11px] leading-relaxed text-warn"
+                data-testid="backtest-history-note"
+              >
+                {history.note}
+              </p>
+            )}
+
             {snapshot?.message && (
               <p className="rounded-2xl border border-line bg-surface px-4 py-3 text-[11px] leading-relaxed text-ink-3">
                 {snapshot.message}

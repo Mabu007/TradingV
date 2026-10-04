@@ -8,13 +8,18 @@
  * The states, and what each one is claiming:
  *
  *   ANALYZING  a real reasoning step is running right now      fast pulse
- *   MODEL      a model request is outstanding right now        fast pulse
+ *   MODEL      building or updating the Trade Plan right now    fast pulse
  *   ACTIVE     deployed, and something happened recently       slow pulse
  *   WATCHING   deployed, waiting for a meaningful event         dim pulse
  *   STALLED    deployed and running, but its last step failed   dim amber
  *   STOPPED    the operator stopped it                          static
  *   UNDEPLOYED saved, not pointed at a market                    static
  *   ERROR      the runtime is not running it                    static, red
+ *
+ * The model state is the one that pulses hardest, deliberately. It is the only
+ * state where the user is waiting on something they cannot see, and where the
+ * product's job is to say so without saying it repeatedly: the dot pulses for
+ * exactly as long as a request is outstanding, and the agent log stays quiet.
  *
  * MODEL and WATCHING are different facts and were once the same line.
  * A GOAT that has submitted a request and is waiting for it back is blocked
@@ -148,7 +153,14 @@ export function statusFor(mission: GoatMission, now: number): GoatStatus {
 
 const LABELS: Record<GoatStatus, string> = {
   ANALYZING: 'ANALYZING',
-  WAITING_FOR_MODEL: 'WAITING FOR MODEL',
+  /*
+   * A placeholder that is never rendered: the model state's label comes from
+   * `modelLabel`, which reads the runtime's own record of what the request is
+   * for. It is here so the map stays exhaustive over the status union, and a
+   * missing entry would be the alternative — a type that can be constructed but
+   * never described.
+   */
+  WAITING_FOR_MODEL: 'BUILDING TRADE PLAN',
   ACTIVE: 'ACTIVE',
   WATCHING: 'WATCHING',
   STALLED: 'STALLED',
@@ -169,10 +181,25 @@ const LABELS: Record<GoatStatus, string> = {
 const STALE_MS = 10 * 60_000;
 
 /** What each state means, for anyone who asks. Shown as a title, not as text. */
+/**
+ * The model's own words for which kind of thinking this is.
+ *
+ * "Building the Trade Plan" and "Updating the Trade Plan" are different states
+ * and collapsing them into one vague word is what the previous version did. The
+ * phase is a field on the runtime's pending request rather than something parsed
+ * back out of a sentence, because a status indicator that reads prose is a
+ * status indicator that will eventually misread it.
+ */
+function modelLabel(mission: GoatMission): string {
+  return mission.modelPending?.phase === 'UPDATING'
+    ? 'UPDATING TRADE PLAN'
+    : 'BUILDING TRADE PLAN';
+}
+
 const EXPLANATIONS: Record<GoatStatus, string> = {
   ANALYZING: 'A real reasoning step is running right now.',
   WAITING_FOR_MODEL:
-    'A request has been submitted to the model and has not come back. The GOAT is not watching the market and is not stuck; it is blocked on that reply.',
+    'A request has been submitted and has not come back. The GOAT is not watching the market and is not stuck; it is blocked on that answer.',
   ACTIVE: 'Deployed, and something happened recently.',
   WATCHING: 'Deployed and waiting for a condition to fire. Nothing to do is not a fault.',
   STALLED: 'Running, but its last recorded step failed. Check the agent log for what failed.',
@@ -229,20 +256,34 @@ export const GoatStatusIndicator: React.FC<GoatStatusIndicatorProps> = ({
   className = '',
 }) => {
   const status = statusFor(mission, now);
+  /*
+   * The label is a function of the state, and one state has a word of its own.
+   * `WAITING_FOR_MODEL` used to render as a phrase invented by the renderer;
+   * now it renders as what the agent is actually doing, taken from the runtime
+   * record that says a request is outstanding.
+   */
+  const label = status === 'WAITING_FOR_MODEL' ? modelLabel(mission) : LABELS[status];
+  const explanation = status === 'WAITING_FOR_MODEL'
+    ? `The GOAT is ${mission.modelPending?.intent ?? 'waiting on the model'}. The market is not being watched and nothing is stuck: it is blocked on that answer.`
+    : EXPLANATIONS[status];
   return (
     <span
       className={`inline-flex items-center gap-2 ${className}`}
-      title={EXPLANATIONS[status]}
+      title={explanation}
       data-status={status}
       data-testid="goat-status"
     >
       <span className={dotClass(status, live)} aria-hidden="true" />
       {withLabel && (
-        <span className="font-mono text-[10px] tracking-[0.14em] text-ink-2">
-          {LABELS[status]}
+        <span
+          className={`font-mono text-[10px] tracking-[0.14em] ${
+            status === 'WAITING_FOR_MODEL' ? 'text-accent-ink' : 'text-ink-2'
+          }`}
+        >
+          {label}
         </span>
       )}
-      <span className="sr-only">{EXPLANATIONS[status]}</span>
+      <span className="sr-only">{explanation}</span>
     </span>
   );
 };

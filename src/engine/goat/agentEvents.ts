@@ -122,18 +122,20 @@ const STYLE: Record<AgentTimelineEventType, AgentEventStyle> = {
 
   // --- waiting on the model, which is not waiting on the market ---------
   /*
-   * MODEL_REQUEST and MODEL_RESPONSE are the two ends of one real operation
-   * and are therefore both `important`: a reader scanning the log must see
-   * where the agent stopped doing anything of its own, and where it started
-   * again.
+   * One line, on the way out.
    *
-   * MODEL_WAITING is deliberately `normal`. It is the heartbeat of a request
-   * that is already announced, and a line that repeats every few seconds must
-   * not compete with the lines that changed something.
+   * There was a heartbeat here, one line every ten seconds for as long as the
+   * call took, and it was the wrong instinct. It was honest — a real elapsed
+   * time against a real pending request — and it still buried the events that
+   * changed something under a dozen identical ones. The waiting is now carried
+   * by the live status, which pulses for exactly as long as the request is
+   * outstanding; the log keeps the request and whatever it produced.
+   *
+   * `important` rather than `critical`: the reader must see where the agent
+   * stopped doing anything of its own, but the outcome line that follows is the
+   * one that decides what happened.
    */
   MODEL_REQUEST: { channel: 'MODEL', tone: 'info', weight: 'important', label: 'MODEL' },
-  MODEL_WAITING: { channel: 'MODEL', tone: 'neutral', weight: 'normal', label: 'MODEL' },
-  MODEL_RESPONSE: { channel: 'MODEL', tone: 'positive', weight: 'important', label: 'MODEL' },
   MODEL_RETRY: { channel: 'MODEL', tone: 'warning', weight: 'important', label: 'RETRY' },
 
   // --- the historical simulation ----------------------------------------
@@ -147,8 +149,18 @@ const STYLE: Record<AgentTimelineEventType, AgentEventStyle> = {
   BACKTEST_COMPLETED: { channel: 'BACKTEST', tone: 'positive', weight: 'important', label: 'BACKTEST' },
 
   // --- believing something ---------------------------------------------
-  THESIS_FORMED: { channel: 'ANALYSIS', tone: 'info', weight: 'important', label: 'THESIS' },
-  THESIS_REVISED: { channel: 'ANALYSIS', tone: 'info', weight: 'important', label: 'THESIS' },
+  /*
+   * The plan, not the belief behind it.
+   *
+   * This product has one user-facing concept for what a GOAT thinks might
+   * happen: the Trade Plan. What it believes, what must happen for it to be
+   * right and what it will do are one thing, said three ways. So the record
+   * that carries the plan is labelled and weighted as the plan — it is the
+   * centre of the product — and there is no separate "hypothesis" line beside
+   * it saying the same thing in another vocabulary.
+   */
+  THESIS_FORMED: { channel: 'PLAN', tone: 'info', weight: 'critical', label: 'TRADE PLAN' },
+  THESIS_REVISED: { channel: 'PLAN', tone: 'info', weight: 'important', label: 'TRADE PLAN UPDATED' },
   EVIDENCE_REQUIREMENTS_DEFINED: { channel: 'EVIDENCE', tone: 'neutral', weight: 'normal', label: 'EVIDENCE' },
   AGENT_EVIDENCE: { channel: 'EVIDENCE', tone: 'neutral', weight: 'normal', label: 'EVIDENCE' },
 
