@@ -21,6 +21,12 @@
  *   4. **Never yank the reader.** If they have scrolled up to read something,
  *      new events do not drag them back to the bottom; a quiet counter offers
  *      to.
+ *
+ * And one thing this log must be able to say about itself: the difference
+ * between *watching the market* and *waiting on the model*. Both are quiet, and
+ * collapsing them into one "WATCHING" state is what made a healthy deployment
+ * look abandoned. The header carries the difference, and it carries it only
+ * when the runtime says a request is outstanding.
  */
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
@@ -61,6 +67,23 @@ export interface AgentLogProps {
    */
   live: boolean;
   watching: boolean;
+  /**
+   * True while the GOAT is blocked on a model request.
+   *
+   * A separate state rather than a flavour of `live`, because the reader's
+   * question changes with it: "is it working" versus "is it waiting on
+   * something it cannot control".
+   */
+  waitingForModel?: boolean;
+  /**
+   * The word shown when events are arriving.
+   *
+   * Overridable because "LIVE" is a claim, not a mood. In a historical replay
+   * events are arriving just as fast, and a log that says LIVE while the clock
+   * says January is the one piece of copy that could make a user believe money
+   * was involved.
+   */
+  liveLabel?: string;
   /** Wall clock, injected so the pulse and the copy are deterministic in tests. */
   now: number;
   /** Called when the reader asks to see an artefact a line points at. */
@@ -81,6 +104,8 @@ export const AgentLog: React.FC<AgentLogProps> = ({
   entries,
   live,
   watching,
+  waitingForModel = false,
+  liveLabel = 'LIVE',
   now,
   onOpenArtifact,
   className = '',
@@ -158,13 +183,17 @@ export const AgentLog: React.FC<AgentLogProps> = ({
     setMissed(0);
   }, []);
 
+  const state = waitingForModel ? 'MODEL' : live ? liveLabel : watching ? 'WATCHING' : 'QUIET';
+
   const headline = entries.length === 0
     ? 'Nothing recorded yet.'
-    : live
-      ? 'Events arriving'
-      : watching
-        ? 'Watching — no new qualifying event'
-        : 'Quiet';
+    : waitingForModel
+      ? 'Waiting on the model — market context prepared and submitted'
+      : live
+        ? 'Events arriving'
+        : watching
+          ? 'Watching — no new qualifying event'
+          : 'Quiet';
 
   return (
     <section
@@ -176,20 +205,26 @@ export const AgentLog: React.FC<AgentLogProps> = ({
         <span
           className="inline-flex items-center gap-2 font-mono text-[10px] tracking-[0.14em]"
           data-testid="agent-log-state"
-          data-state={live ? 'LIVE' : watching ? 'WATCHING' : 'QUIET'}
+          data-state={state}
         >
           <span
             className={`h-1.5 w-1.5 rounded-full ${
-              live
-                ? 'bg-pos animate-goat-pulse'
-                : watching
-                  ? 'bg-pos/40 animate-goat-pulse-dim'
-                  : 'bg-ink-4/70'
+              waitingForModel
+                ? 'bg-accent animate-goat-pulse-fast'
+                : live
+                  ? 'bg-pos animate-goat-pulse'
+                  : watching
+                    ? 'bg-pos/40 animate-goat-pulse-dim'
+                    : 'bg-ink-4/70'
             }`}
             aria-hidden="true"
           />
-          <span className={live ? 'text-pos' : watching ? 'text-ink-3' : 'text-ink-4'}>
-            {live ? 'LIVE' : watching ? 'WATCHING' : 'QUIET'}
+          <span
+            className={
+              waitingForModel ? 'text-accent-ink' : live ? 'text-pos' : watching ? 'text-ink-3' : 'text-ink-4'
+            }
+          >
+            {state}
           </span>
         </span>
       </header>

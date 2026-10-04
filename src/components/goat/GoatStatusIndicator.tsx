@@ -8,12 +8,20 @@
  * The states, and what each one is claiming:
  *
  *   ANALYZING  a real reasoning step is running right now      fast pulse
+ *   MODEL      a model request is outstanding right now        fast pulse
  *   ACTIVE     deployed, and something happened recently       slow pulse
  *   WATCHING   deployed, waiting for a meaningful event         dim pulse
  *   STALLED    deployed and running, but its last step failed   dim amber
  *   STOPPED    the operator stopped it                          static
  *   UNDEPLOYED saved, not pointed at a market                    static
  *   ERROR      the runtime is not running it                    static, red
+ *
+ * MODEL and WATCHING are different facts and were once the same line.
+ * A GOAT that has submitted a request and is waiting for it back is blocked
+ * on an external dependency: it has finished everything it can do on its own.
+ * Rendering that as WATCHING told a user that a deployed agent had nothing to
+ * do while it was, in fact, mid-request — which is the single most misleading
+ * thing this indicator said.
  *
  * The distinction that matters most is WATCHING versus ERROR. A GOAT that is
  * waiting has done its job and is now idle; a GOAT that is broken has stopped
@@ -29,6 +37,7 @@ import type { GoatMission } from '../../engine/goat/mission';
 
 export type GoatStatus =
   | 'ANALYZING'
+  | 'WAITING_FOR_MODEL'
   | 'ACTIVE'
   | 'WATCHING'
   | 'STALLED'
@@ -38,6 +47,25 @@ export type GoatStatus =
 
 /** How long after the last real event a GOAT still counts as recently active. */
 const ACTIVE_WINDOW_MS = 45_000;
+
+/**
+ * Records that mean the GOAT is doing setup work right now.
+ *
+ * The gap this closes: between "deployed" and "the model request went out"
+ * there is a real interval — choosing resolutions, pulling candles, running the
+ * indicator tools — and it used to render as WATCHING. "Deployed and waiting for
+ * a condition to fire" while the agent is three tools into reading the market is
+ * the same class of lie as the model window was, just a shorter one.
+ *
+ * Time-bounded by the same window as "recently active": work that finished a
+ * minute ago is not work in progress, and a GOAT that read the market and then
+ * went quiet is watching, whatever it read last.
+ */
+const SETUP_WORK_EVENTS: ReadonlySet<string> = new Set([
+  'GOAT_SETTING_UP',
+  'MARKET_CONTEXT_LOADED',
+  'MARKET_CONTEXT_PREPARED',
+]);
 
 /**
  * Derive the status from real state.
@@ -60,6 +88,14 @@ export function statusFor(mission: GoatMission, now: number): GoatStatus {
    * runtime actually recorded, so this cannot be true unless something
    * genuinely fired.
    */
+  /*
+   * A model request that is outstanding, checked before anything derived from
+   * recency. It is a fact the runtime owns rather than a window the surface
+   * guesses at, so it cannot expire into the wrong answer: either a request is
+   * in flight or it is not.
+   */
+  if (mission.modelPending) return 'WAITING_FOR_MODEL';
+
   if (mission.lastWakeAt !== undefined && now - mission.lastWakeAt < 8_000) {
     return mission.stage === 'RE_EVALUATING' ? 'ANALYZING' : 'ACTIVE';
   }
@@ -87,6 +123,23 @@ export function statusFor(mission: GoatMission, now: number): GoatStatus {
   const recentlyActive =
     mission.lastWakeAt !== undefined && now - mission.lastWakeAt < ACTIVE_WINDOW_MS;
   if (recentlyActive) return 'ACTIVE';
+
+  /*
+   * Setup in progress.
+   *
+   * Read from the newest record rather than from a flag: if the last thing the
+   * runtime wrote was a market read, the GOAT was reading the market a moment
+   * ago and is not waiting for anything. Anything else means this window has
+   * closed and the honest answer is the one below.
+   */
+  if (
+    mission.lastEvent &&
+    SETUP_WORK_EVENTS.has(mission.lastEvent.type) &&
+    now - mission.lastEvent.at < ACTIVE_WINDOW_MS
+  ) {
+    return 'ANALYZING';
+  }
+
   if (mission.activeTrackerCount > 0) return 'WATCHING';
   if (mission.updatedAt !== undefined && now - mission.updatedAt < ACTIVE_WINDOW_MS) return 'ACTIVE';
 
@@ -95,6 +148,7 @@ export function statusFor(mission: GoatMission, now: number): GoatStatus {
 
 const LABELS: Record<GoatStatus, string> = {
   ANALYZING: 'ANALYZING',
+  WAITING_FOR_MODEL: 'WAITING FOR MODEL',
   ACTIVE: 'ACTIVE',
   WATCHING: 'WATCHING',
   STALLED: 'STALLED',
@@ -117,6 +171,8 @@ const STALE_MS = 10 * 60_000;
 /** What each state means, for anyone who asks. Shown as a title, not as text. */
 const EXPLANATIONS: Record<GoatStatus, string> = {
   ANALYZING: 'A real reasoning step is running right now.',
+  WAITING_FOR_MODEL:
+    'A request has been submitted to the model and has not come back. The GOAT is not watching the market and is not stuck; it is blocked on that reply.',
   ACTIVE: 'Deployed, and something happened recently.',
   WATCHING: 'Deployed and waiting for a condition to fire. Nothing to do is not a fault.',
   STALLED: 'Running, but its last recorded step failed. Check the agent log for what failed.',
@@ -130,6 +186,10 @@ function dotClass(status: GoatStatus, live: boolean): string {
   const base = 'h-2 w-2 rounded-full shrink-0';
   switch (status) {
     case 'ANALYZING':
+    case 'WAITING_FOR_MODEL':
+      // Accent rather than green: something is genuinely in flight, but it is
+      // waiting on something outside this process, and a healthy green dot
+      // would imply the agent itself is doing the work.
       return `${base} bg-accent ${live ? 'animate-goat-pulse-fast' : ''}`;
     case 'ACTIVE':
       return `${base} bg-pos ${live ? 'animate-goat-pulse' : ''}`;

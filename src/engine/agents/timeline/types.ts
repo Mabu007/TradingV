@@ -31,6 +31,28 @@ export type AgentTimelineEventType =
   | 'GOAT_STOPPED'
   | 'GOAT_STEERED'
   /*
+   * A GOAT began building its initial market context.
+   *
+   * Deployment used to end with a single "deployed" line and then a silence
+   * that lasted as long as the model took: reads, research and the request
+   * itself were all real work and none of them were recorded. This is the
+   * line that says setup has begun, so the silence after it is a read rather
+   * than a mystery. Written by the runtime immediately before the first
+   * market read of a pass.
+   */
+  | 'GOAT_SETTING_UP'
+  /*
+   * The context a model request is being built from is finished.
+   *
+   * Distinct from `MARKET_CONTEXT_LOADED`, which is one resolution read. This
+   * is the end of the deterministic research pass: every tool has run, the
+   * observation exists, and the request is about to be submitted. It is the
+   * boundary between "the GOAT is reading the market" and "the GOAT is
+   * blocked on an external dependency", which is the distinction a reader
+   * cannot make when both states render as WATCHING.
+   */
+  | 'MARKET_CONTEXT_PREPARED'
+  /*
    * The agent was told to reconsider, and is doing it.
    *
    * Separate from the steering that caused it on purpose. "User asked the GOAT
@@ -75,7 +97,55 @@ export type AgentTimelineEventType =
   | 'TRADE_PLAN_RISK_CHECKED'
   | 'TRADE_PLAN_REJECTED'
   | 'SHADOW_EXECUTION'
-  | 'MODEL_FAILURE';
+  | 'MODEL_FAILURE'
+  /*
+   * The model request has been submitted.
+   *
+   * The whole point of the MODEL channel. A GOAT that reads three timeframes
+   * and then goes quiet for ten seconds is not watching the market, and a log
+   * that says WATCHING during that window is lying about the agent's state.
+   * This line is written with what was actually submitted — symbol,
+   * resolutions, the indicator values the context carried — so the reader can
+   * see what the model was given and when the waiting started.
+   */
+  | 'MODEL_REQUEST'
+  /*
+   * The request is still outstanding.
+   *
+   * Honest latency, measured against a real elapsed time, emitted only while
+   * the request is genuinely pending and never more often than
+   * `MODEL_WAIT_HEARTBEAT_MS`. Deliberately not a filler: there is no "still
+   * thinking" fiction here, only an unfinished promise the reader was already
+   * told about.
+   */
+  | 'MODEL_WAITING'
+  /*
+   * The model answered.
+   *
+   * Written whatever the answer was — a hypothesis, a plan, or an unreadable
+   * reply — because "it replied and that is all it said" is information, and
+   * an agent log that only records successes hides the turns that found
+   * nothing.
+   */
+  | 'MODEL_RESPONSE'
+  /*
+   * A bounded retry was scheduled after a failure.
+   *
+   * Pairs with the failure it follows. Emitted only when a retry timer was
+   * actually armed, so the line is a claim the runtime keeps.
+   */
+  | 'MODEL_RETRY'
+  /*
+   * The agentic backtest lifecycle.
+   *
+   * Four types, no more: a simulation has a start, a clock, a stop and an
+   * end, and every internal step of a replay reuses the GOAT log's own event
+   * projection rather than inventing a second vocabulary for itself.
+   */
+  | 'BACKTEST_STARTED'
+  | 'BACKTEST_TICK'
+  | 'BACKTEST_STOPPED'
+  | 'BACKTEST_COMPLETED';
 
 export interface AgentTimelineEvent {
   id: string;

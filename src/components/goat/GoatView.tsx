@@ -5,6 +5,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  History,
   Loader2,
   Plus,
   Rocket,
@@ -18,6 +19,7 @@ import { MyGoatCard } from './MyGoatCard';
 import { GoatWorkspace } from './GoatWorkspace';
 import { WorkPlan } from './WorkPlan';
 import { SkillsSurface } from './SkillsSurface';
+import { BacktestSurface } from './BacktestSurface';
 import type { GoatOrchestrator } from '../../engine/goat/orchestrator';
 import type { GoatMission } from '../../engine/goat/mission';
 import type { Goal } from '../../engine/goat/types';
@@ -56,17 +58,22 @@ export interface GoatViewProps {
 /**
  * Where the user is.
  *
- * 'home'    Live GOATs first, then MY GOATs | EXPLORE GOATs.
- * 'create'  write a goal
- * 'review'  what was created, what it will do, and the two real choices
- * 'deploy'  choose the market it runs on
- * 'detail'  one GOAT: what it is doing, what it believes, what it watches
+ * 'home'      Live GOATs first, then MY GOATs | EXPLORE GOATs.
+ * 'create'    write a goal
+ * 'review'    what was created, what it will do, and the two real choices
+ * 'deploy'    choose the market it runs on
+ * 'detail'    one GOAT: what it is doing, what it believes, what it watches
+ * 'backtest'  the same GOAT, in a historical world
  *
  * Every step has a way back, and the GOAT it was working on is still there
  * on return. Losing a GOAT to a dead end is the failure this ordering
  * exists to prevent.
+ *
+ * 'backtest' is an *environment* rather than a separate product, which is why
+ * it is a screen on the GOAT list and not a tab of its own: the same agent, the
+ * same surfaces, a different clock and a different market.
  */
-type Screen = 'home' | 'create' | 'review' | 'deploy' | 'detail';
+type Screen = 'home' | 'create' | 'review' | 'deploy' | 'detail' | 'backtest';
 
 /**
  * The three things a person can be looking at from the GOATs screen.
@@ -420,12 +427,35 @@ export const GoatView: React.FC<GoatViewProps> = ({
 
         {screen === 'home' && (
           <>
-            <header>
-              <h1 className="text-xl font-bold tracking-tight text-ink">GOATs</h1>
-              <p className="mt-1 text-[11px] leading-relaxed text-ink-3">
-                You give a GOAT a goal. It works out what it needs to know, watches the market,
-                gathers evidence, and produces a trade plan when the evidence supports one.
-              </p>
+            <header className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h1 className="text-xl font-bold tracking-tight text-ink">GOATs</h1>
+                <p className="mt-1 max-w-prose text-[11px] leading-relaxed text-ink-3">
+                  You give a GOAT a goal. It works out what it needs to know, watches the market,
+                  gathers evidence, and produces a trade plan when the evidence supports one.
+                </p>
+              </div>
+              {/*
+                One entry point, in the place someone already is.
+
+                A backtest here is the same GOAT in another environment rather
+                than a separate product, so it belongs beside the list of GOATs
+                and not in a tab of its own. It opens the agentic workspace
+                directly — pressing START puts you in the log, not in a wizard.
+              */}
+              <button
+                type="button"
+                onClick={() => {
+                  setError(undefined);
+                  setNotice(undefined);
+                  setScreen('backtest');
+                }}
+                data-testid="open-backtest"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-line px-3 py-2 text-[11px] font-semibold text-ink-2 transition-colors hover:border-accent/50 hover:text-ink"
+              >
+                <History className="h-3.5 w-3.5" aria-hidden="true" />
+                Backtest a GOAT
+              </button>
             </header>
 
             {/*
@@ -597,6 +627,10 @@ export const GoatView: React.FC<GoatViewProps> = ({
             onReadAgain={() => void readAgain()}
             onOpenAISettings={onOpenAISettings}
           />
+        )}
+
+        {screen === 'backtest' && (
+          <BacktestSurface markets={markets.length > 0 ? markets : ['EUR/USD']} onExit={goHome} />
         )}
 
         {mission && screen === 'deploy' && (

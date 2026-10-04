@@ -26,6 +26,7 @@
     "test:audit": "bun src/engine/agents/trackers/auditRegressionTests.ts",
     "test:hardening": "bun src/engine/goat/releaseHardeningTests.ts",
     "test:surface": "bun src/engine/goat/agentSurfaceTests.ts",
+    "test:backtest": "bun src/engine/goat/backtest/tests.ts",
     "watcher:dev": "cd watchers && npx wrangler dev --local",
     "watcher:test": "cd watchers && npm test",
     "watcher:test:runtime": "cd watchers && npm run test:runtime",

@@ -1,0 +1,737 @@
+/**
+ * The simulated market.
+ *
+ * This is the whole of the backtest's safety story, and it is deliberately
+ * one file with no dependency on any venue adapter. A backtest reads history
+ * and fills simulated orders; it cannot reach an exchange because it has
+ * nothing to reach through.
+ *
+ * The information boundary
+ * -----------------------
+ *
+ * Every read in this file is filtered by one rule:
+ *
+ *     a bar is visible only when it has CLOSED at or before the clock's now
+ *
+ * Not "at or before" the bar's open time — its *close*. A 15m candle that runs
+ * from 10:30 to 10:45 is not a fact at 10:37; it is a forecast. Handing it to
+ * the agent is look-ahead bias in its purest form, and it is the single
+ * mistake that makes a backtest worth nothing.
+ *
+ * Enforcing it here rather than in the agent is the point. Every indicator,
+ * every structure read, every support level and every prompt in this system is
+ * derived from `visibleBars()`. RSI at 10:37 is computed from candles that all
+ * closed before 10:37, not from a series computed once over the whole dataset
+ * and then indexed — which is how a "look-ahead-free" backtest still leaks the
+ * future through an indicator's warm-up window.
+ *
+ * Aggregation follows the same rule one level up: a 15m candle exists only
+ * once all fifteen of its 1m bars have closed. There is no partial higher
+ * timeframe anywhere in this file, because a partial candle is a future value
+ * wearing a completed candle's clothes.
+ *
+ * Execution
+ * ---------
+ *
+ * Orders fill against the visible close plus a modelled spread and slippage,
+ * and open positions are evaluated as each new base bar completes. Every
+ * execution event carries `simulated: true`, because a reader of a log full of
+ * "BUY" lines has no other way to know it was not real money.
+ */
+
+import type { Bar, OrderResult, Position, Trade } from '../../../types/trading';
+import type { InstrumentMetadata } from '../../../types/instruments';
+import type { NormalizedQuote } from '../../../types/quotes';
+import type {
+  ITradingEnvironment,
+  MarketFacts,
+  TradingEnvironmentMode,
+} from '../../agents/types';
+import type { ExecutionRejection } from '../../execution/errors';
+import type { SimulationClock } from './clock';
+
+/** Resolution of the replay itself. One minute is the base everything derives from. */
+export const SIMULATION_BASE_TIMEFRAME = '1m';
+
+const TIMEFRAME_SECONDS: Readonly<Record<string, number>> = {
+  '1m': 60,
+  '5m': 300,
+  '15m': 900,
+  '30m': 1800,
+  '1h': 3600,
+  '4h': 14400,
+  '1d': 86400,
+};
+
+/** What a timeframe means, in seconds. Rejects anything it cannot express. */
+export function timeframeSeconds(timeframe: string): number {
+  const seconds = TIMEFRAME_SECONDS[timeframe];
+  if (!seconds) throw new Error(`A simulation cannot read ${timeframe}: unsupported timeframe.`);
+  return seconds;
+}
+
+/**
+ * A point-in-time venue fact.
+ *
+ * Keyed by the instant the reading was published, so answering "what was the
+ * funding rate at 10:37" is a lookup with a boundary rather than a guess about
+ * which record was current.
+ */
+export interface SimulationFact {
+  /** Epoch seconds the reading was taken. */
+  time: number;
+  value: number;
+}
+
+export interface SimulationMarketConfig {
+  symbol: string;
+  /**
+   * The dataset, ascending and non-overlapping, at the base resolution.
+   *
+   * The simulator may hold the entire future — it is the world. Nothing else
+   * in the system ever sees it: the agent is served by `visibleBars`, which
+   * stops at the clock.
+   */
+  bars: Bar[];
+  /** Hourly funding readings, if the dataset carries them. */
+  funding?: SimulationFact[];
+  /** Open-interest readings, if the dataset carries them. */
+  openInterest?: SimulationFact[];
+  initialBalance?: number;
+  /** Spread as a raw price distance. Modelled, not a venue fee. */
+  spreadPrice?: number;
+  /** Slippage as a raw price distance. */
+  slippagePrice?: number;
+  commissionPerLot?: number;
+  lotSize?: number;
+  pricePrecision?: number;
+  leverage?: number;
+  /** Pip size, when the instrument has one. Used only to phrase results in pips. */
+  pipSize?: number;
+  instruments?: InstrumentMetadata[];
+}
+
+export interface SimulatedOrderResult {
+  success: boolean;
+  positionId?: string;
+  fillPrice?: number;
+  error?: string;
+  rejection?: ExecutionRejection;
+  /** Always true here. There is no other kind of order in this file. */
+  simulated?: boolean;
+}
+
+/**
+ * The market, as of the simulation clock.
+ *
+ * Implements the same `ITradingEnvironment` the live GOAT runs through, which
+ * is what makes "the same runtime in a different environment" true rather than
+ * aspirational: the agent runtime, the tracker runtime, the capabilities and
+ * the GOAT loop all hold this object exactly as they hold the venue one, and
+ * none of them can tell the difference.
+ */
+export class SimulationEnvironment implements ITradingEnvironment {
+  public readonly mode: TradingEnvironmentMode = 'BACKTEST';
+
+  private readonly clock: SimulationClock;
+  private readonly symbol: string;
+  private readonly bars: Bar[];
+  private readonly baseSeconds: number;
+  private readonly initialBalance: number;
+
+  private readonly spreadPrice: number;
+  private readonly slippagePrice: number;
+  private readonly commissionPerLot: number;
+  private readonly lotSize: number;
+  private readonly leverage: number;
+  private readonly pricePrecision: number;
+  private readonly pipSize: number | undefined;
+  private readonly instruments: InstrumentMetadata[];
+  private readonly funding: SimulationFact[];
+  private readonly openInterest: SimulationFact[];
+
+  private balance: number;
+  private maxEquitySeen: number;
+  private readonly positions = new Map<string, Position>();
+  private readonly trades: Trade[] = [];
+  private nextPositionId = 0;
+  private nextTradeId = 0;
+  /**
+   * Index of the first bar that is still in the future.
+   *
+   * Monotonic, because the clock only moves forwards, so this is a cursor
+   * rather than a search: a replay of a day of 1m data costs one pass over the
+   * dataset no matter how many times the agent reads it.
+   */
+  private visibleCount = 0;
+  private readonly volumeBearing: boolean;
+
+  constructor(clock: SimulationClock, config: SimulationMarketConfig) {
+    this.clock = clock;
+    this.symbol = config.symbol;
+    this.baseSeconds = timeframeSeconds(SIMULATION_BASE_TIMEFRAME);
+
+    if (!Array.isArray(config.bars) || config.bars.length === 0) {
+      throw new Error('A simulation needs historical bars. There is nothing to replay.');
+    }
+    this.bars = validateDataset(config.bars);
+    this.volumeBearing = this.bars.some((bar) => typeof bar.volume === 'number' && Number.isFinite(bar.volume));
+
+    this.balance = config.initialBalance ?? 10_000;
+    this.initialBalance = this.balance;
+    this.maxEquitySeen = this.balance;
+    this.spreadPrice = config.spreadPrice ?? 0;
+    this.slippagePrice = config.slippagePrice ?? 0;
+    this.commissionPerLot = config.commissionPerLot ?? 3.5;
+    this.lotSize = config.lotSize ?? 100_000;
+    this.leverage = config.leverage ?? 100;
+    this.pricePrecision = config.pricePrecision ?? 5;
+    this.pipSize = typeof config.pipSize === 'number' && config.pipSize > 0 ? config.pipSize : undefined;
+    this.instruments = config.instruments ?? [defaultInstrument(config.symbol, this.pricePrecision)];
+    this.funding = [...(config.funding ?? [])].sort((a, b) => a.time - b.time);
+    this.openInterest = [...(config.openInterest ?? [])].sort((a, b) => a.time - b.time);
+
+    /*
+     * The clock may already be past the start of the dataset, so the cursor is
+     * advanced once here rather than assuming a fresh simulation always begins
+     * at the first bar.
+     */
+    this.catchUpTo(clock.now());
+  }
+
+  // -------------------------------------------------------------------------
+  // The boundary
+  // -------------------------------------------------------------------------
+
+  /** The last instant any bar in this simulation may have closed. */
+  private horizonSeconds(): number {
+    return Math.floor(this.clock.now() / 1000);
+  }
+
+  /** Advance the visibility cursor to the clock. Never moves backwards. */
+  private catchUpTo(instant: number): void {
+    const horizon = Math.floor(instant / 1000);
+    while (this.visibleCount < this.bars.length) {
+      const bar = this.bars[this.visibleCount];
+      if (bar.time + this.baseSeconds > horizon) break;
+      this.visibleCount += 1;
+    }
+  }
+
+  /**
+   * Every bar the agent is allowed to see.
+   *
+   * The single choke point for the whole information boundary. Anything not
+   * sliced by this method is not reachable by the agent at all, which is why
+   * there is no other place in this file that indexes `this.bars` directly for
+   * a read.
+   */
+  private visibleBars(): Bar[] {
+    this.catchUpTo(this.clock.now());
+    return this.bars.slice(0, this.visibleCount);
+  }
+
+  /**
+   * The most recent visible bar.
+   *
+   * Its close is the simulation's price. There is no partial bar: the
+   * simulation's world advances on bar boundaries, so "now" always means "the
+   * close of the last candle that has finished".
+   */
+  currentBar(): Bar | undefined {
+    const visible = this.visibleBars();
+    return visible[visible.length - 1];
+  }
+
+  /**
+   * The newest instant the agent may observe.
+   *
+   * Exposed so a test can assert the boundary from the outside rather than
+   * inferring it from behaviour.
+   */
+  horizon(): number {
+    const bar = this.currentBar();
+    return bar ? (bar.time + this.baseSeconds) * 1000 : this.clock.now();
+  }
+
+  /** True when the replay has consumed the whole dataset. */
+  get exhausted(): boolean {
+    return this.barsConsumed() >= this.bars.length;
+  }
+
+  /** How much of the dataset has been revealed so far, [0,1]. */
+  get progress(): number {
+    this.catchUpTo(this.clock.now());
+    return this.bars.length === 0 ? 1 : this.visibleCount / this.bars.length;
+  }
+
+  /** Base bars consumed so far. A one-minute tick consumes one. */
+  barsConsumed(): number {
+    this.catchUpTo(this.clock.now());
+    return this.visibleCount;
+  }
+
+  /** The whole dataset, for the simulator's own use. Never handed to the agent. */
+  dataset(): Bar[] {
+    return [...this.bars];
+  }
+
+  // -------------------------------------------------------------------------
+  // Market data
+  // -------------------------------------------------------------------------
+
+  async getMarketQuote(symbol: string): Promise<NormalizedQuote> {
+    this.assertSymbol(symbol);
+    const bar = this.currentBar();
+    if (!bar) throw new Error('No bar has closed yet in this simulation.');
+    const mid = bar.close;
+    const half = this.spreadPrice / 2;
+    return {
+      symbol,
+      symbolId: '0',
+      bid: this.round(mid - half),
+      ask: this.round(mid + half),
+      spread: this.spreadPrice,
+      timestamp: (bar.time + this.baseSeconds) * 1000,
+      status: 'MOCK',
+    };
+  }
+
+  /**
+   * Candles for a timeframe, aggregated from the visible base bars.
+   *
+   * `timeframe` is aggregated rather than fetched, which is what makes the
+   * multi-timeframe case work at the replay's own resolution: at 10:37 a 15m
+   * read returns the candle that closed at 10:30 and stops, because the one
+   * that closes at 10:45 has fifteen minutes of unrevealed price in it.
+   */
+  async getMarketBars(symbol: string, timeframe: string, count: number): Promise<Bar[]> {
+    this.assertSymbol(symbol);
+    if (!Number.isInteger(count) || count <= 0) throw new Error('Bar count must be a positive integer.');
+    const seconds = timeframeSeconds(timeframe);
+    const visible = this.visibleBars();
+    if (visible.length === 0) return [];
+
+    if (seconds === this.baseSeconds) return visible.slice(Math.max(0, visible.length - count));
+
+    const aggregated: Bar[] = [];
+    const horizon = Math.floor(this.clock.now() / 1000);
+    let bucketStart: number | undefined;
+    let bucket: Bar | undefined;
+
+    /*
+     * A bucket is only a candle once every one of its minutes has closed.
+     *
+     * The last bucket in the loop is the one that matters, and dropping it is
+     * not a detail: at 10:37 the 10:30 bucket has seven minutes of price in it
+     * that the agent is not entitled to see, and returning it as a completed
+     * candle is look-ahead bias wearing the same shape as a real one. Caught by
+     * the boundary test that exists to catch exactly this.
+     */
+    const flush = (): void => {
+      if (bucket && bucketStart !== undefined && bucketStart + seconds <= horizon) {
+        aggregated.push(bucket);
+      }
+      bucket = undefined;
+      bucketStart = undefined;
+    };
+
+    for (const bar of visible) {
+      const start = Math.floor(bar.time / seconds) * seconds;
+      if (bucketStart === undefined || start !== bucketStart) {
+        flush();
+        bucketStart = start;
+        bucket = { time: start, open: bar.open, high: bar.high, low: bar.low, close: bar.close, ...(bar.volume !== undefined ? { volume: 0 } : {}) };
+      }
+      if (!bucket) continue;
+      bucket.high = Math.max(bucket.high, bar.high);
+      bucket.low = Math.min(bucket.low, bar.low);
+      bucket.close = bar.close;
+      if (bar.volume !== undefined) bucket.volume = (bucket.volume ?? 0) + bar.volume;
+    }
+    flush();
+
+    return aggregated.slice(Math.max(0, aggregated.length - count));
+  }
+
+  /**
+   * Funding, open interest and volume, as of the simulation clock.
+   *
+   * Every field is read at or before `now` or omitted. A replay that answered
+   * with the dataset's last funding print would be handing the agent an
+   * outcome: funding is published for a window that has already happened, and
+   * the agent would be reasoning with it before it existed.
+   *
+   * A missing fact is reported as missing, with the reason. The alternative —
+   * a plausible zero — is how a GOAT ends up building a thesis on a
+   * liquidity assumption nobody measured.
+   */
+  async getMarketContext(symbol: string): Promise<MarketFacts> {
+    this.assertSymbol(symbol);
+    const horizon = Math.floor(this.clock.now() / 1000);
+    const unavailable: string[] = [];
+
+    const funding = latestAtOrBefore(this.funding, horizon);
+    if (funding === undefined) {
+      unavailable.push('This dataset publishes no funding rate.');
+    }
+
+    const interest = latestAtOrBefore(this.openInterest, horizon);
+
+    const visible = this.visibleBars();
+    let volume: number | undefined;
+    if (this.volumeBearing) {
+      const since = horizon - 86_400;
+      volume = visible
+        .filter((bar) => bar.time >= since)
+        .reduce((sum, bar) => sum + (bar.volume ?? 0), 0);
+    } else {
+      unavailable.push('This dataset publishes no volume.');
+    }
+
+    return {
+      symbol,
+      ...(funding !== undefined
+        ? { fundingRate: funding.value, fundingIntervalHours: 1 }
+        : {}),
+      ...(interest !== undefined ? { openInterest: interest.value } : {}),
+      ...(volume !== undefined ? { dayVolume: volume } : {}),
+      ...(unavailable.length > 0 ? { unavailable } : {}),
+      /*
+       * Where the reading came from, including when. A GOAT shown a funding
+       * rate should be able to see it is a replayed reading rather than a live
+       * one, and this is the only place that fact exists.
+       */
+      source: `Historical replay as of ${new Date(this.clock.now()).toISOString()}`,
+    };
+  }
+
+  async getInstruments(): Promise<InstrumentMetadata[]> {
+    return this.instruments;
+  }
+
+  // -------------------------------------------------------------------------
+  // Account
+  // -------------------------------------------------------------------------
+
+  async getAccountState() {
+    const unrealized = this.unrealized();
+    const equity = this.balance + unrealized;
+    const margin = [...this.positions.values()].reduce(
+      (sum, position) => sum + (Math.abs(position.volume) * position.currentPrice) / this.leverage,
+      0,
+    );
+    const drawdown = this.maxEquitySeen > 0 ? ((this.maxEquitySeen - equity) / this.maxEquitySeen) * 100 : 0;
+    return {
+      balance: this.round2(this.balance),
+      equity: this.round2(equity),
+      margin: this.round2(margin),
+      freeMargin: this.round2(Math.max(0, equity - margin)),
+      dailyPnL: this.round2(equity - this.initialBalance),
+      drawdownPercent: this.round2(drawdown),
+    };
+  }
+
+  async getPositions(symbol?: string): Promise<Position[]> {
+    const all = [...this.positions.values()];
+    return symbol ? all.filter((position) => position.symbol === symbol) : all;
+  }
+
+  async getOrders(): Promise<OrderResult[]> {
+    return [];
+  }
+
+  // -------------------------------------------------------------------------
+  // Simulated execution
+  // -------------------------------------------------------------------------
+
+  /**
+   * Fill an order against the simulated book.
+   *
+   * There is no adapter, no signer and no network path anywhere in this class,
+   * so a backtest cannot reach live execution — not because a flag says so, but
+   * because there is nothing to call. The `mode` assertion is belt and braces,
+   * kept because a subclass that overrode `mode` to `'LIVE'` would otherwise be
+   * indistinguishable from a real environment at the interface level.
+   */
+  async placeMarketOrder(params: {
+    symbol: string;
+    side: 'BUY' | 'SELL';
+    volume: number;
+    stopLoss?: number;
+    takeProfit?: number;
+    comment?: string;
+  }): Promise<SimulatedOrderResult> {
+    if (this.mode !== 'BACKTEST') {
+      throw new Error('The simulated market refuses to act as anything but a simulation.');
+    }
+    this.assertSymbol(params.symbol);
+    if (!Number.isFinite(params.volume) || params.volume <= 0) {
+      return { success: false, error: 'Volume must be positive.', simulated: true };
+    }
+    const bar = this.currentBar();
+    if (!bar) return { success: false, error: 'No bar has closed yet in this simulation.', simulated: true };
+
+    const fillPrice = params.side === 'BUY'
+      ? bar.close + this.spreadPrice / 2 + this.slippagePrice
+      : bar.close - this.spreadPrice / 2 - this.slippagePrice;
+
+    const positionId = `sim_pos_${this.nextPositionId++}`;
+    const commission = this.commissionPerLot * (Math.abs(params.volume) / this.lotSize);
+    const position: Position = {
+      id: positionId,
+      symbol: params.symbol,
+      side: params.side,
+      volume: params.volume,
+      entryPrice: this.round(fillPrice),
+      currentPrice: bar.close,
+      stopLoss: params.stopLoss,
+      takeProfit: params.takeProfit,
+      unrealizedPnL: 0,
+      unrealizedPnlPercent: 0,
+      timestamp: (bar.time + this.baseSeconds) * 1000,
+      commission,
+      goatName: params.comment,
+    };
+
+    this.balance -= commission;
+    this.positions.set(positionId, position);
+    if (this.balance + this.unrealized() > this.maxEquitySeen) {
+      this.maxEquitySeen = this.balance + this.unrealized();
+    }
+
+    return { success: true, positionId, fillPrice: position.entryPrice, simulated: true };
+  }
+
+  async modifyPosition(positionId: string, changes: { stopLoss?: number; takeProfit?: number }) {
+    const position = this.positions.get(positionId);
+    if (!position) return { success: false, error: 'Position not found' };
+    if (changes.stopLoss !== undefined) position.stopLoss = changes.stopLoss;
+    if (changes.takeProfit !== undefined) position.takeProfit = changes.takeProfit;
+    this.positions.set(positionId, position);
+    return { success: true };
+  }
+
+  async closePosition(
+    positionId: string,
+    volumeToClose?: number,
+  ): Promise<{ success: boolean; pnl?: number; error?: string; rejection?: ExecutionRejection }> {
+    const position = this.positions.get(positionId);
+    if (!position) return { success: false, error: 'Position not found' };
+    if (volumeToClose !== undefined && (!Number.isFinite(volumeToClose) || volumeToClose <= 0 || volumeToClose > position.volume)) {
+      return { success: false, error: 'Close volume must be positive and not exceed the open position volume.' };
+    }
+    const bar = this.currentBar();
+    if (!bar) return { success: false, error: 'No bar has closed yet in this simulation.' };
+
+    const exitPrice = position.side === 'BUY'
+      ? bar.close - this.spreadPrice / 2 - this.slippagePrice
+      : bar.close + this.spreadPrice / 2 + this.slippagePrice;
+    const volume = volumeToClose !== undefined && volumeToClose < position.volume ? volumeToClose : position.volume;
+    const pnl = this.realise(position, volume, exitPrice, bar.time + this.baseSeconds, 'MANUAL');
+    return { success: true, pnl };
+  }
+
+  /**
+   * Move open positions to the newest visible close.
+   *
+   * Called once per replayed base bar, never with a bar the agent could not
+   * have seen, and evaluated against that bar's own high and low — so a stop
+   * is hit if the price reached it inside the bar, which is the only honest
+   * treatment of 1m data and the same one the live venue adapter applies to a
+   * candle.
+   */
+  settleOpenPositions(): void {
+    const bar = this.currentBar();
+    if (!bar) return;
+
+    for (const position of [...this.positions.values()]) {
+      const stopHit = position.side === 'BUY'
+        ? position.stopLoss !== undefined && bar.low <= position.stopLoss
+        : position.stopLoss !== undefined && bar.high >= position.stopLoss;
+      const targetHit = position.side === 'BUY'
+        ? position.takeProfit !== undefined && bar.high >= position.takeProfit
+        : position.takeProfit !== undefined && bar.low <= position.takeProfit;
+
+      if (stopHit && position.stopLoss !== undefined) {
+        // A stop is a promise about a price, so it fills there rather than at
+        // wherever the bar closed.
+        this.realise(position, position.volume, position.stopLoss, bar.time + this.baseSeconds, 'STOP_LOSS');
+        continue;
+      }
+      if (targetHit && position.takeProfit !== undefined) {
+        this.realise(position, position.volume, position.takeProfit, bar.time + this.baseSeconds, 'TAKE_PROFIT');
+        continue;
+      }
+
+      position.currentPrice = bar.close;
+      const difference = position.side === 'BUY' ? bar.close - position.entryPrice : position.entryPrice - bar.close;
+      position.unrealizedPnL = this.round2(difference * position.volume);
+      position.unrealizedPnlPercent = this.round2((difference / position.entryPrice) * 100);
+      this.positions.set(position.id, position);
+    }
+
+    if (this.balance + this.unrealized() > this.maxEquitySeen) {
+      this.maxEquitySeen = this.balance + this.unrealized();
+    }
+  }
+
+  /** Close everything at the last visible close, and report what happened. */
+  async finalize(): Promise<void> {
+    const bar = this.currentBar();
+    if (!bar) return;
+    for (const position of [...this.positions.values()]) {
+      const exitPrice = position.side === 'BUY'
+        ? bar.close - this.spreadPrice / 2 - this.slippagePrice
+        : bar.close + this.spreadPrice / 2 + this.slippagePrice;
+      this.realise(position, position.volume, exitPrice, bar.time + this.baseSeconds, 'MANUAL');
+    }
+  }
+
+  private realise(
+    position: Position,
+    volume: number,
+    exitPrice: number,
+    atSeconds: number,
+    reason: Trade['exitReason'],
+  ): number {
+    const difference = position.side === 'BUY' ? exitPrice - position.entryPrice : position.entryPrice - exitPrice;
+    const pnl = this.round2(difference * volume);
+    const commission = this.commissionPerLot * (volume / this.lotSize);
+
+    this.balance += pnl - commission;
+    this.trades.push({
+      id: `sim_trd_${this.nextTradeId++}`,
+      positionId: position.id,
+      symbol: position.symbol,
+      side: position.side,
+      volume,
+      entryPrice: position.entryPrice,
+      exitPrice: this.round(exitPrice),
+      entryTime: Math.floor(position.timestamp / 1000),
+      exitTime: atSeconds,
+      pnl,
+      pnlPercent: this.round2((difference / position.entryPrice) * 100),
+      returnPercent: this.round2((difference / position.entryPrice) * 100),
+      commission: this.round2(commission),
+      exitReason: reason,
+    });
+
+    if (volume >= position.volume) {
+      this.positions.delete(position.id);
+    } else {
+      position.volume = this.round(position.volume - volume);
+      this.positions.set(position.id, position);
+    }
+
+    return pnl;
+  }
+
+  /** Closed trades, oldest first. */
+  simulatedTrades(): Trade[] {
+    return [...this.trades];
+  }
+
+  /** Open positions, for the session's own bookkeeping. */
+  openPositions(): Position[] {
+    return [...this.positions.values()];
+  }
+
+  /**
+   * The last trade that closed a position, used by the session to report an
+   * outcome exactly once.
+   */
+  tradeCount(): number {
+    return this.trades.length;
+  }
+
+  /**
+   * Pips, when the instrument has a pip.
+   *
+   * A reporting convenience, not a model: the P&L rule is linear, exactly as it
+   * is in the live adapter, and a pip is only ever a way to express a distance
+   * the user reads more easily.
+   */
+  pipsFor(trade: Trade): number | undefined {
+    if (this.pipSize === undefined) return undefined;
+    return this.round((trade.exitPrice - trade.entryPrice) / this.pipSize) * (trade.side === 'BUY' ? 1 : -1);
+  }
+
+  private unrealized(): number {
+    return [...this.positions.values()].reduce((sum, position) => sum + (position.unrealizedPnL ?? 0), 0);
+  }
+
+  private assertSymbol(symbol: string): void {
+    if (symbol !== this.symbol) {
+      throw new Error(`This simulation is configured for ${this.symbol}, not ${symbol}.`);
+    }
+  }
+
+  private round(value: number): number {
+    return Number(value.toFixed(this.pricePrecision));
+  }
+
+  private round2(value: number): number {
+    return Number(value.toFixed(2));
+  }
+}
+
+/**
+ * The newest reading published at or before an instant.
+ *
+ * The boundary again, for facts rather than candles: a reading published after
+ * the horizon does not exist yet, so asking for the closest one would silently
+ * answer with the future.
+ */
+export function latestAtOrBefore(facts: SimulationFact[], horizonSeconds: number): SimulationFact | undefined {
+  let found: SimulationFact | undefined;
+  for (const fact of facts) {
+    if (fact.time <= horizonSeconds) found = fact;
+    else break;
+  }
+  return found;
+}
+
+/**
+ * Reject a dataset that would make a replay lie.
+ *
+ * Two checks, both of which have silently corrupted backtests before:
+ * out-of-order candles (which make "the last visible bar" mean something else)
+ * and a bar whose own OHLC is impossible (which produces indicators no human
+ * would believe). A simulation is allowed to be wrong about the market; it is
+ * not allowed to be wrong about its own data.
+ */
+export function validateDataset(bars: Bar[]): Bar[] {
+  let previous: Bar | undefined;
+  return bars.map((bar, index) => {
+    if (![bar.time, bar.open, bar.high, bar.low, bar.close].every((value) => Number.isFinite(value))) {
+      throw new Error(`Historical bar ${index} contains a non-finite value.`);
+    }
+    if (bar.high < Math.max(bar.open, bar.close) || bar.low > Math.min(bar.open, bar.close) || bar.high < bar.low) {
+      throw new Error(`Historical bar at ${bar.time} is not a possible candle.`);
+    }
+    if (previous && bar.time <= previous.time) {
+      throw new Error(`Historical data must be strictly chronological; ${bar.time} does not follow ${previous.time}.`);
+    }
+    previous = bar;
+    return { ...bar };
+  });
+}
+
+function defaultInstrument(symbol: string, pricePrecision: number): InstrumentMetadata {
+  return {
+    symbol,
+    displayName: symbol,
+    assetClass: 'FOREX',
+    provider: 'HYPERLIQUID',
+    providerSymbol: symbol,
+    providerMarketId: symbol,
+    quoteCurrency: 'USD',
+    baseCurrency: symbol.slice(0, 3),
+    pricePrecision,
+    sizePrecision: 0,
+    sizeStep: 1,
+    minOrderSize: 1,
+    maxOrderSize: 1_000_000,
+  };
+}

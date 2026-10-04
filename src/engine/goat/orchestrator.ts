@@ -23,7 +23,7 @@ import { AgentWakeEvent } from '../agents/types';
 import { capabilityRegistry, CapabilityRegistry } from '../agents/capabilities';
 import { agentModel } from '../agents/model/openrouter';
 import { skillRegistry, SkillRegistry } from '../agents/skills';
-import { IAgentModel, AgentModelResponse } from '../agents/model/types';
+import { IAgentModel, AgentModelRequest, AgentModelResponse } from '../agents/model/types';
 import { AgentObservation, AgentPolicy, ITradingEnvironment, TradingAgent } from '../agents/types';
 import type { AgentInstance } from '../agents/runtime';
 import type { AgentTimelineEventType } from '../agents/timeline/types';
@@ -169,6 +169,52 @@ const MIN_INTERPRETATION_LENGTH = 24;
  * shape; past that the honest answer is that there is nothing to act on.
  */
 export const MAX_UNPROMPTED_RECONSIDERATIONS = 3;
+
+/**
+ * How often a genuinely outstanding model request says so.
+ *
+ * Not a thinking animation and not a progress bar: a measurement of real
+ * elapsed time against a real pending promise. Ten seconds is chosen because
+ * it is the point at which silence stops looking like work — below it a
+ * reader would not have wondered, and above it the line arrives once a
+ * second. A request that answers in 300ms produces exactly one MODEL line and
+ * no heartbeat at all.
+ */
+export const MODEL_WAIT_HEARTBEAT_MS = 10_000;
+
+/**
+ * A model request that is outstanding right now.
+ *
+ * Real-time, deliberately, even in a simulation whose clock is historical:
+ * latency is a property of the call, not of the market being replayed, and a
+ * backtest that reported a simulated 4ms model wait would be measuring
+ * nothing.
+ */
+export interface PendingModelRequest {
+  /** Real time the request went out. */
+  startedAt: number;
+  /** What the request is for, in the reader's words. */
+  intent: string;
+  /** The contract asked for: INVESTIGATION, PLAN, … */
+  contract: string;
+}
+
+/**
+ * What one model request produced, for the log.
+ *
+ * Written after the fact from the response itself, so the line cannot claim a
+ * hypothesis that was not parsed or a failure that did not happen.
+ */
+export interface ModelCallReport {
+  /** True when the model could not be read at all. */
+  failed: boolean;
+  /** Machine-readable failure cause, when there was one. */
+  code?: string;
+  /** Real milliseconds the request took. */
+  elapsedMs: number;
+  /** What came back, in the log's vocabulary. */
+  outcome: string;
+}
 
 /**
  * What an investigation did, in words the UI can show verbatim.
@@ -393,6 +439,20 @@ export class GoatOrchestrator {
   }
   /** Consecutive unprompted looks that produced no hypothesis. */
   private readonly noThesisLooks = new Map<string, number>();
+  /**
+   * Model requests that are outstanding right now, one per agent.
+   *
+   * This is what lets a surface answer "is it working or is it stuck?" without
+   * guessing from timestamps. While an entry exists the GOAT is not watching
+   * the market and not idle: it is blocked on an external dependency, which is
+   * a state the product previously reported as WATCHING — the single most
+   * misleading thing the agent log said.
+   *
+   * Keyed by agent so two GOATs cannot mask each other, and always cleared in
+   * a `finally`, so a model that throws cannot leave a GOAT permanently
+   * "waiting for the model".
+   */
+  private readonly pendingModels = new Map<string, PendingModelRequest>();
 
   constructor(private readonly deps: GoatDeps) {
     this.stores = deps.stores;
@@ -477,6 +537,152 @@ export class GoatOrchestrator {
 
   private now(): number {
     return this.clock ? this.clock() : Date.now();
+  }
+
+  /**
+   * The model request a GOAT is blocked on, when it has one.
+   *
+   * Exposed for the read model rather than for the surface: a status dot that
+   * asks the orchestrator what phase its GOAT is in cannot disagree with the
+   * events the orchestrator wrote, because they are the same fact.
+   */
+  pendingModelRequest(agentId: string): PendingModelRequest | undefined {
+    return this.pendingModels.get(agentId);
+  }
+
+  /**
+   * Ask the model, and make the waiting visible while it happens.
+   *
+   * Every reasoning step in this system goes through here, which is the only
+   * reason the log can be honest about model latency. Three things are written
+   * around the call, and each corresponds to a real transition:
+   *
+   *   MODEL_REQUEST   the request went out, with what was in it
+   *   MODEL_WAITING   it is still outstanding, after a real interval
+   *   MODEL_RESPONSE  it came back, and what came back
+   *
+   * The pending entry is registered before the call and cleared in a `finally`,
+   * so a surface can render "waiting for the model" for exactly as long as
+   * that is true. Nothing here is generated for display: no request means no
+   * line, a fast answer means one line, and a slow one says how slow it
+   * actually was rather than performing thought.
+   */
+  private async callModel(options: {
+    agentId: string;
+    deploymentId?: string;
+    /** What this request is for, in words a reader would use. */
+    intent: string;
+    /** What was submitted, for the log's detail line. */
+    submitted: Record<string, number | string>;
+    request: AgentModelRequest;
+  }): Promise<{ response: AgentModelResponse; report: ModelCallReport }> {
+    const { agentId, deploymentId, intent, submitted, request } = options;
+
+    const startedAt = Date.now();
+    this.pendingModels.set(agentId, {
+      startedAt,
+      intent,
+      contract: request.contract ?? 'DECISION',
+    });
+
+    this.recordActivity({
+      goatId: agentId,
+      deploymentId,
+      agentId,
+      type: 'MODEL_REQUEST',
+      data: { intent, contract: request.contract ?? 'DECISION', ...submitted },
+    });
+
+    /*
+     * A real interval, cleared in the same `finally` as the pending entry.
+     * It measures elapsed time against the call it surrounds; it does not
+     * estimate, and it never fires for a request that answered first.
+     */
+    const heartbeat = setInterval(() => {
+      this.recordActivity({
+        goatId: agentId,
+        deploymentId,
+        agentId,
+        type: 'MODEL_WAITING',
+        data: {
+          intent,
+          elapsedMs: Date.now() - startedAt,
+          elapsedSeconds: Math.round((Date.now() - startedAt) / 1000),
+        },
+      });
+    }, MODEL_WAIT_HEARTBEAT_MS);
+
+    try {
+      const response = await this.model.run(request);
+      const report = this.reportModelOutcome(
+        response,
+        Date.now() - startedAt,
+        request.contract ?? 'DECISION',
+      );
+      this.recordActivity({
+        goatId: agentId,
+        deploymentId,
+        agentId,
+        type: report.failed ? 'MODEL_FAILURE' : 'MODEL_RESPONSE',
+        data: { intent, outcome: report.outcome, elapsedMs: report.elapsedMs, ...(report.code ? { code: report.code } : {}) },
+      });
+      return { response, report };
+    } catch (error) {
+      const elapsedMs = Date.now() - startedAt;
+      this.recordActivity({
+        goatId: agentId,
+        deploymentId,
+        agentId,
+        type: 'MODEL_FAILURE',
+        data: {
+          intent,
+          outcome: 'The request threw before it could be read.',
+          code: 'REQUEST_THREW',
+          elapsedMs,
+        },
+      });
+      // Re-thrown, so the caller's own failure handling stays in charge.
+      throw error;
+    } finally {
+      clearInterval(heartbeat);
+      this.pendingModels.delete(agentId);
+    }
+  }
+
+  /**
+   * What a model response turned out to be.
+   *
+   * Pure, and derived from the response rather than from the caller's
+   * interpretation of it, so two reasoning paths cannot describe the same
+   * answer differently.
+   */
+  private reportModelOutcome(
+    response: AgentModelResponse,
+    elapsedMs: number,
+    contract: string,
+  ): ModelCallReport {
+    if (response.unavailable) {
+      return { failed: true, code: response.unavailable.code, elapsedMs, outcome: 'The model could not be reached.' };
+    }
+    if (response.malformed) {
+      return { failed: true, code: 'MALFORMED_RESPONSE', elapsedMs, outcome: 'The response could not be read.' };
+    }
+    if (response.toolCall) {
+      return { failed: true, code: 'TOOL_CALL_RESPONSE', elapsedMs, outcome: 'The model asked for tools instead of answering.' };
+    }
+    if (contract === 'INVESTIGATION') {
+      const thesis = isRecord(response.payload?.['thesis']) ? 'a hypothesis' : 'no hypothesis';
+      const trackers = Array.isArray(response.payload?.['trackers'])
+        ? (response.payload?.['trackers'] as unknown[]).length
+        : 0;
+      return {
+        failed: false,
+        elapsedMs,
+        outcome: `Answered with ${thesis} and ${trackers} proposed ${trackers === 1 ? 'condition' : 'conditions'}.`,
+      };
+    }
+    const kind = typeof response.payload?.['kind'] === 'string' ? response.payload['kind'] : 'nothing recognisable';
+    return { failed: false, elapsedMs, outcome: `Answered: ${kind}.` };
   }
 
   /**
@@ -1553,13 +1759,22 @@ export class GoatOrchestrator {
       const proposal = await this.proposeInvestigation(goal, deployment);
 
       if (proposal.unavailable) {
-        this.recordActivity({
-          goatId: goal.agentId,
-          deploymentId: deployment.id,
-          agentId: goal.agentId,
-          type: 'MODEL_FAILURE',
-          data: { code: proposal.unavailableCode ?? 'UNKNOWN' },
-        });
+        /*
+         * The model call records its own failure, with the intent and the
+         * elapsed time, so this line is only for the failures that happened
+         * before a request could be made at all — a GOAT with no runtime
+         * registered has not called anything, and reporting it as a model
+         * failure would send someone looking at the wrong thing.
+         */
+        if (!proposal.modelFailed) {
+          this.recordActivity({
+            goatId: goal.agentId,
+            deploymentId: deployment.id,
+            agentId: goal.agentId,
+            type: 'MODEL_FAILURE',
+            data: { code: proposal.unavailableCode ?? 'UNKNOWN', phase: 'PRE_REQUEST' },
+          });
+        }
         /*
          * The message below promises a retry, so one has to happen.
          *
@@ -1571,7 +1786,7 @@ export class GoatOrchestrator {
          * re-checks that the deployment is still live before acting, so a
          * GOAT stopped in the meantime is not resurrected by it.
          */
-        this.scheduleReconsideration(goal, deployment);
+        this.scheduleReconsideration(goal, deployment, 'MODEL_UNAVAILABLE');
         return failed(
           `${proposal.unavailable} The GOAT stays deployed on ${deployment.marketId} and will retry safely.`,
           'MODEL_FAILURE',
@@ -2388,6 +2603,14 @@ export class GoatOrchestrator {
     unavailable?: string;
     /** Machine-readable form of the same cause. */
     unavailableCode?: string;
+    /**
+     * True when a model request went out and could not be read.
+     *
+     * Distinct from "unavailable" on purpose: that also covers a GOAT with no
+     * runtime registered, which is not a model failure and must not be
+     * recorded as one.
+     */
+    modelFailed?: boolean;
   }> {
     const instance = this.deps.agentRuntime.getAgent(goal.agentId);
     if (!instance) {
@@ -2404,6 +2627,24 @@ export class GoatOrchestrator {
       .join('\n\n');
 
     const timeframe = goal.timeframes[0] ?? DEFAULT_GOAT_TIMEFRAME;
+
+    /*
+     * Setup begins, recorded before anything is read rather than after.
+     *
+     * The order of this line matters more than its content. A deployment used
+     * to show one "deployed" record and then nothing until the model replied,
+     * so the entire setup — resolutions chosen, candles pulled, tools run —
+     * happened inside a silence that looked exactly like a stuck agent. Now
+     * the reader is told work has started, sees each read below it, and can
+     * tell an agent that is reading from an agent that is blocked.
+     */
+    this.recordActivity({
+      goatId: goal.agentId,
+      deploymentId: deployment.id,
+      agentId: goal.agentId,
+      type: 'GOAT_SETTING_UP',
+      data: { market: deployment.marketId, timeframe, environment: this.deps.env.mode },
+    });
 
     /*
      * Initialisation, recorded as the work it is.
@@ -2448,23 +2689,43 @@ export class GoatOrchestrator {
     }
 
     /*
-     * The model call is the one part of setup that is not the GOAT doing
-     * anything observable, so it says so. A line reading "waiting for the
-     * model" is honest and removes the dead seconds; a line reading "thinking"
-     * would be a claim about a private process nobody can verify — and the
-     * free model route genuinely can take ten seconds.
+     * The deterministic research pass is over.
+     *
+     * Every tool has now run against every resolution above, so this is where
+     * "reading the market" ends and "waiting on the model" begins. Recorded
+     * from what was actually collected — resolutions, candles, whether the
+     * indicators came back, what could not be read — because a GOAT that
+     * could not read its own indicators has to be able to say so at the point
+     * it starts waiting, not discover it later.
      */
     this.recordActivity({
       goatId: goal.agentId,
       deploymentId: deployment.id,
       agentId: goal.agentId,
-      type: 'GOAT_WAITING',
+      type: 'MARKET_CONTEXT_PREPARED',
       data: {
-        message: `Reading ${deployment.marketId} across ${setupContexts.map((c) => c.timeframe).join(', ')} and waiting for the model to form a hypothesis.`,
+        market: deployment.marketId,
+        timeframes: setupContexts.map((context) => context.timeframe),
+        resolutions: setupContexts.length,
+        candles: market.bars.received,
+        indicators: Object.keys(market.indicators).length,
+        limitations: market.limitations.length,
       },
     });
 
-    const response = await this.model.run({
+    const { response } = await this.callModel({
+      agentId: goal.agentId,
+      deploymentId: deployment.id,
+      intent: `Form a hypothesis on ${deployment.marketId}`,
+      submitted: {
+        symbol: deployment.marketId,
+        setupTimeframe: timeframe,
+        timeframes: setupContexts.map((context) => context.timeframe).join(', '),
+        candles: market.bars.received,
+        indicators: Object.keys(market.indicators).length,
+        objective: goal.statement,
+      },
+      request: {
       agent: instance.agent,
       observation,
       contract: 'INVESTIGATION',
@@ -2503,10 +2764,15 @@ export class GoatOrchestrator {
       toolHistory: [],
       iteration: 0,
       wakeReason: 'DEPLOYED',
+      },
     });
 
     if (response.unavailable) {
-      return { unavailable: response.unavailable.message, unavailableCode: response.unavailable.code };
+      return {
+        unavailable: response.unavailable.message,
+        unavailableCode: response.unavailable.code,
+        modelFailed: true,
+      };
     }
 
     if (response.malformed) {
@@ -2514,6 +2780,7 @@ export class GoatOrchestrator {
         unavailable:
           'The reasoning model returned a response TradingGOATs could not read. The GOAT is still deployed and this will be retried.',
         unavailableCode: 'MALFORMED_RESPONSE',
+        modelFailed: true,
       };
     }
 
@@ -2537,6 +2804,7 @@ export class GoatOrchestrator {
         unavailable:
           'The reasoning model asked for tools instead of answering. The GOAT is still deployed and this will be retried.',
         unavailableCode: 'TOOL_CALL_RESPONSE',
+        modelFailed: true,
       };
     }
 
@@ -2565,7 +2833,11 @@ export class GoatOrchestrator {
    * system must never do. So the GOAT returns on a timer instead, a bounded
    * number of times, and every one of those looks is written to the feed.
    */
-  private scheduleReconsideration(goal: Goal, deployment: GoatDeployment): void {
+  private scheduleReconsideration(
+    goal: Goal,
+    deployment: GoatDeployment,
+    cause: 'MODEL_UNAVAILABLE' | 'NO_THESIS' = 'NO_THESIS',
+  ): void {
     this.clearReconsideration(goal.agentId);
 
     const looks = (this.noThesisLooks.get(goal.agentId) ?? 0) + 1;
@@ -2612,6 +2884,29 @@ export class GoatOrchestrator {
         message: `No thesis on look ${looks} of ${MAX_UNPROMPTED_RECONSIDERATIONS}; will look again on its own shortly.`,
       },
     });
+
+    /*
+     * A retry that was actually armed, announced as one.
+     *
+     * The failure line above says the model could not be read and the wait
+     * line says the GOAT will look again; nothing joined them, so the log read
+     * as a failure followed by an unrelated sleep. Emitted only once the timer
+     * exists, and only for the failure case — a GOAT that answered and found
+     * no hypothesis has not been retried, it has thought.
+     */
+    if (cause === 'MODEL_UNAVAILABLE') {
+      this.recordActivity({
+        goatId: goal.agentId,
+        deploymentId: deployment.id,
+        agentId: goal.agentId,
+        type: 'MODEL_RETRY',
+        data: {
+          looks,
+          retryInMs: GOAT_RECONSIDER_AFTER_MS,
+          message: `Bounded retry ${looks} of ${MAX_UNPROMPTED_RECONSIDERATIONS} scheduled.`,
+        },
+      });
+    }
   }
 
   /** Cancel a pending look. Called whenever the deployment stops. */
@@ -2800,6 +3095,15 @@ export class GoatOrchestrator {
       activity: this.recentActivityFor(goal.agentId, 25),
       outstandingConstraints: this.loop.outstandingConstraints(goal.id),
       reEvaluating: runtime === 'RUNNING' && now - latestWake < 8_000,
+      /*
+       * The live model request, when there is one. Passed in rather than
+       * derived from timestamps, because the read model must never guess what
+       * the runtime is doing: the orchestrator knows whether a request is
+       * outstanding, and that is the whole fact.
+       */
+      modelPending: this.pendingModels.has(goal.agentId)
+        ? this.pendingModels.get(goal.agentId)
+        : undefined,
       now,
     });
   }
@@ -3414,7 +3718,34 @@ export class GoatOrchestrator {
     });
   }
 
-private updateTradePlan(
+/**
+   * Move a plan on because something happened to it outside the agent's own
+   * decision.
+   *
+   * A plan goes `PROPOSED → RISK_CHECK → READY` entirely inside the runtime, and
+   * stops there: nothing in the GOAT layer submits an order, because nothing
+   * in the GOAT layer may. Execution belongs to the deployment and to whatever
+   * is acting on it — a venue adapter in live, and the simulated book in a
+   * backtest.
+   *
+   * So the two states a plan is in once it has actually been acted on,
+   * `EXECUTING` and `CLOSED`, had no way to be reached, and a plan that had
+   * been filled would sit at READY for the rest of the run claiming it was
+   * waiting to be acted on. This is the seam: the caller that executed it says
+   * so, and the same bookkeeping records the transition, so the plan surface
+   * and the log cannot disagree about whether it filled.
+   */
+  applyExecution(
+    ideaId: string,
+    change: { status: TradeIdea['status']; reason: string },
+  ): TradeIdea | undefined {
+    if (change.status !== 'EXECUTING' && change.status !== 'MANAGING' && change.status !== 'CLOSED') {
+      throw new Error(`An execution may only move a plan to EXECUTING, MANAGING or CLOSED, not ${change.status}.`);
+    }
+    return this.updateTradePlan(ideaId, { status: change.status });
+  }
+
+  private updateTradePlan(
     ideaId: string,
     change: { status: TradeIdea['status']; riskCheck?: TradeIdea['riskCheck'] },
   ): TradeIdea | undefined {
@@ -3542,8 +3873,40 @@ private updateTradePlan(
     const steering = this.steeringFor(goal?.id);
     if (goal && steering.length > 0) this.markLatestSteeringApplied(goal);
 
+    /*
+     * The same boundary as a first pass: research is over, and the GOAT is
+     * now blocked on the model. Without this line a wake rendered as one
+     * quiet gap between "a tracker fired" and "the thesis was revised", which
+     * is exactly the gap during which the agent appears frozen.
+     */
+    this.recordActivity({
+      goatId: context.agentId,
+      deploymentId: context.deployment.deploymentId,
+      agentId: instance.agent.id,
+      type: 'MARKET_CONTEXT_PREPARED',
+      data: {
+        market: symbol,
+        timeframes: contexts.map((read) => read.timeframe),
+        resolutions: contexts.length,
+        candles: market.bars.received,
+        indicators: Object.keys(market.indicators).length,
+        limitations: market.limitations.length,
+      },
+    });
+
     try {
-      const response = await this.model.run({
+      const { response } = await this.callModel({
+        agentId: context.agentId,
+        deploymentId: context.deployment.deploymentId,
+        intent: `Interpret the fired condition for ${symbol}`,
+        submitted: {
+          symbol,
+          setupTimeframe: timeframe,
+          timeframes: contexts.map((read) => read.timeframe).join(', '),
+          candles: market.bars.received,
+          objective: goal?.statement ?? context.goal,
+        },
+        request: {
         agent: instance.agent,
         objective: goal?.statement ?? context.goal,
         observation,
@@ -3595,6 +3958,7 @@ private updateTradePlan(
         toolHistory: [],
         iteration: 0,
         wakeReason: wake.event.reason,
+        },
       });
 
       if (response.unavailable || response.malformed) {
@@ -3819,6 +4183,74 @@ function detailForActivity(type: AgentTimelineEventType, record: Record<string, 
       if (typeof record.thesisState === 'string' && record.thesisState) parts.push(record.thesisState.toLowerCase());
       break;
 
+    case 'GOAT_SETTING_UP':
+      if (text(record.timeframe)) parts.push(`${text(record.timeframe)} setup`);
+      if (text(record.environment)) parts.push(text(record.environment));
+      break;
+
+    case 'MARKET_CONTEXT_PREPARED':
+      if (text(record.timeframes)) parts.push(text(record.timeframes));
+      if (isFiniteNumber(record.candles)) parts.push(`${record.candles} candles`);
+      if (isFiniteNumber(record.indicators)) parts.push(`${record.indicators} indicator sets`);
+      if (isFiniteNumber(record.limitations) && record.limitations > 0) {
+        parts.push(`${record.limitations} could not be read`);
+      }
+      break;
+
+    /*
+     * What was actually submitted.
+     *
+     * This is the line a reader uses to check the agent's claim about its own
+     * context, so it carries the real values rather than a reassurance: the
+     * resolutions, how many candles, how many indicator sets, and the
+     * objective in the user's own words.
+     */
+    case 'MODEL_REQUEST':
+      if (text(record.symbol)) parts.push(text(record.symbol));
+      if (text(record.timeframes)) parts.push(text(record.timeframes));
+      if (isFiniteNumber(record.candles)) parts.push(`${record.candles} candles`);
+      if (isFiniteNumber(record.indicators)) parts.push(`${record.indicators} indicator sets`);
+      if (text(record.objective)) parts.push(text(record.objective));
+      if (isFiniteNumber(record.elapsedMs)) parts.push(`${Math.round(record.elapsedMs / 1000)}s`);
+      break;
+
+    case 'MODEL_WAITING':
+      if (isFiniteNumber(record.elapsedSeconds)) parts.push(`${record.elapsedSeconds}s elapsed`);
+      break;
+
+    case 'MODEL_RESPONSE':
+      if (isFiniteNumber(record.elapsedMs)) parts.push(`${Math.round(record.elapsedMs / 1000)}s`);
+      if (isFiniteNumber(record.trackers)) parts.push(count(record.trackers, 'condition'));
+      break;
+
+    case 'MODEL_RETRY':
+      if (isFiniteNumber(record.retryInMs)) parts.push(`in ${describeDuration(record.retryInMs)}`);
+      if (isFiniteNumber(record.looks)) parts.push(`look ${record.looks}`);
+      break;
+
+    case 'BACKTEST_STARTED':
+      if (text(record.symbol)) parts.push(text(record.symbol));
+      if (text(record.range)) parts.push(text(record.range));
+      if (isFiniteNumber(record.speed)) parts.push(`${record.speed}x`);
+      break;
+
+    case 'BACKTEST_TICK':
+      // The price is the headline's job; repeating it here made every tick a
+      // line and a half long.
+      if (isFiniteNumber(record.simulatedMinutes)) {
+        parts.push(`${record.simulatedMinutes} simulated minutes`);
+      }
+      break;
+
+    case 'BACKTEST_STOPPED':
+    case 'BACKTEST_COMPLETED':
+      if (isFiniteNumber(record.simulatedMinutes)) {
+        parts.push(`${record.simulatedMinutes} simulated minutes`);
+      }
+      if (isFiniteNumber(record.trades)) parts.push(count(record.trades, 'trade'));
+      if (isFiniteNumber(record.modelCalls)) parts.push(count(record.modelCalls, 'model call'));
+      break;
+
     default:
       break;
   }
@@ -3942,8 +4374,51 @@ function describeActivity(type: AgentTimelineEventType, data: unknown): string {
       if (typeof record.message === 'string' && record.message) return record.message;
       return `Waiting on ${count(record.trackers, 'tracker')}`;
     }
+    case 'GOAT_SETTING_UP':
+      return text(record.market)
+        ? `Building the initial market context on ${text(record.market)}`
+        : 'Building the initial market context';
+
     case 'MARKET_CONTEXT_LOADED':
       return `Read ${text(record.symbol)}: ${text(record.candles)} candles, RSI ${text(record.rsi)}, ATR ${text(record.atr)}`;
+
+    case 'MARKET_CONTEXT_PREPARED':
+      return text(record.timeframes)
+        ? `Research complete across ${text(record.timeframes)} — the request is ready`
+        : 'Research complete — the request is ready';
+
+    /*
+     * The request, and what was in it.
+     *
+     * Deliberately not phrased as progress. It is an outbound call to an
+     * external dependency, and saying so is the only honest description of
+     * what the runtime is doing while it waits.
+     */
+    case 'MODEL_REQUEST':
+      return `${text(record.intent) || 'Model request'} — request started`;
+
+    case 'MODEL_WAITING':
+      return isFiniteNumber(record.elapsedSeconds)
+        ? `Still waiting for a response \u00b7 ${record.elapsedSeconds}s`
+        : 'Waiting for a response';
+
+    case 'MODEL_RESPONSE':
+      return `Answered \u2014 ${text(record.outcome) || 'the model replied'}`;
+
+    case 'MODEL_RETRY':
+      return text(record.message) || 'Bounded retry scheduled';
+
+    case 'BACKTEST_STARTED':
+      return `Backtest started on ${text(record.symbol) || 'this market'}`;
+
+    case 'BACKTEST_TICK':
+      return `${text(record.symbol)} ${text(record.price)}`;
+
+    case 'BACKTEST_STOPPED':
+      return 'Backtest stopped';
+
+    case 'BACKTEST_COMPLETED':
+      return 'Backtest complete';
     case 'MARKET_RESEARCH_COMPLETED':
       return record.formedThesis === true
         ? 'Finished its first pass and formed a hypothesis'
@@ -3977,7 +4452,16 @@ function describeActivity(type: AgentTimelineEventType, data: unknown): string {
     case 'SHADOW_EXECUTION':
       return `Simulated ${text(record.side)} ${text(record.volume)} ${text(record.symbol)}`;
     case 'MODEL_FAILURE':
-      return `The reasoning model failed: ${text(record.code) || text(record.message)}`;
+      /*
+       * The intent keeps its own capitalisation: lower-casing it mid-sentence
+       * produced "failed while form a hypothesis on eur/usd", which reads like a
+       * truncated thought rather than a request that went out.
+       */
+      return text(record.intent)
+        ? `The reasoning model failed — ${text(record.intent)}: ${
+            text(record.code) || text(record.message) || 'unreadable'
+          }`
+        : `The reasoning model failed: ${text(record.code) || text(record.message)}`;
     case 'ERROR':
       return text(record.message) || 'The runtime recorded an error';
     default:

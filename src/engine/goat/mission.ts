@@ -44,6 +44,16 @@ export type MissionStage =
   | 'UNDEPLOYED'
   | 'UNDERSTANDING'
   | 'RESEARCHING'
+  /*
+   * Blocked on the model.
+   *
+   * A stage rather than a decoration, because it is the answer to the question
+   * this read model exists for: the GOAT is not watching the market, and it is
+   * not stuck either — it has done everything it can and is waiting on an
+   * external dependency. Rendering this as RESEARCHING or WAITING made a
+   * healthy deployment look like it had nothing to do.
+   */
+  | 'WAITING_FOR_MODEL'
   | 'ANALYZING'
   | 'FORMING_THESIS'
   | 'COLLECTING_EVIDENCE'
@@ -63,6 +73,7 @@ export const MISSION_STAGE_LABELS: Record<MissionStage, string> = {
   UNDEPLOYED: 'Not deployed',
   UNDERSTANDING: 'Understanding your objective',
   RESEARCHING: 'Researching the market',
+  WAITING_FOR_MODEL: 'Waiting for the model',
   ANALYZING: 'Analyzing what it found',
   FORMING_THESIS: 'Forming a thesis',
   COLLECTING_EVIDENCE: 'Collecting evidence',
@@ -200,6 +211,13 @@ export interface GoatMission {
    */
   lastFailure?: { at: number; type: string };
   lastActivity?: { at: number; text: string };
+  /**
+   * The model request this GOAT is blocked on, when it has one.
+   *
+   * Exposed so a surface can say what it is waiting for instead of rendering
+   * an idle agent and an empty log as the same thing.
+   */
+  modelPending?: { at: number; intent: string; contract?: string };
 
   steering: { total: number; pending: number; notes: SteeringNote[] };
   updatedAt: number;
@@ -221,6 +239,15 @@ export interface MissionInput {
   outstandingConstraints?: string[];
   /** The most recent wake, when one is being processed right now. */
   reEvaluating?: boolean;
+  /**
+   * The outstanding model request, when the runtime has one.
+   *
+   * Supplied by the orchestrator rather than reconstructed from timestamps.
+   * A read model that inferred "waiting for the model" from the age of the
+   * last event would eventually be wrong in the direction that matters most:
+   * reporting a stuck agent as busy.
+   */
+  modelPending?: { intent: string; contract?: string };
   now: number;
 }
 
@@ -247,6 +274,14 @@ export const FAILURE_EVENTS: ReadonlySet<string> = new Set(['MODEL_FAILURE', 'ER
 export const BOOKKEEPING_EVENTS: ReadonlySet<string> = new Set([
   'GOAT_WAITING',
   'TRACKER_EVALUATED',
+  /*
+   * The model heartbeat, for the same reason the sleep line is here.
+   *
+   * A request that answers and answers again — a wake, then a heartbeat, then
+   * a response — must not have the response treated as bookkeeping, and a
+   * failure followed by heartbeats must not be retired by them.
+   */
+  'MODEL_WAITING',
 ]);
 
 /** A tracker fires at most this often, so "just woke" means just. */
@@ -285,6 +320,18 @@ function deriveNext(input: {
       label: `Thesis ${liveThesis.state.toLowerCase()} \u2014 no action from this hypothesis`,
       detail: liveThesis.invalidation,
       blocked: true,
+    };
+  }
+  if (stage === 'WAITING_FOR_MODEL') {
+    /*
+     * Not blocked. Something is genuinely in flight — a request that has been
+     * submitted and not yet answered — and a reader told "nothing is coming"
+     * during that window would be told the one thing that is untrue.
+     */
+    return {
+      label: 'Waiting for the model',
+      detail: source.modelPending?.intent,
+      blocked: false,
     };
   }
   if (stage === 'RISK_CHECK' || stage === 'READY') {
@@ -416,6 +463,15 @@ export function buildMission(input: MissionInput): GoatMission {
       ? { lastEvent: { at: lastRecorded.at, type: lastRecorded.type } }
       : {}),
     ...(lastFailure ? { lastFailure: { at: lastFailure.at, type: lastFailure.type } } : {}),
+    ...(input.modelPending
+      ? {
+          modelPending: {
+            at: now,
+            intent: input.modelPending.intent,
+            ...(input.modelPending.contract ? { contract: input.modelPending.contract } : {}),
+          },
+        }
+      : {}),
     lastActivity,
 
     steering: {
@@ -444,6 +500,14 @@ function deriveStage(input: {
   if (source.runtime === 'ERROR') return 'ERROR';
 
   if (source.reEvaluating) return 'RE_EVALUATING';
+
+  /*
+   * Checked after the lifecycle states and before anything derived from the
+   * thesis or the plan, because a pending request outranks all of them: a GOAT
+   * holding a valid thesis that is mid-request is waiting on the model, not
+   * monitoring, researching or building anything.
+   */
+  if (source.modelPending) return 'WAITING_FOR_MODEL';
 
   const plan = source.tradePlan;
   if (plan) {
@@ -512,6 +576,15 @@ function deriveActivity(input: {
         return 'The runtime is not running this GOAT. Check the deployment.';
       case 'RESEARCHING':
         return `Reading ${market} before forming a view.`;
+      case 'WAITING_FOR_MODEL':
+        /*
+         * The blocked-on-external-dependency state, named as such. "Reading
+         * the market" while a request is outstanding would be false: the
+         * reads are finished.
+         */
+        return source.modelPending?.intent
+          ? `${source.modelPending.intent}. Waiting for the model.`
+          : 'Waiting for the model to answer.';
       case 'FORMING_THESIS':
         return liveThesis
           ? `Building a thesis on ${market}.`
@@ -555,6 +628,9 @@ function deriveActivity(input: {
     }
     if (stage === 'RESEARCHING' && activeTrackers.length === 0) {
       return 'No thesis yet.';
+    }
+    if (stage === 'WAITING_FOR_MODEL') {
+      return 'Market context prepared and submitted.';
     }
     return '';
   })();

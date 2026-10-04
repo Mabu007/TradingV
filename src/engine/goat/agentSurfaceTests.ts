@@ -1016,14 +1016,24 @@ test('timeframes: the context read is coarser than the setup, never finer', asyn
   const reads = h.agentLog().filter((entry) => entry.type === 'MARKET_CONTEXT_LOADED');
   assert(reads.length > 0, 'setup recorded market reads');
 
-  const waiting = h.agentLog().find((entry) => /waiting for the model/.test(`${entry.headline} ${entry.detail ?? ''}`));
+  /*
+   * The request line, not a sleep line.
+   *
+   * This used to look for a `GOAT_WAITING` message that happened to name the
+   * resolutions, which meant the property being protected — "the context is
+   * coarser than the setup" — was being read off the wording of a line that
+   * was really about something else. The runtime now records what it
+   * submitted, so the resolutions are asserted where they are actually true.
+   */
+  const request = h.agentLog().find((entry) => entry.type === 'MODEL_REQUEST');
+  assert(request !== undefined, 'the model request is recorded with what was submitted');
   assert(
-    waiting !== undefined,
-    `the model wait names the resolutions it read: ${JSON.stringify(h.agentLog().map((e) => [e.type, e.headline, e.detail]))}`,
+    request!.type === 'MODEL_REQUEST' && /waiting for the model/.test(request!.style.label.toLowerCase()) === false,
+    'a pending request reads as MODEL, not as waiting on the market',
   );
-  const timeframes = [...`${waiting!.headline} ${waiting!.detail ?? ''}`.matchAll(/\b(\d+[mhd])\b/g)]
+  const timeframes = [...`${request!.headline} ${request!.detail ?? ''}`.matchAll(/\b(\d+[mhd])\b/g)]
     .map((match) => match[1]);
-  assert(timeframes.includes('15m'), `the setup resolution was read: ${waiting!.detail}`);
+  assert(timeframes.includes('15m'), `the setup resolution was read: ${request!.detail}`);
 
   const rank = (timeframe: string) => ['1m', '5m', '15m', '30m', '1h', '4h', '1d'].indexOf(timeframe);
   const contextReads = timeframes.filter((timeframe) => timeframe !== '15m');
@@ -1411,6 +1421,163 @@ test('skills: a GOAT can see the rules it has not satisfied yet', async () => {
     plan.outstandingConstraints.length,
     outstanding.length,
     'the trade plan shows the same list, so the two cannot disagree',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 6. Initial work is visible, and waiting on the model is not watching
+// ---------------------------------------------------------------------------
+
+/**
+ * A model that holds its reply until the test lets it go.
+ *
+ * The whole point of the MODEL states is the window while a request is
+ * outstanding, and a model that answers immediately never opens one. This
+ * double opens exactly one window and closes it on demand.
+ */
+class GatedModel implements IAgentModel {
+  calls = 0;
+  private release?: () => void;
+  readonly answered = new Promise<void>((resolve) => {
+    this.release = resolve;
+  });
+
+  async run() {
+    this.calls += 1;
+    await this.answered;
+    return normalizeModelReply(INVESTIGATION);
+  }
+
+  letGo(): void {
+    this.release?.();
+  }
+}
+
+test('progress: a deployment records the work it does before the model is asked', async () => {
+  const h = makeHarness();
+  await h.investigate();
+
+  const types = h.agentLog().map((entry) => entry.type);
+  const at = (type: string) => types.indexOf(type);
+
+  assert(types.includes('GOAT_SETTING_UP'), 'setup is announced');
+  assert(
+    at('GOAT_SETTING_UP') < at('MARKET_CONTEXT_LOADED'),
+    'setup is announced before anything is read, so the silence after deployment has a boundary',
+  );
+  assert(
+    at('MARKET_CONTEXT_PREPARED') > at('MARKET_CONTEXT_LOADED'),
+    'research is recorded as finishing after the reads, not before them',
+  );
+  assert(
+    at('MODEL_REQUEST') > at('MARKET_CONTEXT_PREPARED'),
+    'and the request goes out after research is complete',
+  );
+  assert(
+    at('MODEL_RESPONSE') > at('MODEL_REQUEST'),
+    'the answer follows the request',
+  );
+
+  /*
+   * The resolution set the agent claimed to have read, in the request itself.
+   * Everything the reader is told about the agent's context has to be a value
+   * the runtime actually collected.
+   */
+  const request = h.agentLog().find((entry) => entry.type === 'MODEL_REQUEST');
+  assert(request!.detail !== undefined && /15m/.test(request!.detail!), 'the request carries the resolutions read');
+  assert(/candles/.test(request!.detail!), 'and how much data went with them');
+});
+
+test('progress: waiting on the model is a state of its own, not watching', async () => {
+  /*
+   * The failure this exists to stop: a GOAT that read 15m, 30m and 1h and was
+   * then blocked on a model for ten seconds rendered as WATCHING — "deployed
+   * and waiting for a condition to fire" — which described a GOAT with nothing
+   * to do while it was, in fact, mid-request.
+   */
+  const gate = new GatedModel();
+  const h = makeHarness({ model: gate as unknown as ScriptedModel });
+  const investigation = h.orchestrator.investigateGoal(h.goalId);
+
+  // The window: read the state while the request is genuinely outstanding.
+  let pending: GoatMission | undefined;
+  for (let attempt = 0; attempt < 200 && !pending?.modelPending; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    pending = h.mission();
+  }
+
+  assert(pending?.modelPending !== undefined, 'the runtime knows a request is outstanding');
+  assertEqual(pending!.stage, 'WAITING_FOR_MODEL', 'the stage says so');
+  assertEqual(statusFor(pending!, h.clock.now()), 'WAITING_FOR_MODEL', 'and so does the status the dot renders');
+  assert(
+    pending!.next.blocked === false,
+    'it is not reported as blocked, because something is genuinely in flight',
+  );
+
+  gate.letGo();
+  await investigation;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const settled = h.mission();
+  assertEqual(settled.modelPending, undefined, 'the pending state clears when the answer lands');
+  assert(
+    settled.stage !== 'WAITING_FOR_MODEL',
+    `and the GOAT moves on to what it is actually doing: ${settled.stage}`,
+  );
+});
+
+test('progress: a fast answer produces one line, not a heartbeat', async () => {
+  /*
+   * The failure mode this guards against is the opposite one: filling the gap
+   * with reassurance. A request that answered in under a second must leave
+   * exactly one request line and one response line, and no MODEL_WAITING at
+   * all — there is no pending promise to report on.
+   */
+  const h = makeHarness();
+  await h.investigate();
+
+  const types = h.agentLog().map((entry) => entry.type);
+  assertEqual(types.filter((type) => type === 'MODEL_REQUEST').length, 1, 'one request line');
+  assertEqual(types.filter((type) => type === 'MODEL_RESPONSE').length, 1, 'one response line');
+  assertEqual(
+    types.filter((type) => type === 'MODEL_WAITING').length,
+    0,
+    'and nothing pretending to be a wait that never happened',
+  );
+
+  /*
+   * No sleep line inside the request window.
+   *
+   * A GOAT *is* entitled to a sleep line once its trackers exist — that is the
+   * genuine "waiting for a qualifying market event" state and it belongs after
+   * the answer. What it must never do is claim to be waiting while it is in
+   * fact blocked on a reply.
+   */
+  const request = types.indexOf('MODEL_REQUEST');
+  const response = types.indexOf('MODEL_RESPONSE');
+  assert(
+    !types.slice(request, response).includes('GOAT_WAITING'),
+    `nothing claims to be watching between the request and the answer: ${types.join(' → ')}`,
+  );
+  assert(
+    types.lastIndexOf('GOAT_WAITING') > response,
+    'and the sleep that does exist comes after the thesis exists',
+  );
+});
+
+test('progress: a failure to read the model is followed by a retry that exists', async () => {
+  const h = makeHarness({
+    model: new ScriptedModel([], undefined, true),
+  });
+  const report = await h.orchestrator.investigateGoal(h.goalId);
+  assertEqual(report.outcome, 'MODEL_FAILURE', 'the failure is reported as a failure');
+  assertEqual(h.orchestrator.hasPendingReconsideration(h.agentId), true, 'and a retry is genuinely armed');
+
+  const retry = h.agentLog().find((entry) => entry.type === 'MODEL_RETRY');
+  assert(retry !== undefined, 'the log says a retry was scheduled, because one was');
+  assert(
+    h.agentLog().some((entry) => entry.type === 'MODEL_FAILURE'),
+    'and the failure that caused it is on the record',
   );
 });
 

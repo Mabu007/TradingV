@@ -54,7 +54,25 @@ export type AgentEventChannel =
   | 'WAIT'
   | 'INVALIDATION'
   | 'ERROR'
-  | 'CONTROL';
+  | 'CONTROL'
+  /*
+   * Waiting on the model, and only on the model.
+   *
+   * Its own channel because the distinction is the whole argument of this
+   * file's larger sibling: "waiting for a qualifying market event" and
+   * "waiting for an external dependency to answer" are different states with
+   * different meanings, and both used to render as WATCHING. A reader cannot
+   * act on one of them and can do something about the other.
+   */
+  | 'MODEL'
+  /*
+   * The historical simulation.
+   *
+   * A clock and a dataset, not an agent phase, so it never competes with the
+   * GOAT's own narrative — it says where "now" is, and the GOAT's log says
+   * what the agent did with it.
+   */
+  | 'BACKTEST';
 
 /**
  * Semantic colour. Only the signal is coloured; most of a log is neutral,
@@ -89,9 +107,11 @@ const STYLE: Record<AgentTimelineEventType, AgentEventStyle> = {
   // --- the agent coming to life ---------------------------------------
   GOAT_WOKE: { channel: 'WAKE', tone: 'info', weight: 'important', label: 'WAKE' },
   AGENT_WAKE: { channel: 'WAKE', tone: 'info', weight: 'important', label: 'WAKE' },
+  GOAT_SETTING_UP: { channel: 'CONTROL', tone: 'info', weight: 'important', label: 'SETUP' },
 
   // --- reading the world ------------------------------------------------
   MARKET_CONTEXT_LOADED: { channel: 'MARKET', tone: 'neutral', weight: 'normal', label: 'MARKET' },
+  MARKET_CONTEXT_PREPARED: { channel: 'RESEARCH', tone: 'neutral', weight: 'normal', label: 'RESEARCH' },
   FILL: { channel: 'MARKET', tone: 'neutral', weight: 'normal', label: 'MARKET' },
   OBSERVATION: { channel: 'OBSERVATION', tone: 'neutral', weight: 'normal', label: 'OBSERVATION' },
   CAPABILITY_CALL: { channel: 'RESEARCH', tone: 'neutral', weight: 'normal', label: 'RESEARCH' },
@@ -99,6 +119,32 @@ const STYLE: Record<AgentTimelineEventType, AgentEventStyle> = {
   MARKET_RESEARCH_COMPLETED: { channel: 'RESEARCH', tone: 'neutral', weight: 'normal', label: 'RESEARCH' },
   NO_THESIS_YET: { channel: 'RESEARCH', tone: 'warning', weight: 'normal', label: 'RESEARCH' },
   MODEL_FAILURE: { channel: 'ERROR', tone: 'negative', weight: 'critical', label: 'ERROR' },
+
+  // --- waiting on the model, which is not waiting on the market ---------
+  /*
+   * MODEL_REQUEST and MODEL_RESPONSE are the two ends of one real operation
+   * and are therefore both `important`: a reader scanning the log must see
+   * where the agent stopped doing anything of its own, and where it started
+   * again.
+   *
+   * MODEL_WAITING is deliberately `normal`. It is the heartbeat of a request
+   * that is already announced, and a line that repeats every few seconds must
+   * not compete with the lines that changed something.
+   */
+  MODEL_REQUEST: { channel: 'MODEL', tone: 'info', weight: 'important', label: 'MODEL' },
+  MODEL_WAITING: { channel: 'MODEL', tone: 'neutral', weight: 'normal', label: 'MODEL' },
+  MODEL_RESPONSE: { channel: 'MODEL', tone: 'positive', weight: 'important', label: 'MODEL' },
+  MODEL_RETRY: { channel: 'MODEL', tone: 'warning', weight: 'important', label: 'RETRY' },
+
+  // --- the historical simulation ----------------------------------------
+  /*
+   * `BACKTEST_TICK` is `normal` for the same reason a heartbeat is: at sixty
+   * simulated minutes a minute it would otherwise dominate every screen.
+   */
+  BACKTEST_STARTED: { channel: 'BACKTEST', tone: 'info', weight: 'important', label: 'BACKTEST' },
+  BACKTEST_TICK: { channel: 'BACKTEST', tone: 'neutral', weight: 'normal', label: 'BACKTEST' },
+  BACKTEST_STOPPED: { channel: 'BACKTEST', tone: 'neutral', weight: 'important', label: 'BACKTEST' },
+  BACKTEST_COMPLETED: { channel: 'BACKTEST', tone: 'positive', weight: 'important', label: 'BACKTEST' },
 
   // --- believing something ---------------------------------------------
   THESIS_FORMED: { channel: 'ANALYSIS', tone: 'info', weight: 'important', label: 'THESIS' },

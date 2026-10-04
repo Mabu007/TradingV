@@ -106,6 +106,14 @@ export const GoatWorkspace: React.FC<GoatWorkspaceProps> = ({
 
   const plan = useMemo(() => buildPlanView(mission), [mission]);
 
+  /*
+   * Whether the runtime has a model request outstanding, re-read on the same
+   * push path as the log. The workspace does not infer it from the age of the
+   * last event: the orchestrator knows, and a surface that guessed would
+   * eventually report a stuck agent as busy.
+   */
+  const waitingForModel = Boolean(orchestrator.pendingModelRequest(mission.agentId));
+
   const newestAt = entries.length > 0 ? entries[entries.length - 1].at : 0;
   const live = pageVisible && newestAt > 0 && now - newestAt < LIVE_WINDOW_MS;
   const watching =
@@ -208,6 +216,7 @@ export const GoatWorkspace: React.FC<GoatWorkspaceProps> = ({
           entries={entries}
           live={live}
           watching={watching}
+          waitingForModel={waitingForModel}
           now={now}
           className="h-[26rem] lg:h-[calc(100dvh-15rem)] lg:min-h-[30rem]"
         />
