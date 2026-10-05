@@ -43,6 +43,7 @@ import { ProfileView } from './components/views/ProfileView';
 import { createDurableRuntime } from './engine/goat/durableRuntime';
 import { runtimeServices } from './services/cloudflare/runtimeServices';
 import { firebaseServices } from './services/firebase/configure';
+import { startUserDataSync } from './services/firebase/userDataSync';
 
 import { User, userService } from './services/userService';
 import { ConnectionStatus } from './types/quotes';
@@ -127,11 +128,37 @@ trackerRuntime.setEnvironment('DEMO');
  */
 const demoEnvironmentForGoat = new DemoEnvironment();
 
+const goatStores = createGoatStores('PERSISTENT');
+
+/*
+ * Firestore as the account's data path.
+ *
+ * Started at module scope, beside the orchestrator that owns the stores, because
+ * the store it reads and writes is the one the GOAT screens render. Hydration
+ * loads this account's GOATs before any write is allowed out, so a refresh
+ * restores what the account has rather than overwriting it with whatever this
+ * browser happened to be holding.
+ */
+const userDataSync = startUserDataSync({
+  auth: firebaseServices().auth,
+  data: firebaseServices().data,
+  goals: goatStores.goals,
+});
+
+/*
+ * The store the application writes through.
+ *
+ * Every GOAT save goes to the device store and then to the signed-in account.
+ * Hydration deliberately writes to the inner store instead, so restoring this
+ * account's own GOATs is not mistaken for the user editing them.
+ */
+goatStores.goals = userDataSync.goalStore(goatStores.goals);
+
 const goatOrchestrator = new GoatOrchestrator({
   agentRuntime,
   trackers: trackerRuntime,
   env: demoEnvironmentForGoat,
-  stores: createGoatStores('PERSISTENT'),
+  stores: goatStores,
   /*
    * The durable runtime, so a deployed GOAT keeps working when this tab closes.
    *
@@ -618,7 +645,7 @@ function App() {
   useEffect(() => {
     let cancelled = false;
 
-    void userService
+    void userService()
       .getCurrentUser()
       .then((currentUser) => {
         if (!cancelled) {

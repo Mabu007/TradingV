@@ -26,7 +26,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ onBack, onUserUpdated 
   const [saveSuccess, setSaveSuccess] = useState(false);
 
   useEffect(() => {
-    userService.getCurrentUser().then((u) => {
+    userService().getCurrentUser().then((u) => {
       setUser(u);
       setUsername(u.username);
       setEmail(u.email);
@@ -38,7 +38,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ onBack, onUserUpdated 
     if (!username.trim() || !email.trim()) return;
 
     setIsSaving(true);
-    const updated = await userService.updateProfile({
+    const updated = await userService().updateProfile({
       username: username.trim(),
       email: email.trim(),
     });

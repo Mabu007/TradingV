@@ -29,7 +29,8 @@ export const BottomNav: React.FC<BottomNavProps> = ({
   onTabChange,
   openPositionsCount,
   runningGoatsCount,
-  user = { username: 'Gift', email: 'gtebogo75@gmail.com' },
+  /* No default identity: signed out is nobody, not a particular person. */
+  user = { username: '', email: '' },
   onOpenProfile,
   connectionStatus = 'CONNECTED',
 }) => {

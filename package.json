@@ -41,6 +41,7 @@
     "test:openrouter:live": "bun src/adapters/openrouter/liveCheck.ts",
     "test:goat:live": "bun src/engine/goat/liveEndToEnd.ts",
     "test:firebase": "bun src/services/firebase/tests.ts",
+    "test:firebase-integration": "bun src/services/firebase/integrationTests.ts",
     "test:rules": "bun src/services/firebase/rulesTests.ts",
     "test:historical": "bun src/engine/backtester/historicalUnitTests.ts",
     "test:trade-engine": "bun src/engine/goat/tradeEngineTests.ts",

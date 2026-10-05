@@ -5,6 +5,24 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
+    /*
+     * Which environment variables reach the browser bundle.
+     *
+     * Vite exposes only `VITE_`-prefixed variables by default, so a project
+     * configured with the Firebase/AI Studio names (`FIREBASE_apiKey`) built a
+     * bundle with no Firebase configuration in it at all: sign-in was silently
+     * unavailable in production while the same repository read perfectly in a
+     * local `.env` that used the Vite names. The failure was invisible because
+     * the fallback path is a working product, not a crash.
+     *
+     * `FIREBASE_` is added so the variables this project actually has are the
+     * ones that work. Everything under that prefix is Firebase's own browser
+     * configuration — apiKey, authDomain, projectId, storageBucket,
+     * messagingSenderId, appId, measurementId — which is client-visible by
+     * design and is what Firebase itself embeds in every web app. No secret
+     * belongs under this prefix, and none does.
+     */
+    envPrefix: ['VITE_', 'FIREBASE_'],
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {

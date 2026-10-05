@@ -44,9 +44,17 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
   openRouterConfig,
   accountStats,
 }) => {
-  const username = user?.username || 'Gift';
-  const email = user?.email || 'gtebogo75@gmail.com';
-  const tier = user?.tier || 'Pro';
+  /*
+   * No invented identity.
+   *
+   * These used to fall back to a specific person's name and email, so a signed
+   * -out visitor was shown an account that did not exist — presented as though it
+   * were theirs. Absent an account there is nothing to show, and the empty string
+   * is the honest answer.
+   */
+  const username = user?.username ?? '';
+  const email = user?.email ?? '';
+  const tier = user?.tier ?? 'Free';
 
   const hasOpenRouterKey = Boolean(
     openRouterConfig.apiKey && openRouterConfig.apiKey.trim().length > 10

@@ -343,14 +343,27 @@ export interface PreferenceRecord {
 export function firebaseConfigFromEnv(
   env: Record<string, string | undefined>,
 ): { config: FirebaseConfig } | { unavailable: string } {
-  const apiKey = env['VITE_FIREBASE_API_KEY'];
-  const authDomain = env['VITE_FIREBASE_AUTH_DOMAIN'];
-  const projectId = env['VITE_FIREBASE_PROJECT_ID'];
+  /*
+   * Two naming conventions, one configuration.
+   *
+   * This repository documents and templates `VITE_FIREBASE_API_KEY`, which is
+   * what Vite exposes by default. The deployed environment is configured with
+   * `FIREBASE_apiKey`, the Firebase/AI Studio convention. Accepting both means
+   * the same build is configured by either, and — the part that matters — a
+   * mismatch shows up as a missing variable rather than as a product that
+   * quietly has no accounts.
+   */
+  const read = (viteName: string, firebaseName: string): string | undefined =>
+    env[viteName] ?? env[firebaseName];
+
+  const apiKey = read('VITE_FIREBASE_API_KEY', 'FIREBASE_apiKey');
+  const authDomain = read('VITE_FIREBASE_AUTH_DOMAIN', 'FIREBASE_authDomain');
+  const projectId = read('VITE_FIREBASE_PROJECT_ID', 'FIREBASE_projectId');
 
   const missing: string[] = [];
-  if (!apiKey) missing.push('VITE_FIREBASE_API_KEY');
-  if (!authDomain) missing.push('VITE_FIREBASE_AUTH_DOMAIN');
-  if (!projectId) missing.push('VITE_FIREBASE_PROJECT_ID');
+  if (!apiKey) missing.push('VITE_FIREBASE_API_KEY/FIREBASE_apiKey');
+  if (!authDomain) missing.push('VITE_FIREBASE_AUTH_DOMAIN/FIREBASE_authDomain');
+  if (!projectId) missing.push('VITE_FIREBASE_PROJECT_ID/FIREBASE_projectId');
   if (missing.length > 0) {
     return {
       unavailable: `Firebase is not configured (${missing.join(', ')}). Sign-in is unavailable and data stays on this device.`,
@@ -362,11 +375,11 @@ export function firebaseConfigFromEnv(
       apiKey: apiKey as string,
       authDomain: authDomain as string,
       projectId: projectId as string,
-      ...(env['VITE_FIREBASE_STORAGE_BUCKET'] ? { storageBucket: env['VITE_FIREBASE_STORAGE_BUCKET'] } : {}),
-      ...(env['VITE_FIREBASE_MESSAGING_SENDER_ID']
-        ? { messagingSenderId: env['VITE_FIREBASE_MESSAGING_SENDER_ID'] }
+      ...(read('VITE_FIREBASE_STORAGE_BUCKET', 'FIREBASE_storageBucket') ? { storageBucket: read('VITE_FIREBASE_STORAGE_BUCKET', 'FIREBASE_storageBucket') } : {}),
+      ...(read('VITE_FIREBASE_MESSAGING_SENDER_ID', 'FIREBASE_messagingSenderId')
+        ? { messagingSenderId: read('VITE_FIREBASE_MESSAGING_SENDER_ID', 'FIREBASE_messagingSenderId') }
         : {}),
-      ...(env['VITE_FIREBASE_APP_ID'] ? { appId: env['VITE_FIREBASE_APP_ID'] } : {}),
+      ...(read('VITE_FIREBASE_APP_ID', 'FIREBASE_appId') ? { appId: read('VITE_FIREBASE_APP_ID', 'FIREBASE_appId') } : {}),
     },
   };
 }
