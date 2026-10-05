@@ -11,7 +11,7 @@ import {
   KeyRound,
 } from 'lucide-react';
 import { ExecutionMode } from '../../types/trading';
-import { User } from '../../services/userService';
+import { User, userService } from '../../services/userService';
 import { AIProviderConfig } from '../../adapters/openrouter/types';
 import { WalletCard } from './WalletCard';
 
@@ -111,6 +111,35 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
           <ChevronRight className="w-4 h-4 text-ink-4 group-hover:text-ink-2" />
         </div>
       </div>
+
+      {/*
+        Sign out.
+
+        Needed and previously missing: `AuthService.signOut` existed and the gate
+        would honour it, but nothing in the interface offered it, so an account
+        could be created and then never left on a shared machine — with the
+        previous session's GOATs still on screen behind the next person to use it.
+        Shown only when there is an account, since signing out of nothing is
+        meaningless.
+      */}
+      {user?.id && (
+        <button
+          type="button"
+          onClick={() => {
+            void userService().signOut().catch((error: unknown) => {
+              console.warn('Sign-out failed', error);
+            });
+          }}
+          className="w-full rounded-2xl bg-surface border border-line px-3.5 py-3 text-left hover:bg-surface-3 transition-colors cursor-pointer"
+        >
+          <div className="text-xs font-bold uppercase tracking-wider text-ink-3">
+            Account
+          </div>
+          <div className="mt-1 text-xs text-ink-3 font-mono truncate">
+            Signed in as {email || 'this account'} — sign out
+          </div>
+        </button>
+      )}
 
       {/* TRADING ACCOUNTS */}
       <div className="space-y-2">
