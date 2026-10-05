@@ -88,7 +88,23 @@ class StubEnvironment implements ITradingEnvironment {
   }
   /** Counts reads so a test can prove a doomed one is not repeated. */
   barReads = 0;
-  async getMarketBars(): Promise<Bar[]> { this.barReads += 1; return BARS; }
+  /** Reads per resolution, so "was this resolution asked for again?" is answerable. */
+  readsByTimeframe = new Map<string, number>();
+  /** Resolutions this market cannot supply, as a real deployment's may not be. */
+  unavailableTimeframes: string[] = [];
+
+  async getMarketBars(_symbol: string, timeframe: string): Promise<Bar[]> {
+    this.barReads += 1;
+    this.readsByTimeframe.set(timeframe, (this.readsByTimeframe.get(timeframe) ?? 0) + 1);
+    if (this.unavailableTimeframes.includes(timeframe)) {
+      throw new Error(`${timeframe} is not available for this market.`);
+    }
+    return BARS;
+  }
+
+  readsFor(timeframe: string): number {
+    return this.readsByTimeframe.get(timeframe) ?? 0;
+  }
   async getInstruments() { return [METADATA]; }
   async getAccountState() {
     return { balance: 10_000, equity: 10_000, margin: 0, freeMargin: 10_000, dailyPnL: 0, drawdownPercent: 0 };
@@ -122,7 +138,11 @@ class ScriptedModel implements IAgentModel {
     this.unavailable = unavailable;
   }
 
-  async run() {
+  /** Every prompt this model was asked, so a test can assert on what the GOAT was told. */
+  requests: Array<{ instructions: string }> = [];
+
+  async run(request: { instructions: string }) {
+    this.requests.push({ instructions: request.instructions });
     const next = this.replies[this.calls] ?? this.fallback;
     this.calls += 1;
     if (this.unavailable) {
@@ -2252,28 +2272,93 @@ export async function runAgentSurfaceTests(): Promise<void> {
  * needing 1h confirmation could ask again on the next wake, and the one after.
  */
 test('resolutions: a resolution known to be unavailable is not read again', async () => {
-  const h = makeHarness({ timeframes: ['1m'] });
-
-  // First pass: the 1h read happens and fails, and that failure is remembered.
-  await h.orchestrator.investigateGoal(h.goalId);
-  const afterFirst = h.env.barReads;
-  assert(afterFirst > 0, 'the first pass read the market');
-
   /*
-   * Second pass over the same agent. The point is not that the read count is
-   * identical — a live 1m read is still needed each pass — but that the dead 1h
-   * resolution is not probed again, so the count does not grow by a whole extra
-   * resolution's worth of reads on a market that cannot serve it.
+   * A market that can serve 1m but not 1h — the shape of the original problem: a
+   * GOAT working one resolution and needing a coarser one, on a dataset that does
+   * not have it. Whether 1h exists does not change between wakes, so paying for
+   * the read again is paying to learn something already known.
+   *
+   * A wake is the unit that matters, not another investigate: the first pass sets
+   * up the deployment, and it is subsequent wakes that used to re-probe.
    */
-  const beforeSecond = h.env.barReads;
+  const h = makeHarness({ timeframes: ['1m', '1h'] });
+  h.env.unavailableTimeframes = ['1h'];
+
   await h.orchestrator.investigateGoal(h.goalId);
-  const secondPassReads = h.env.barReads - beforeSecond;
+  const coarseAfterSetup = h.env.readsFor('1h');
+  assert(coarseAfterSetup > 0, 'setup does try to read the coarser resolution');
+  const liveAfterSetup = h.env.readsFor('1m');
+  assert(liveAfterSetup > 0, 'and the resolution the market can supply');
+
+  const thesisId = h.mission().thesis!.id;
+  const wake = (id: string) =>
+    h.orchestrator.runWake({
+      thesisId,
+      goalId: h.goalId,
+      agentId: h.agentId,
+      thesis: h.orchestrator.stores.theses.get(thesisId)!,
+      relatedEvents: [],
+      skillIds: [],
+      createdAt: h.clock.now(),
+      event: {
+        id, trackerId: '', agentId: h.agentId, kind: 'CUSTOM' as const, eventType: 'CUSTOM' as const,
+        timestamp: h.clock.now(), environment: 'DEMO' as const, reason: 'wake', priority: 0, severity: 'INFO' as const,
+      },
+    } as never);
+
+  await wake('evt-unavailable-1');
+  await wake('evt-unavailable-2');
+
+  assertEqual(
+    h.env.readsFor('1h'),
+    coarseAfterSetup,
+    'later wakes do not re-read a resolution already known to be unavailable',
+  );
   assert(
-    secondPassReads <= beforeSecond,
-    `a second pass does not probe more than the first did (${afterFirst} then ${secondPassReads})`,
+    h.env.readsFor('1m') > liveAfterSetup,
+    'while the resolution the market can supply is still read on every wake',
   );
 });
 
+
+
+
+/**
+ * A constraint the runtime had already determined used to be shown only to the
+ * person watching, so the model was asked to work it out for itself — and, in
+ * the case of a resolution the market cannot supply, asked again on every wake.
+ * Stating it in the decision prompt is what closes that loop, so this asserts
+ * the prompt rather than the method that builds it.
+ */
+test('constraints: an outstanding constraint reaches the decision prompt', async () => {
+  const h = makeHarness({ timeframes: ['1m'] });
+
+  const written = h.orchestrator.saveUserSkill([
+    '---',
+    'id: needs_confirmation',
+    'name: Needs Confirmation',
+    'description: Wants a coarser read before acting.',
+    'capabilities: [market.getQuote]',
+    'constraints: [REQUIRE_HIGHER_TIMEFRAME_CONFIRMATION]',
+    '---',
+    '',
+    'Wait for a coarser read before acting.',
+  ].join('\n'));
+  assertEqual(written.problems.length, 0, `the skill saves: ${written.problems.join('; ')}`);
+  const skillId = written.document!.id;
+
+  await h.orchestrator.investigateGoal(h.goalId);
+
+  const asked = h.model.requests.map((request) => request.instructions).join('\n');
+  assert(
+    asked.includes('KNOWN CONDITIONS'),
+    'the decision prompt tells the model what the runtime already knows',
+  );
+  assert(
+    asked.includes('higher timeframe'),
+    `and names the outstanding requirement instead of leaving it to be rediscovered (skills: ${skillId})`,
+  );
+});
 
 if (import.meta.main) {
   await runAgentSurfaceTests();
