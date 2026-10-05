@@ -31,6 +31,11 @@ import {
 
 import type { Bar } from '../../types/trading';
 import {
+  backtestKeyFor,
+  backtestManager,
+  createManagedBacktest,
+} from '../../engine/goat/backtest/manager';
+import {
   BacktestSession,
   SIMULATION_SPEEDS,
   formatSimulatedDate,
@@ -196,11 +201,37 @@ export const BacktestSurface: React.FC<BacktestSurfaceProps> = ({
   const [preset, setPreset] = useState('declared');
   const [history, setHistory] = useState<BacktestHistory | undefined>();
 
-  const [session, setSession] = useState<BacktestSession | undefined>();
-  const [snapshot, setSnapshot] = useState<BacktestSnapshot | undefined>();
+  /*
+   * The session is not this component's. It is filed with the application-level
+   * manager under a key derived from the GOAT, so leaving this screen detaches
+   * the view without touching the run — which is the whole difference between a
+   * replay you can navigate away from and one that either dies on you or keeps
+   * ticking where nothing can reach it.
+   */
+  const key = useMemo(() => backtestKeyFor(seed?.goalId), [seed?.goalId]);
+  const [session, setSession] = useState<BacktestSession | undefined>(() => backtestManager.get(key));
+  const [snapshot, setSnapshot] = useState<BacktestSnapshot | undefined>(
+    () => backtestManager.get(key)?.snapshot(),
+  );
   const [entries, setEntries] = useState<AgentEventView[]>([]);
   const [error, setError] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
+
+  /*
+   * Re-attach to whatever is running for this GOAT, whenever the key changes.
+   *
+   * Mounting late is the case this exists for: returning to a replay already in
+   * progress shows that run, not an empty screen. The subscription reports the
+   * current session immediately, so a run that finished while nobody was looking
+   * is still there to read.
+   */
+  useEffect(() => {
+    setSession(backtestManager.get(key));
+    return backtestManager.subscribe(key, (next) => {
+      setSession(next);
+      setSnapshot(next?.snapshot());
+    });
+  }, [key]);
 
   /*
    * The clock ticks a few times a second, and only so the simulated time stays
@@ -275,7 +306,7 @@ export const BacktestSurface: React.FC<BacktestSurfaceProps> = ({
         ...(seed?.timeframe ? { setup: seed.timeframe } : {}),
       });
 
-      const next = new BacktestSession({
+      const next = createManagedBacktest(key, {
         goal,
         market,
         timeframe: plan.setup,
@@ -308,11 +339,15 @@ export const BacktestSurface: React.FC<BacktestSurfaceProps> = ({
       await next.play();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
+      // A replay that failed to load is taken out of the registry as well as
+      // the screen: clearing the view alone would leave a session nobody can
+      // start, pause or stop behind the manager.
+      await backtestManager.dispose(key, 'Failed to start.');
       setSession(undefined);
     } finally {
       setBusy(false);
     }
-  }, [busy, from, goal, loadBars, market, speed, to]);
+  }, [busy, from, goal, key, loadBars, market, name, preset, seed, speed, to]);
 
   const mission = snapshot?.mission;
   const plan = useMemo(() => (mission ? buildPlanView(mission) : undefined), [mission]);
@@ -403,8 +438,8 @@ export const BacktestSurface: React.FC<BacktestSurfaceProps> = ({
             )}
             <BacktestControl
               onClick={() => {
-                void session.stop('Stopped from the surface.').then(() => setSnapshot(session.snapshot()));
-              }}
+                  void backtestManager.stop(key, 'Stopped from the surface.').then(() => setSnapshot(session.snapshot()));
+                }}
               icon={<Square className="h-3 w-3" />}
               testId="backtest-stop"
               disabled={snapshot?.state === 'STOPPED'}

@@ -178,6 +178,18 @@ export interface BacktestRequest {
   model?: IAgentModel;
   warmupMinutes?: number;
   costModel?: BacktestCostModel;
+  /**
+   * Timers for the replay clock. Omitted, it uses the platform's.
+   *
+   * Forwarded from the request so a lifecycle test can drive the clock by hand
+   * and observe whether a running replay is still reachable after the surface
+   * that started it has gone. The clock already treats its scheduler as a
+   * dependency; this only lets a caller reach it through the session.
+   */
+  scheduler?: {
+    setInterval(handler: () => void, ms: number): unknown;
+    clearInterval(handle: unknown): void;
+  };
 }
 
 /**
@@ -352,6 +364,7 @@ export class BacktestSession {
     this.clock = new SimulationClock({
       start: request.start,
       speed: request.speed ?? DEFAULT_SIMULATION_SPEED,
+      ...(request.scheduler ? { scheduler: request.scheduler } : {}),
     });
 
     /*
