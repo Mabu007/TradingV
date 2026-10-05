@@ -157,8 +157,26 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
   const selected = models.find((model) => model.id === value);
   const recommended = useMemo(() => recommendedModels(models), [models]);
   const matches = useMemo(() => filterModels(models, filters), [models, filters]);
-  const recommendedIds = useMemo(() => new Set(recommended.map((model) => model.id)), [recommended]);
   const missingSelected = Boolean(value) && models.length > 0 && !selected;
+
+  /*
+   * `matches` is the answer the filters already produced, and it is the whole
+   * answer. The All section used to hand it to a filter that kept only the
+   * recommended ids, which turned a 466-model catalogue into 8 rows and a
+   * 96-result search into 1 — the count in the heading came from `matches`
+   * while the rows came from the thinned list, so the two disagreed on screen.
+   *
+   * Recommended models are dropped from All so nothing is listed twice, but
+   * only while their own section is on screen. The heading is hidden as soon
+   * as there is a query, so excluding them unconditionally would throw away
+   * matching models during a search — the one moment the All list is the only
+   * list. A model that matches belongs in front of the user either way.
+   */
+  const recommendedVisible = recommended.length > 0 && !filters.query;
+  const allMatches = useMemo(
+    () => sectionModelRows(matches, recommended, recommendedVisible).all,
+    [matches, recommended, recommendedVisible],
+  );
 
   // Close on an outside click or Escape: a panel that only closes on its own
   // button is a panel people get stuck in.
@@ -316,7 +334,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
               </div>
             )}
 
-            {recommended.length > 0 && !filters.query && (
+            {recommendedVisible && (
               <>
                 <GroupLabel label="Recommended" />
                 {recommended
@@ -333,20 +351,18 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
               </>
             )}
 
-            {matches.length > 0 && (
+            {allMatches.length > 0 && (
               <>
-                <GroupLabel label={`All text models (${matches.length})`} />
-                {matches
-                  .filter((model) => recommendedIds.has(model.id))
-                  .map((model) => (
-                    <ModelRow
-                      key={`all-${model.id}`}
-                      model={model}
-                      selected={model.id === value}
-                      testState={testState?.id === model.id ? testState.status : undefined}
-                      onSelect={() => choose(model.id)}
-                    />
-                  ))}
+                <GroupLabel label={`All text models (${allMatches.length})`} />
+                {allMatches.map((model) => (
+                  <ModelRow
+                    key={`all-${model.id}`}
+                    model={model}
+                    selected={model.id === value}
+                    testState={testState?.id === model.id ? testState.status : undefined}
+                    onSelect={() => choose(model.id)}
+                  />
+                ))}
               </>
             )}
           </div>
@@ -478,6 +494,29 @@ const Badge: React.FC<{ label: string; tone?: 'good' | 'bad' }> = ({ label, tone
     {label}
   </span>
 );
+
+/**
+ * Split a filtered catalogue into the two rows the list actually renders.
+ *
+ * This used to live inline in the render, where the All section filtered
+ * `matches` down to the recommended ids — inverting the section's purpose and
+ * discarding everything the filters had kept. Splitting it out makes the rule
+ * stated once and testable without a DOM.
+ *
+ * `recommendedVisible` is passed in rather than derived, because it depends on
+ * whether the caller is searching. While there is a query the Recommended
+ * heading is not rendered, so a matching recommended model must stay in All
+ * rather than vanish between two lists that both claim it.
+ */
+export function sectionModelRows(
+  matches: OpenRouterModel[],
+  recommended: OpenRouterModel[],
+  recommendedVisible: boolean,
+): { all: OpenRouterModel[] } {
+  if (!recommendedVisible) return { all: matches };
+  const recommendedIds = new Set(recommended.map((model) => model.id));
+  return { all: matches.filter((model) => !recommendedIds.has(model.id)) };
+}
 
 function formatContext(tokens: number): string {
   if (!tokens) return '—';
