@@ -132,6 +132,8 @@ type OpenRouterContext = AIChatContext;
 
 export class OpenRouterProvider implements IAIProvider {
   private config: AIProviderConfig;
+  /** The start-up model swap, waiting to be shown rather than silently applied. */
+  private lastReconciled: { from: string; to: string } | null = null;
 
   constructor() {
     this.config = this.loadConfig();
@@ -285,11 +287,34 @@ export class OpenRouterProvider implements IAIProvider {
     const replacement = pickDefaultModel(catalogue.models);
     if (replacement && replacement !== previous) {
       this.setModel(replacement);
+      /*
+       * Recorded rather than only logged.
+       *
+       * A retired model has to be replaced — there is nothing to call — but the
+       * swap used to be invisible: it happened at start-up, and because
+       * `pickDefaultModel` returns the first live entry in the recommended list,
+       * a user who had chosen a specific free model silently ended up on
+       * `openrouter/free` and was told the application wanted them there. It is
+       * kept so a surface can state the change in the conversation instead.
+       */
+      this.lastReconciled = { from: previous, to: replacement };
       console.info(
         `OpenRouter model "${previous}" is no longer offered. Using "${replacement}".`,
       );
     }
     return this.config.model;
+  }
+
+  /**
+   * Take the start-up model swap, if there was one.
+   *
+   * Returns it once and clears it, so the notice appears once rather than on
+   * every render.
+   */
+  takeReconciledNotice(): { from: string; to: string } | null {
+    const notice = this.lastReconciled;
+    this.lastReconciled = null;
+    return notice;
   }
 
   /**

@@ -134,6 +134,15 @@ export interface ModelPickerProps {
   variant?: 'modal' | 'compact';
   /** Offer the one-request "does this key work with this model" check. */
   allowTest?: boolean;
+  /**
+   * Increment this to open the picker from outside it.
+   *
+   * A number rather than a boolean so the same value can request the picker
+   * twice: a "choose another model" button has to be able to reopen a picker the
+   * user has just closed, which a boolean latch cannot express. The picker owns
+   * its open state — this only asks, and the user can still close it.
+   */
+  openSignal?: number;
 }
 
 export const ModelPicker: React.FC<ModelPickerProps> = ({
@@ -144,8 +153,10 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
   onRefresh,
   variant = 'modal',
   allowTest = true,
+  openSignal = 0,
 }) => {
   const [open, setOpen] = useState(false);
+  const lastSignal = useRef(openSignal);
   const [filters, setFilters] = useState<Filters>(NO_FILTERS);
   const [testState, setTestState] = useState<
     { id: string; status: 'testing' } | { id: string; status: 'ok' } | { id: string; status: 'failed'; message: string }
@@ -177,6 +188,17 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
     () => sectionModelRows(matches, recommended, recommendedVisible).all,
     [matches, recommended, recommendedVisible],
   );
+
+  /*
+   * Open when asked from outside, and only then: a repeated identical signal is
+   * ignored so a parent re-rendering with the same number cannot yank the list
+   * open while somebody is reading it.
+   */
+  useEffect(() => {
+    if (openSignal === lastSignal.current) return;
+    lastSignal.current = openSignal;
+    setOpen(true);
+  }, [openSignal]);
 
   // Close on an outside click or Escape: a panel that only closes on its own
   // button is a panel people get stuck in.

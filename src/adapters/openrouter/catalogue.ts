@@ -39,10 +39,16 @@ export const LONG_CONTEXT_TOKENS = 200_000;
  *
  * Ordered by what an MVP tester needs first: free, capable of tools and
  * structured output, and enough context for the agent runtime.
+ *
+ * `stealth/space-bunny-alpha` was here and has been removed. OpenRouter does not
+ * list it — no `stealth` vendor and no model with "bunny" in its id or name is
+ * published — so every request using it came back 404. It survived here because
+ * `recommendedModels` only offers ids the live catalogue contains, which made the
+ * entry invisible online and useless offline: a selection that could only ever
+ * fail. Nothing here should name a model the provider does not serve.
  */
 export const RECOMMENDED_MODEL_IDS = [
   'openrouter/free',
-  'stealth/space-bunny-alpha',
   'nvidia/nemotron-3-super-120b-a12b:free',
   'google/gemini-2.5-flash',
   'openai/gpt-4.1-mini',
@@ -102,10 +108,13 @@ export const DEFAULT_MODEL_ID = 'openrouter/free';
  * Deliberately small. This list is not the product's model picker; it is
  * what keeps the app from becoming unusable during an outage, and it is
  * written so that a wrong entry costs one model rather than a screen.
+ *
+ * Every entry must be a model OpenRouter actually serves, because this list is
+ * what a user is offered when the catalogue cannot be fetched: an entry that is
+ * not served is a selection that can only fail.
  */
 export const FALLBACK_MODELS: OpenRouterModel[] = [
   fallbackModel('openrouter/free', 'Free Models Router', 200_000),
-  fallbackModel('stealth/space-bunny-alpha', 'Space Bunny Alpha', 1_000_000),
   fallbackModel('nvidia/nemotron-3-super-120b-a12b:free', 'NVIDIA: Nemotron 3 Super', 262_144),
   fallbackModel('google/gemini-2.5-flash', 'Google: Gemini 2.5 Flash', 1_048_576),
   fallbackModel('openai/gpt-4.1-mini', 'OpenAI: GPT-4.1 Mini', 1_047_576),

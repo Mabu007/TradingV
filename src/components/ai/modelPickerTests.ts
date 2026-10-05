@@ -53,19 +53,24 @@ const ids = (models: OpenRouterModel[]): string[] => models.map((entry) => entry
  * Test 1 — the full catalogue reaches the list.
  *
  * The regression in one assertion: with no search, every non-recommended model
- * is rendered. Before the fix this returned the 8 recommended ids, so a
- * catalogue of 500 produced 8 rows.
+ * is rendered. Before the fix this returned only the recommended ids, so a
+ * catalogue of ~500 produced 8 rows.
+ *
+ * The total is derived rather than written down: the recommended list changes
+ * when a model is retired upstream, and a hardcoded count then fails for a
+ * reason that has nothing to do with the picker.
  */
 function runFullCatalogueTest(): void {
   const recommendedFixtures = RECOMMENDED_MODEL_IDS.map((id) => model(id));
   const others = filler(492);
   const catalogue = [...recommendedFixtures, ...others];
+  const expectedTotal = catalogue.length;
 
   const matches = filterModels(catalogue, {});
   const recommended = recommendedModels(catalogue);
   const { all } = sectionModelRows(matches, recommended, true);
 
-  assert(matches.length === 500, 'the filters keep the whole catalogue');
+  assert(matches.length === expectedTotal, 'the filters keep the whole catalogue');
   assert(recommended.length > 0, 'the catalogue yields a recommended section');
   assert(
     all.length === matches.length - recommended.length,

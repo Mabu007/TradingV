@@ -154,6 +154,27 @@ interface MessageState {
  * phone it is the whole screen, because a 400px column with a 40px
  * composer at the bottom of a phone screen is unusable.
  */
+/**
+ * What a recovery button does.
+ *
+ * Extracted because the failure it now covers was invisible: the button rendered
+ * on exactly the right messages, the click reached a real handler, and the
+ * handler only handled `'SETTINGS'` — so `'MODEL'` fell through and did nothing.
+ * Nothing threw and nothing was logged, and the assistant looked like it had a
+ * working recovery path. A branch of one `if` is too small to be reviewed by
+ * reading and too easy to leave empty, so it is a function with a test.
+ */
+export function runRecovery(
+  kind: 'MODEL' | 'SETTINGS',
+  actions: { openModelPicker: () => void; openProviderSettings?: () => void },
+): void {
+  if (kind === 'MODEL') {
+    actions.openModelPicker();
+    return;
+  }
+  actions.openProviderSettings?.();
+}
+
 export const FloatingAIAssistant: React.FC<FloatingAIAssistantProps> = ({
   openPositions,
   onClosePosition,
@@ -193,6 +214,18 @@ export const FloatingAIAssistant: React.FC<FloatingAIAssistantProps> = ({
   const nextId = useRef(0);
 
   const { catalogue, loading: catalogueLoading } = useModelCatalogue();
+
+  /*
+   * Opening the picker from outside it.
+   *
+   * The "Choose another model" button exists on the message that reports a model
+   * failure, and it had no effect at all: the recovery handler covered only
+   * 'SETTINGS', so the 'MODEL' branch fell through and the button was a no-op. A
+   * counter rather than a boolean, because a button has to be able to reopen a
+   * picker the user has just closed.
+   */
+  const [pickerSignal, setPickerSignal] = useState(0);
+  const openModelPicker = useCallback(() => setPickerSignal((value) => value + 1), []);
 
   useEffect(() => {
     mounted.current = true;
@@ -319,6 +352,30 @@ export const FloatingAIAssistant: React.FC<FloatingAIAssistantProps> = ({
     const id = `msg-${(nextId.current += 1)}`;
     setChat((state) => ({ ...state, messages: [...state.messages, { ...message, id }] }));
   }, []);
+
+  /*
+   * A model swapped at start-up is stated, not assumed.
+   *
+   * `reconcileModel` has to replace a model the provider no longer serves — there
+   * is nothing to call — but the swap was invisible, and because the replacement
+   * is the first live entry in the recommended list it landed on `openrouter/free`.
+   * A user who had chosen a particular free model was therefore moved onto the
+   * router with no word, which is indistinguishable from the application insisting
+   * on the router. Said once, here, where the conversation is.
+   */
+  useEffect(() => {
+    const notice = openRouterProvider.takeReconciledNotice();
+    if (!notice || !mounted.current) return;
+    append({
+      role: 'assistant',
+      content:
+        `Your saved model ${notice.from} is no longer offered by OpenRouter, so I am using ` +
+        `${notice.to} instead. Choose another model if that is not what you want.`,
+      recovery: 'MODEL',
+    });
+    // Runs once: the notice is taken, so re-running would not repeat it anyway,
+    // and `append` is stable.
+  }, [append]);
 
   const send = useCallback(
     async (text: string) => {
@@ -563,6 +620,7 @@ export const FloatingAIAssistant: React.FC<FloatingAIAssistantProps> = ({
                   loading={catalogueLoading}
                   variant="compact"
                   allowTest={false}
+                  openSignal={pickerSignal}
                 />
               </div>
             </header>
@@ -582,9 +640,12 @@ export const FloatingAIAssistant: React.FC<FloatingAIAssistantProps> = ({
                     onAction={handleAction}
                     onControl={onGoatControl}
                     onReply={append}
-                    onRecovery={(kind) => {
-                      if (kind === 'SETTINGS') onOpenProviderSettings?.();
-                    }}
+                    onRecovery={(kind) =>
+                      runRecovery(kind, {
+                        openModelPicker,
+                        ...(onOpenProviderSettings ? { openProviderSettings: onOpenProviderSettings } : {}),
+                      })
+                    }
                   />
                 ))
               )}

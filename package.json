@@ -38,6 +38,7 @@
     "verify:no-triggers": "bash scripts/verify-no-triggers.sh",
     "test:venue": "bun src/config/venueTests.ts",
     "test:openrouter": "bun src/adapters/openrouter/tests.ts",
+    "test:assistant-model": "bun src/adapters/openrouter/assistantModelTests.ts",
     "test:openrouter:live": "bun src/adapters/openrouter/liveCheck.ts",
     "test:goat:live": "bun src/engine/goat/liveEndToEnd.ts",
     "test:firebase": "bun src/services/firebase/tests.ts",
