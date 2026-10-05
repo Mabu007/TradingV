@@ -21,6 +21,7 @@ import { PersistenceService } from './persistence';
 import { MemoryStore } from './memoryStore';
 import { startUserDataSync, goalFromRecord, recordFromGoal } from './userDataSync';
 import { firebaseConfigFromEnv } from './contract';
+import { configureFirebase, firebaseServices, resetFirebaseServices } from './configure';
 import type { AuthSession, FirebaseAuthBackend, GoatRecord } from './contract';
 import type { Goal } from '../../engine/goat/types';
 import type { GoalStore } from '../../engine/goat/store';
@@ -448,6 +449,25 @@ async function testSignOutStopsWriting(): Promise<void> {
 // 6. Record <-> goal mapping
 // ---------------------------------------------------------------------------
 
+/**
+ * One set of services per tab.
+ *
+ * `main.tsx` hands a configured instance to the auth gate while `App.tsx` — whose
+ * module scope runs first, because `import App` is hoisted — reads the services
+ * itself. Two instances meant the gate authenticated against one AuthService
+ * while the Firestore data path listened to another, so sign-in worked and
+ * nothing was persisted. The symptom was a correctly signed-in application with
+ * an empty account.
+ */
+function testSingleServicesInstance(): void {
+  resetFirebaseServices();
+  const first = firebaseServices();
+  const second = configureFirebase();
+  assert(first === second, 'building the services again returns the same set, not a second one');
+  assert(first.auth === second.auth, 'and therefore the same auth service');
+  resetFirebaseServices();
+}
+
 function testMapping(): void {
   const original = goal('map-me');
   const record = recordFromGoal(original);
@@ -476,6 +496,7 @@ if (import.meta.main) {
     { name: 'failure: a failed load keeps local state', fn: testFailedReadKeepsLocalState },
     { name: 'failure: sign-out stops writes reaching the account', fn: testSignOutStopsWriting },
     { name: 'mapping: a stored GOAT round-trips', fn: testMapping },
+    { name: 'services: one instance per tab', fn: testSingleServicesInstance },
   ];
   let passed = 0;
   const failures: string[] = [];

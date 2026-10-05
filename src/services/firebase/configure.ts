@@ -67,6 +67,24 @@ let services: FirebaseServices | null = null;
 export function configureFirebase(
   env: Record<string, string | undefined> = import.meta.env as unknown as Record<string, string | undefined>,
 ): FirebaseServices {
+  /*
+   * One set of services per tab.
+   *
+   * Calling this twice used to build two independent stacks — two `AuthService`s,
+   * two session subscriptions — while this module's own comment claimed there was
+   * exactly one. The failure was invisible and severe: `main.tsx` passes a
+   * configured instance to the auth gate, and because `import App` is hoisted
+   * above that call, `App.tsx`'s module scope had already built a *different*
+   * one. Sign-in worked on the gate's copy, so the application looked correctly
+   * authenticated, while everything listening on the other copy — the Firestore
+   * data path — never saw a session and quietly persisted nothing.
+   *
+   * An explicit environment still builds fresh services, which is what the tests
+   * rely on to exercise both the configured and unconfigured paths.
+   */
+  const explicitEnv = arguments.length > 0;
+  if (!explicitEnv && services !== null) return services;
+
   const resolved = firebaseConfigFromEnv(env);
 
   if ('unavailable' in resolved) {
@@ -145,6 +163,18 @@ export function configureFirebase(
  */
 export function firebaseServices(): FirebaseServices {
   return services ?? configureFirebase();
+}
+
+/**
+ * Drop the tab's services so the next call builds them afresh.
+ *
+ * For tests, which need to exercise both the configured and unconfigured paths in
+ * one process. Production has no reason to call it: the services are meant to
+ * live for the tab.
+ */
+export function resetFirebaseServices(): void {
+  if (services) services.dispose();
+  services = null;
 }
 
 /** Whether the application can offer sign-in at all. */
