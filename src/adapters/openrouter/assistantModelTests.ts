@@ -13,6 +13,7 @@
 
 import { OpenRouterProvider } from './provider';
 import { runRecovery } from '../../components/ai/FloatingAIAssistant';
+import { isModelFailure } from './errors';
 import {
   DEFAULT_MODEL_ID,
   clearModelCatalogueCache,
@@ -24,7 +25,7 @@ import {
   pickDefaultModel,
   recommendedModels,
 } from './catalogue';
-import type { OpenRouterModel } from './types';
+import type { AIProviderError, OpenRouterModel } from './types';
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -248,7 +249,99 @@ function testPickerStillRendersEveryModel(): void {
 }
 
 // ---------------------------------------------------------------------------
-// 5. "Choose another model" must actually do something
+// 5. The selected id is what reaches OpenRouter
+// ---------------------------------------------------------------------------
+
+/**
+ * The end the UI cannot prove on its own.
+ *
+ * A model can be picked, displayed correctly and still not be the model that
+ * answers, if anything between the picker and the request body rewrites the id.
+ * Production cannot demonstrate this without spending a real request against a
+ * real key, so it is pinned here instead — the assertion is that the exact id
+ * chosen is the id sent, and in particular that a specific free model is never
+ * quietly replaced by the router.
+ */
+async function testSelectedIdReachesTheRequestBody(): Promise<void> {
+  for (const chosen of ['liquid/lfm-2.5-2.6b:free', 'openrouter/free', 'stealth/space-bunny-alpha']) {
+    clearModelCatalogueCache();
+    const provider = new OpenRouterProvider();
+    provider.saveConfig({ apiKey: 'sk-or-v1-test0000000000000000notreal', model: chosen });
+
+    const originalFetch = globalThis.fetch;
+    let sent: Record<string, unknown> | undefined;
+    globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+      sent = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const response = await provider.chat([{ role: 'user', content: 'hello' }]);
+      assert(response.error === undefined, `the call succeeded for ${chosen}`);
+      assertEqual(
+        String(sent?.['model']),
+        chosen,
+        `the request body carries exactly the selected id (${chosen}), not the router`,
+      );
+      assert(
+        String(sent?.['model']) !== 'openrouter/free' || chosen === 'openrouter/free',
+        'a specific model is never rewritten to the router',
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearModelCatalogueCache();
+    }
+  }
+}
+
+/**
+ * A model the provider does not serve fails visibly.
+ *
+ * The retired id is used deliberately: OpenRouter answers 404 for it, and the
+ * assistant must surface that as a model failure with a recovery action rather
+ * than as silence.
+ */
+async function testUnknownModelSurfacesAModelFailure(): Promise<void> {
+  clearModelCatalogueCache();
+  const provider = new OpenRouterProvider();
+  provider.saveConfig({ apiKey: 'sk-or-v1-test0000000000000000notreal', model: 'stealth/space-bunny-alpha' });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ error: { message: 'No endpoints found for stealth/space-bunny-alpha' } }), {
+      status: 404,
+    })) as typeof fetch;
+
+  try {
+    const response = (await provider.chat([{ role: 'user', content: 'hello' }])) as {
+      content: string;
+      error?: AIProviderError;
+    };
+    assert(response.error !== undefined, 'an uncallable model produces an error, not a silent success');
+    assertEqual(
+      response.error?.code,
+      'MODEL_UNAVAILABLE',
+      'classified as a model problem rather than an outage',
+    );
+    assert(
+      isModelFailure(response.error!),
+      'which is what offers the user "Choose another model"',
+    );
+    assert(
+      !response.content.includes('No endpoints found'),
+      'and the provider payload never becomes model content',
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearModelCatalogueCache();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 6. "Choose another model" must actually do something
 // ---------------------------------------------------------------------------
 
 function testChooseAnotherModelOpensThePicker(): void {
@@ -292,6 +385,8 @@ if (import.meta.main) {
     { name: 'startup: a retired model is replaced and reported', fn: testReconciledSwapIsObservable },
     { name: 'startup: a live model is left alone and silent', fn: testLiveSelectionIsNotReportedAsSwapped },
     { name: 'picker: the whole catalogue still renders and searches', fn: testPickerStillRendersEveryModel },
+    { name: 'request: the selected id is what reaches OpenRouter', fn: testSelectedIdReachesTheRequestBody },
+    { name: 'failure: an uncallable model surfaces a model failure', fn: testUnknownModelSurfacesAModelFailure },
     { name: "recovery: 'Choose another model' opens the picker", fn: testChooseAnotherModelOpensThePicker },
   ];
   let passed = 0;
