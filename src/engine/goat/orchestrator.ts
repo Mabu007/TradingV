@@ -43,6 +43,7 @@ import {
   collectMarketContext,
   marketContextEvidence,
   renderMarketContext,
+  BAR_COUNT,
 } from './marketContext';
 import {
   EvidenceStore,
@@ -572,6 +573,67 @@ export class GoatOrchestrator {
   }
   /** Consecutive unprompted looks that produced no hypothesis. */
   private readonly noThesisLooks = new Map<string, number>();
+  /**
+   * Resolutions this agent's market could not supply, learned once and kept.
+   *
+   * Keyed `agentId → symbol:timeframe`. Whether a resolution exists is a
+   * property of the market for this deployment, so re-deciding it on every wake
+   * was answering a question whose answer does not change — each wake paying
+   * for a read that was already known to fail, and then asking a model to
+   * request it again.
+   *
+   * Scoped to the agent rather than the process: a new deployment, and a CLEAR,
+   * both produce a new agent id and therefore re-probe, which is correct
+   * because the market behind the agent may have changed. Nothing here is
+   * persisted, so there is no cache to invalidate and no global state to leak
+   * between users.
+   */
+  private readonly unavailableResolutions = new Map<string, Set<string>>();
+  /**
+   * Record that a resolution cannot be read, or return the ones already known.
+   *
+   * A `getMarketBars` failure is recorded; a context that came back with
+   * limitations is recorded too, since a resolution with no candles behind it is
+   * the same dead end reached by a different route.
+   */
+  private noteUnavailableResolution(agentId: string, symbol: string, timeframe: string): void {
+    const key = `${symbol}:${timeframe}`;
+    const known = this.unavailableResolutions.get(agentId);
+    if (known) {
+      known.add(key);
+      return;
+    }
+    this.unavailableResolutions.set(agentId, new Set([key]));
+  }
+
+  private knownUnavailableResolutions(agentId: string): ReadonlySet<string> {
+    return this.unavailableResolutions.get(agentId) ?? new Set<string>();
+  }
+
+  /**
+   * State the runtime already knows, so the model is not asked to find it.
+   *
+   * These constraints are computed from skills and recorded evidence before
+   * any call is made, and they were previously only ever rendered for the
+   * person watching. A GOAT told only what its tools returned would read an
+   * absent coarser resolution as something to go and request — which is how a
+   * known-unavailable timeframe got asked for on every wake. Told up front, it
+   * can plan within what the market actually offers.
+   *
+   * Wording is deliberately informational: these are unmet conditions, not a
+   * prohibition. The runtime reports them rather than enforcing them, and a
+   * prompt that implied otherwise would turn a reported condition into an
+   * invented one.
+   */
+  private renderKnownConstraints(goalId: string): string {
+    const constraints = this.loop.outstandingConstraints(goalId);
+    if (constraints.length === 0) return '';
+    return [
+      'KNOWN CONDITIONS — already determined for this market, not something you need to discover:',
+      ...constraints.map((constraint) => `- ${constraint}`),
+      'Plan within these. Do not request a resolution already reported as unavailable, and do not ask for the confirmation above — it is recorded as outstanding and surfaced to the person who wrote your goal.',
+    ].join('\n');
+  }
   /**
    * Model requests that are outstanding right now, one per agent.
    *
@@ -2142,10 +2204,21 @@ export class GoatOrchestrator {
          * could ever wake it. The timer is the same bounded one, and it
          * re-checks that the deployment is still live before acting, so a
          * GOAT stopped in the meantime is not resurrected by it.
+         *
+         * A provider that answered unusably is exempt. The request reached
+         * OpenRouter and came back in a shape that would not read again, so
+         * the retry would spend a model call to arrive at the same answer —
+         * which is how one unreadable response used to become three. The
+         * failure is still reported, still leaves the GOAT deployed, and is
+         * still stated in plain terms; only the promise of a retry is
+         * withdrawn, because it is not one this runtime can keep.
          */
-        this.scheduleReconsideration(goal, deployment, 'MODEL_UNAVAILABLE');
+        const retryable = !proposal.responseReached;
+        if (retryable) this.scheduleReconsideration(goal, deployment, 'MODEL_UNAVAILABLE');
         return failed(
-          `${proposal.unavailable} The GOAT stays deployed on ${deployment.marketId} and will retry safely.`,
+          retryable
+            ? `${proposal.unavailable} The GOAT stays deployed on ${deployment.marketId} and will retry safely.`
+            : `${proposal.unavailable} The GOAT stays deployed on ${deployment.marketId}. Retrying would return the same unreadable answer, so no retry was scheduled.`,
           'MODEL_FAILURE',
           true,
         );
@@ -2921,13 +2994,44 @@ export class GoatOrchestrator {
       };
     }
 
-    return collectMarketContext(this.deps.env, this.capabilities, {
+    /*
+     * Already known to be dead for this agent, so the read is not attempted
+     * again. The answer is returned directly and says why it is empty, so the
+     * model is told the resolution is unavailable for the same reason it was
+     * the first time — the loop stops repeating a doomed read, and stops
+     * asking the model to request what is already known not to exist.
+     */
+    if (this.knownUnavailableResolutions(instance.agent.id).has(`${symbol}:${timeframe}`)) {
+      return {
+        symbol,
+        timeframe,
+        bars: { requested: BAR_COUNT, received: 0 },
+        structure: {},
+        indicators: {},
+        limitations: [
+          `${timeframe} is not available for ${symbol} on this market and was already found to be unavailable for this GOAT. It has not been requested again.`,
+        ],
+      };
+    }
+
+    const context = await collectMarketContext(this.deps.env, this.capabilities, {
       agentId: instance.agent.id,
       symbol,
       timeframe,
       policy: instance.agent.policy,
       mode: this.deps.env.mode,
     });
+
+    /*
+     * Learned here so the next wake starts from it. Both routes to a dead end
+     * count: a thrown read and a context that came back with no candles behind
+     * it.
+     */
+    if (context.limitations.length > 0 || context.bars.received === 0) {
+      this.noteUnavailableResolution(instance.agent.id, symbol, timeframe);
+    }
+
+    return context;
   }
 
   /**
@@ -3208,6 +3312,15 @@ export class GoatOrchestrator {
      * recorded as one.
      */
     modelFailed?: boolean;
+    /**
+     * True when the provider answered and the answer was unusable.
+     *
+     * Suppresses the outage retry: the request reached OpenRouter, so waiting
+     * cannot change the outcome and re-issuing it spends a model call to
+     * arrive at the same unusable answer. The GOAT stays deployed and no
+     * thesis is invented — the difference is the retry, not the outcome.
+     */
+    responseReached?: boolean;
     /** Real milliseconds the deciding call took, when one was made. */
     elapsedMs?: number;
     /** Resolutions the GOAT asked for and had to wait for before it could plan. */
@@ -3366,6 +3479,7 @@ export class GoatOrchestrator {
         unavailable: response.unavailable.message,
         unavailableCode: response.unavailable.code,
         modelFailed: true,
+        ...(response.unavailable.responseReached ? { responseReached: true } : {}),
       };
     }
 
@@ -3502,6 +3616,7 @@ export class GoatOrchestrator {
           'Each resolution is labelled with the job it is doing for you:',
           this.renderTimeframeContexts(reads),
           '',
+          this.renderKnownConstraints(goal.id),
           steering.length > 0
             ? `OPERATOR STEERING (runtime guidance, applies to this and later wakeups):\n${steering
                 .slice(-3)

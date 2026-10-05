@@ -104,6 +104,15 @@ export interface AgentModelResponse {
     code: string;
     /** Written to be shown to a user. Carries no provider payload. */
     message: string;
+    /**
+     * True when the provider answered and the answer was unusable.
+     *
+     * The call did not fail in transit, so outage recovery is the wrong
+     * response to it: repeating the request produces the same unusable answer
+     * at the cost of another model call. Set only where the distinction is
+     * known, so absence keeps the existing availability behaviour.
+     */
+    responseReached?: boolean;
   };
 }
 

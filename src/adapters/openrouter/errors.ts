@@ -266,3 +266,64 @@ export function isModelFailure(error: AIProviderError): boolean {
     error.code === 'BAD_REQUEST'
   );
 }
+
+/**
+ * Codes that mean "the provider answered, and the answer was unusable".
+ *
+ * ## Why this exists
+ *
+ * Every other code here describes a provider that could not be reached or would
+ * not accept the request, and the retry behaviour attached to those is correct:
+ * the same call a minute later is likely to work, so arming a bounded retry is
+ * exactly what should happen.
+ *
+ * A response that arrived and could not be read is a different situation. The
+ * transport worked, so waiting does not fix it, and retrying the identical call
+ * burns a model request per attempt to arrive at the same unreadable answer.
+ * These were previously folded into `EMPTY_RESPONSE` and therefore treated as an
+ * outage.
+ */
+const RESPONSE_SHAPE_CODES: ReadonlySet<AIProviderErrorCode> = new Set<AIProviderErrorCode>([
+  'EMPTY_RESPONSE',
+  'NO_CHOICES',
+  'CONTENT_FILTERED',
+  'UNREADABLE_RESPONSE',
+]);
+
+/**
+ * Whether the provider answered with something this adapter could not use.
+ *
+ * True means the call reached the provider and came back unusable, so outage
+ * recovery — retries, reconsideration timers — is the wrong response. It does not
+ * mean the call succeeded: there is still no answer to reason from.
+ */
+export function isResponseShapeFailure(error: AIProviderError): boolean {
+  return RESPONSE_SHAPE_CODES.has(error.code);
+}
+
+/**
+ * The inverse, named so call sites can ask the availability question directly.
+ *
+ * The codes that mean the provider could not be reached or would not accept the
+ * request. Availability, retry and reconsideration are keyed on this, so it is
+ * stated as one list rather than left implicit in the shape codes above.
+ */
+const OUTAGE_CODES: ReadonlySet<AIProviderErrorCode> = new Set<AIProviderErrorCode>([
+  'NETWORK_ERROR',
+  'PROVIDER_ERROR',
+  'RATE_LIMITED',
+  'MODEL_UNAVAILABLE',
+  'MODEL_NOT_FOUND',
+  'UNAUTHORIZED',
+  'INVALID_KEY',
+  'OUT_OF_CREDITS',
+  'KEY_REQUIRED',
+  'ENDPOINT_NOT_FOUND',
+  'BAD_REQUEST',
+  'UNKNOWN',
+]);
+
+/** Whether this code means the provider could not be reached or would not serve. */
+export function isProviderOutageCode(code: AIProviderErrorCode): boolean {
+  return OUTAGE_CODES.has(code);
+}

@@ -19,7 +19,12 @@ import {
   redactSecrets,
 } from './provider';
 import { chatCompletionsUrl, modelsUrl, openRouterUrl, OPENROUTER_BASE_URL } from './endpoints';
-import { classifyProviderFailure, isCredentialFailure, isModelFailure } from './errors';
+import {
+  classifyProviderFailure,
+  isCredentialFailure,
+  isModelFailure,
+  isProviderOutageCode,
+} from './errors';
 import {
   DEFAULT_MODEL_ID,
   FALLBACK_MODELS,
@@ -33,7 +38,7 @@ import {
   recommendedModels,
   supportsAgentReasoning,
 } from './catalogue';
-import type { OpenRouterModel } from './types';
+import type { AIProviderErrorCode, OpenRouterModel } from './types';
 
 /** The exact URL a request must resolve to. */
 const CHAT_URL = 'https://openrouter.ai/api/v1/chat/completions';
@@ -53,6 +58,20 @@ interface CapturedRequest {
 }
 
 type Responder = (url: string, init: RequestInit) => Response | Promise<Response>;
+
+/** A 200 carrying JSON, the shape every happy-path response arrives in. */
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+function assertEqual<T>(actual: T, expected: T, message: string): void {
+  if (actual !== expected) {
+    throw new Error(`${message} (expected ${String(expected)}, got ${String(actual)})`);
+  }
+}
 
 /**
  * Runs one chat call against a fake fetch and returns both what the caller
@@ -430,14 +449,104 @@ async function runEmptyResponseTest(): Promise<void> {
       new Response('<html>gateway</html>', { status: 200 }),
     );
 
+    /*
+     * Unreadable rather than empty, and deliberately so: the provider answered
+     * and this adapter could not parse the answer, which is a different event
+     * from a model that returned nothing — and it is not an outage. The
+     * property this test has always protected is the one that still matters
+     * below it: the body never becomes model content.
+     */
     assert(
-      malformed.error?.code === 'EMPTY_RESPONSE',
-      'a non-JSON body does not become model content',
+      malformed.error?.code === 'UNREADABLE_RESPONSE',
+      'a non-JSON body is reported as unreadable, not as an empty answer',
     );
     assert(
       !malformed.content.includes('gateway'),
       'a non-JSON body does not travel as model content',
     );
+  });
+}
+
+/** --- Response shapes a provider can legitimately return ----------------------- */
+
+/**
+ * A 200 that arrives in a shape this adapter did not expect used to be
+ * classified as an empty response, which is an availability code — so a
+ * perfectly good answer, sent as parts rather than a string, was treated as an
+ * outage and spent retries. Each case below is pinned to the specific code it
+ * now produces, because the specific code is what keeps it off the outage path.
+ */
+async function runResponseShapeTests(): Promise<void> {
+  await withStorage(async () => {
+    const provider = new OpenRouterProvider();
+    provider.saveConfig({ apiKey: FAKE_KEY });
+
+    // A: the ordinary string answer is unaffected.
+    const string = await callWithFetch(provider, () =>
+      jsonResponse({ choices: [{ message: { content: 'hello' }, finish_reason: 'stop' }] }),
+    );
+    assert(string.response.error === undefined, 'a string answer is not a failure');
+    assertEqual(string.response.content, 'hello', 'and the text is passed through');
+
+    // B: the same answer as parts, which is what was being thrown away.
+    const parts = await callWithFetch(provider, () =>
+      jsonResponse({
+        choices: [{ message: { content: [{ type: 'text', text: 'hello ' }, { type: 'text', text: 'world' }] } }],
+      }),
+    );
+    assert(parts.response.error === undefined, 'array-of-parts content is an answer, not a failure');
+    assertEqual(parts.response.content, 'hello world', 'text parts are joined in order');
+
+    // C: null content is the provider declining to answer, not empty text.
+    const nullContent = await callWithFetch(provider, () =>
+      jsonResponse({ choices: [{ message: { content: null }, finish_reason: 'stop' }] }),
+    );
+    assertEqual(nullContent.response.error?.code, 'EMPTY_RESPONSE', 'null content is reported as no text');
+    assert(
+      nullContent.response.content !== 'null' && nullContent.response.content !== '',
+      'null never becomes model content',
+    );
+
+    // D: an empty choices array means no answer was offered, which is specific.
+    const noChoices = await callWithFetch(provider, () => jsonResponse({ choices: [] }));
+    assertEqual(noChoices.response.error?.code, 'NO_CHOICES', 'an empty choices array is named for what it is');
+    assertEqual(noChoices.response.error?.status, 200, 'and it is still a 200, not an HTTP failure');
+
+    // E: a filter is the provider declining on purpose, which is not emptiness.
+    const filtered = await callWithFetch(provider, () =>
+      jsonResponse({ choices: [{ message: { content: null }, finish_reason: 'content_filter' }] }),
+    );
+    assertEqual(filtered.response.error?.code, 'CONTENT_FILTERED', 'a content-filtered answer is named as filtered');
+
+    // F: a 200 the adapter cannot read at all.
+    const unreadable = await callWithFetch(provider, () => jsonResponse({ result: 'surprise' }));
+    assertEqual(unreadable.response.error?.code, 'UNREADABLE_RESPONSE', 'an unknown envelope is unreadable');
+    const notJson = await callWithFetch(provider, () => new Response('<html>ok</html>', { status: 200 }));
+    assertEqual(notJson.response.error?.code, 'UNREADABLE_RESPONSE', 'a non-JSON 200 is unreadable');
+
+    /*
+     * G: none of the above is an outage, which is the whole behavioural point.
+     * These are the codes the availability and retry paths key on, so a
+     * response that arrived and could not be read must not carry one.
+     */
+    const shapeCodes: AIProviderErrorCode[] = [
+      'EMPTY_RESPONSE',
+      'NO_CHOICES',
+      'CONTENT_FILTERED',
+      'UNREADABLE_RESPONSE',
+    ];
+    for (const code of shapeCodes) {
+      assert(
+        !isProviderOutageCode(code),
+        `${code} is a received-but-unusable response, not an outage`,
+      );
+    }
+
+    // H: a genuine outage still is one. Nothing about this narrows availability.
+    assert(isProviderOutageCode('NETWORK_ERROR'), 'a network failure is still an outage');
+    assert(isProviderOutageCode('PROVIDER_ERROR'), 'a 5xx is still an outage');
+    assert(isProviderOutageCode('MODEL_UNAVAILABLE'), 'no available provider is still an outage');
+    assert(isProviderOutageCode('RATE_LIMITED'), 'rate limiting is still an outage');
   });
 }
 
@@ -797,6 +906,7 @@ if (import.meta.main) {
   await runNetworkFailureTest();
   await runErrorClassificationTest();
   await runEmptyResponseTest();
+  await runResponseShapeTests();
   await runConfigValidationTest();
   runRedactionTest();
   runCatalogueTest();

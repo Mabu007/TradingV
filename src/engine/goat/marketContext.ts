@@ -77,7 +77,13 @@ export interface MarketContext {
   limitations: string[];
 }
 
-const BAR_COUNT = 120;
+/**
+ * Candles each context is built from.
+ *
+ * Exported so a caller reporting an unavailable resolution quotes the same
+ * number the read would have asked for, rather than inventing its own.
+ */
+export const BAR_COUNT = 120;
 
 /**
  * The tools consulted, in the order that costs the fewest round trips.

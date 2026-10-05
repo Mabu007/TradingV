@@ -249,8 +249,8 @@ export const TradePlanPanel: React.FC<TradePlanPanelProps> = ({
           <Rule label="STILL REQUIRED" />
           <ul className="space-y-1" data-testid="plan-constraints">
             {plan.outstandingConstraints.map((constraint) => (
-              <li key={constraint} className="flex items-start gap-2 text-[11px] leading-5 text-warn/90">
-                <span className="mt-[3px] shrink-0 font-mono text-[10px] text-warn/60" aria-hidden="true">
+              <li key={constraint} className="flex items-start gap-2 text-[11px] leading-5 text-ink-2">
+                <span className="mt-[3px] shrink-0 font-mono text-[10px] text-ink-4" aria-hidden="true">
                   ○
                 </span>
                 <span className="min-w-0 break-words">{constraint}</span>

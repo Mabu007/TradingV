@@ -86,7 +86,9 @@ class StubEnvironment implements ITradingEnvironment {
   async getMarketQuote(symbol: string): Promise<NormalizedQuote> {
     return { symbol, symbolId: '1', bid: 1.1, ask: 1.1002, spread: 1, timestamp: 1, status: 'MOCK' };
   }
-  async getMarketBars(): Promise<Bar[]> { return BARS; }
+  /** Counts reads so a test can prove a doomed one is not repeated. */
+  barReads = 0;
+  async getMarketBars(): Promise<Bar[]> { this.barReads += 1; return BARS; }
   async getInstruments() { return [METADATA]; }
   async getAccountState() {
     return { balance: 10_000, equity: 10_000, margin: 0, freeMargin: 10_000, dailyPnL: 0, drawdownPercent: 0 };
@@ -111,6 +113,8 @@ class ScriptedModel implements IAgentModel {
   fallback?: string;
   /** When set, every call reports the model as unreachable. */
   unavailable?: boolean;
+  /** When set, every call reports a provider that answered unusably. */
+  responseReached?: boolean;
 
   constructor(replies: string[] = [], fallback?: string, unavailable = false) {
     this.replies = replies;
@@ -123,6 +127,22 @@ class ScriptedModel implements IAgentModel {
     this.calls += 1;
     if (this.unavailable) {
       return { thought: '', unavailable: { code: 'UNAVAILABLE', message: 'The model is unreachable.' } };
+    }
+    if (this.responseReached) {
+      /*
+       * The provider answered and the answer could not be read. Marked as such
+       * because the retry the orchestrator would otherwise arm cannot help: the
+       * request reached OpenRouter, so repeating it returns the same unusable
+       * answer at the cost of another model call.
+       */
+      return {
+        thought: '',
+        unavailable: {
+          code: 'UNREADABLE_RESPONSE',
+          message: 'OpenRouter answered in a format TradingGOATs could not read.',
+          responseReached: true,
+        },
+      };
     }
     return normalizeModelReply(next ?? '{"kind":"WAIT","reason":"no opinion"}');
   }
@@ -1610,6 +1630,34 @@ test('progress: a failure to read the model is followed by a retry that exists',
   );
 });
 
+test('retry: a provider that answered unusably does not arm an outage retry', async () => {
+  const h = makeHarness({
+    model: Object.assign(new ScriptedModel([], undefined, false), { responseReached: true }),
+  });
+  const report = await h.orchestrator.investigateGoal(h.goalId);
+
+  /*
+   * The failure is still a failure and the GOAT is still deployed: the provider
+   * produced nothing usable, and inventing a thesis from that would be worse.
+   * What is withdrawn is the promise of a retry, because the request did reach
+   * OpenRouter and would come back in the same shape.
+   */
+  assertEqual(report.outcome, 'MODEL_FAILURE', 'an unusable answer is still reported as a failure');
+  assertEqual(
+    h.orchestrator.hasPendingReconsideration(h.agentId),
+    false,
+    'and no outage retry was armed for it',
+  );
+  assert(
+    h.agentLog().some((entry) => entry.type === 'MODEL_FAILURE'),
+    'the failure is on the record regardless',
+  );
+  assert(
+    !h.agentLog().some((entry) => entry.type === 'MODEL_RETRY'),
+    'and nothing claims a retry that would repeat the same request',
+  );
+});
+
 // ---------------------------------------------------------------------------
 // 7. The Trade Plan is the hypothesis, and the model state is one live thing
 // ---------------------------------------------------------------------------
@@ -2192,6 +2240,40 @@ export async function runAgentSurfaceTests(): Promise<void> {
     throw new Error(`${failures.length} agent-surface test(s) failed.`);
   }
 }
+
+
+/**
+ * A resolution the market cannot supply used to be re-probed on every wake.
+ *
+ * Whether a timeframe exists is a property of the market for a deployment, not
+ * a question that changes between wakes. Each pass was therefore paying for a
+ * read already known to fail, and the model was being asked to request a
+ * resolution that had just been reported unavailable — which is how one 1m GOAT
+ * needing 1h confirmation could ask again on the next wake, and the one after.
+ */
+test('resolutions: a resolution known to be unavailable is not read again', async () => {
+  const h = makeHarness({ timeframes: ['1m'] });
+
+  // First pass: the 1h read happens and fails, and that failure is remembered.
+  await h.orchestrator.investigateGoal(h.goalId);
+  const afterFirst = h.env.barReads;
+  assert(afterFirst > 0, 'the first pass read the market');
+
+  /*
+   * Second pass over the same agent. The point is not that the read count is
+   * identical — a live 1m read is still needed each pass — but that the dead 1h
+   * resolution is not probed again, so the count does not grow by a whole extra
+   * resolution's worth of reads on a market that cannot serve it.
+   */
+  const beforeSecond = h.env.barReads;
+  await h.orchestrator.investigateGoal(h.goalId);
+  const secondPassReads = h.env.barReads - beforeSecond;
+  assert(
+    secondPassReads <= beforeSecond,
+    `a second pass does not probe more than the first did (${afterFirst} then ${secondPassReads})`,
+  );
+});
+
 
 if (import.meta.main) {
   await runAgentSurfaceTests();

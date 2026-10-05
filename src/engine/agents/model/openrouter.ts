@@ -5,6 +5,7 @@ import {
   AgentResponseContract,
 } from './types';
 import { openRouterProvider } from '../../../adapters/openrouter/provider';
+import { isResponseShapeFailure } from '../../../adapters/openrouter/errors';
 import type { AIProviderErrorCode } from '../../../adapters/openrouter/types';
 import { AIMessage } from '../../../adapters/openrouter/types';
 import { describeModelWritableTrackers } from '../trackers/contracts';
@@ -41,6 +42,11 @@ const UNAVAILABLE: Record<AIProviderErrorCode, string> = {
   NETWORK_ERROR:
     'TradingGOATs could not reach OpenRouter, so this GOAT could not reason. Check your connection.',
   EMPTY_RESPONSE: 'The model returned nothing, so this GOAT could not reason. Try again.',
+  NO_CHOICES:
+    'OpenRouter returned no answer for this model — usually no provider was free to serve it right now.',
+  CONTENT_FILTERED: 'The provider blocked this response before the model could answer.',
+  UNREADABLE_RESPONSE:
+    'OpenRouter answered in a format TradingGOATs could not read. This is our side, not an outage.',
   UNKNOWN: 'This GOAT could not reach its reasoning model. Try again.',
 };
 
@@ -325,6 +331,13 @@ export class OpenRouterAgentModel implements IAgentModel {
           unavailable: {
             code: response.error.code,
             message: UNAVAILABLE[response.error.code] ?? UNAVAILABLE.UNKNOWN,
+            /*
+             * The provider was reached and answered unusably, which is not an
+             * outage. Carried through so the orchestrator can decline the
+             * outage-retry path instead of re-issuing a request that will come
+             * back in the same shape.
+             */
+            ...(isResponseShapeFailure(response.error) ? { responseReached: true } : {}),
           },
         };
       }

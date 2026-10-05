@@ -68,6 +68,29 @@ export type AIProviderErrorCode =
   | 'NETWORK_ERROR'
   /** A 200 with nothing usable in it. */
   | 'EMPTY_RESPONSE'
+  /**
+   * A 200 whose `choices` array is empty.
+   *
+   * Distinct from an empty response because it means something specific: the
+   * provider accepted the request and declined to answer it — a route with no
+   * healthy upstream, or a policy that filtered every candidate. Nothing about
+   * it indicates the provider is down.
+   */
+  | 'NO_CHOICES'
+  /**
+   * A 200 the provider marked as filtered (`finish_reason` says so).
+   *
+   * The model did not fail and did not return nothing; it was prevented from
+   * answering, which is a different event with a different remedy.
+   */
+  | 'CONTENT_FILTERED'
+  /**
+   * A 200 in a shape this adapter cannot read.
+   *
+   * The response arrived and was not understood, which is a bug or a contract
+   * change here rather than an outage at the provider.
+   */
+  | 'UNREADABLE_RESPONSE'
   /** Status and body both failed to identify anything. */
   | 'UNKNOWN';
 

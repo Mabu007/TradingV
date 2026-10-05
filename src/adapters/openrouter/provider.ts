@@ -406,17 +406,25 @@ export class OpenRouterProvider implements IAIProvider {
 
       const json: unknown = await response.json().catch(() => undefined);
 
-      const content = readContent(json);
+      const extracted = extractResponseText(json);
 
-      if (typeof content !== 'string' || !content.trim()) {
+      /*
+       * Each outcome is named for what happened rather than collapsed into one
+       * "empty response", so the reason a call produced nothing is legible to
+       * whoever reads the failure instead of being a guess.
+       */
+      if (extracted.kind !== 'text') {
         return {
           content: REQUEST_FAILED,
           error: {
-            code: 'EMPTY_RESPONSE',
-            message: 'The model returned an empty response. Try again.',
+            code: RESPONSE_SHAPE_ERROR[extracted.kind],
+            message: RESPONSE_SHAPE_MESSAGE[extracted.kind],
+            status: response.status,
           },
         };
       }
+
+      const content = extracted.text;
 
       /*
        * A model that answered is a model this key can use. Remembered so
@@ -476,19 +484,116 @@ export class OpenRouterProvider implements IAIProvider {
 }
 
 export const openRouterProvider = new OpenRouterProvider();
+/**
+ * How each unusable-but-received response is named.
+ *
+ * The provider was reached in every one of these cases, which is the whole
+ * reason they are named separately from the codes that mean it could not be.
+ */
+const RESPONSE_SHAPE_ERROR: Record<
+  Exclude<ExtractedContent['kind'], 'text'>,
+  AIProviderError['code']
+> = {
+  empty: 'EMPTY_RESPONSE',
+  no_choices: 'NO_CHOICES',
+  filtered: 'CONTENT_FILTERED',
+  null_content: 'EMPTY_RESPONSE',
+  unreadable: 'UNREADABLE_RESPONSE',
+};
+
+const RESPONSE_SHAPE_MESSAGE: Record<Exclude<ExtractedContent['kind'], 'text'>, string> = {
+  empty: 'The model returned an empty response. Try again.',
+  no_choices: 'OpenRouter returned no answer for this model, which usually means no provider was free to serve it.',
+  filtered: 'The provider blocked this response before the model could answer.',
+  null_content: 'The model returned no text for this request. Try again.',
+  unreadable:
+    'OpenRouter answered in a format TradingGOATs could not read. This is a problem on our side, not an outage.',
+};
+
 /** Narrow an unknown value to a plain record. */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** Pull the assistant text out of a response without trusting its shape. */
-function readContent(json: unknown): unknown {
-  if (!isRecord(json)) return undefined;
+/**
+ * What a provider response turned out to be.
+ *
+ * The distinction being preserved is between "nothing came back" and "something
+ * came back and this is what it was". A single `EMPTY_RESPONSE` for every
+ * unusable 200 made a refusal, a filter, an empty routing result and an
+ * unfamiliar envelope indistinguishable — and then routed all four into the
+ * availability path, which is built for a provider that cannot be reached.
+ */
+type ExtractedContent =
+  | { kind: 'text'; text: string }
+  | { kind: 'empty' }
+  | { kind: 'no_choices' }
+  | { kind: 'filtered' }
+  | { kind: 'null_content' }
+  | { kind: 'unreadable' };
+
+/**
+ * `finish_reason` values that mean the provider declined to answer.
+ *
+ * Matched on substrings because OpenRouter and the providers behind it do not
+ * agree on spelling (`content_filter` and `content-filtered` both occur), and
+ * treating an unrecognised sibling as an ordinary empty answer would be the same
+ * mistake in miniature.
+ */
+const FILTER_FINISH_REASONS = ['content_filter', 'content-filtered', 'safety', 'blocked'];
+
+/**
+ * Pull the assistant text out of a response, tolerating the shapes providers
+ * actually use.
+ *
+ * A string is the common case. An array of parts is equally common and was
+ * being read as nothing at all, which turned an ordinary answer into an outage.
+ * Null content is not an answer and is reported as such rather than as text.
+ */
+export function extractResponseText(json: unknown): ExtractedContent {
+  if (!isRecord(json)) return { kind: 'unreadable' };
+
   const choices = json['choices'];
-  if (!Array.isArray(choices) || choices.length === 0) return undefined;
+  if (!Array.isArray(choices)) return { kind: 'unreadable' };
+  if (choices.length === 0) return { kind: 'no_choices' };
+
   const first = choices[0];
-  if (!isRecord(first)) return undefined;
+  if (!isRecord(first)) return { kind: 'unreadable' };
+
+  /*
+   * Checked before the message is read, and only as a signal: a filter that
+   * leaves `content: null` is otherwise indistinguishable from a model that
+   * simply had nothing to say.
+   */
+  const finishReason = first['finish_reason'];
+  if (typeof finishReason === 'string') {
+    const lowered = finishReason.toLowerCase();
+    if (FILTER_FINISH_REASONS.some((reason) => lowered.includes(reason))) {
+      return { kind: 'filtered' };
+    }
+  }
+
   const message = first['message'];
-  if (!isRecord(message)) return undefined;
-  return message['content'];
+  if (!isRecord(message)) return { kind: 'unreadable' };
+
+  const content = message['content'];
+
+  if (typeof content === 'string') {
+    return content.trim() ? { kind: 'text', text: content } : { kind: 'empty' };
+  }
+
+  if (Array.isArray(content)) {
+    // Parts are joined in order; a part's `text` is the only field read.
+    const parts = content
+      .filter(isRecord)
+      .map((part) => part['text'])
+      .filter((text): text is string => typeof text === 'string' && text.trim().length > 0);
+    const joined = parts.join('').trim();
+    return joined ? { kind: 'text', text: joined } : { kind: 'empty' };
+  }
+
+  // Explicitly null is the provider declining to answer, not a missing field.
+  if (content === null) return { kind: 'null_content' };
+
+  return { kind: 'unreadable' };
 }
