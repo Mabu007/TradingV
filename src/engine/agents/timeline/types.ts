@@ -31,6 +31,10 @@ export type AgentTimelineEventType =
   | 'TRADE_CLOSED'
   | 'DECISION_REFUSED'
   /** The durable runtime behind this deployment, registered or not. */
+  /** The session was destroyed and a new one minted. Not a refresh. */
+  | 'SESSION_CLEARED'
+  /** Work from a cleared session arrived and was refused. */
+  | 'STALE_WORK_REFUSED'
   | 'RUNTIME_REGISTERED'
   | 'RUNTIME_UNAVAILABLE'
   | 'ERROR'
@@ -204,4 +208,13 @@ export interface AgentTimelineStore {
    * already in memory; this only exposes them.
    */
   snapshotByGoat?(goatId: string, limit?: number): AgentTimelineEvent[];
+  /**
+   * Delete every event recorded for a GOAT.
+   *
+   * Optional on the interface for the same reason `snapshotByGoat` is: a store may
+   * not support it. A caller that needs a session cleared must check, because a
+   * store that cannot delete will otherwise leave the previous session's log in
+   * place — a cleared GOAT whose history reappears after a reload.
+   */
+  removeForGoat?(goatId: string): Promise<number>;
 }

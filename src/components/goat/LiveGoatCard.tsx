@@ -161,10 +161,12 @@ function tradePlanLine(mission: GoatMission): string {
     // it had nothing to say. The hypothesis is the plan until it is priced, so it is
     // shown instead — truncated by the card, which is a display decision rather
     // than a different claim.
-    if (mission.thesis) {
+    if (mission.sessionHasWork && mission.thesis) {
       return `${mission.thesis.direction ?? ''} ${mission.thesis.statement}`.trim();
     }
-    return 'Forming a Trade Plan — still gathering evidence';
+    return mission.sessionHasWork === false
+      ? 'No session yet — press PLAY to start one'
+      : 'Forming a Trade Plan — still gathering evidence';
   }
   const status = plan.status.toLowerCase().replace(/_/g, ' ');
   return `${plan.direction} ${plan.symbol} · ${status}`;

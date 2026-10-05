@@ -1820,10 +1820,10 @@ test('timeframes: an objective that names its resolutions is not overruled', asy
 });
 
 // ---------------------------------------------------------------------------
-// 9. Refresh: a clean runtime without losing the GOAT
+// 9. CLEAR: a true clean slate, without losing the GOAT
 // ---------------------------------------------------------------------------
 
-test('refresh: the runtime is cleared and the GOAT, its deployment and its history are not', async () => {
+test('clear: the session is destroyed and the GOAT is left as though it had never run', async () => {
   const h = makeHarness();
   await h.investigate();
 
@@ -1835,50 +1835,114 @@ test('refresh: the runtime is cleared and the GOAT, its deployment and its histo
   const trackersBefore = before.activeTrackerCount;
   assert(trackersBefore > 0, 'there was something running to clear');
 
-  const report = await h.orchestrator.refreshGoat(h.goalId);
+  const report = await h.orchestrator.clearGoatSession(h.goalId);
 
   const after = h.mission();
 
-  // --- cleared ---------------------------------------------------------
-  assertEqual(report.cleared.trackers, trackersBefore, 'every tracker it had was reported as cleared');
+  // --- the session is gone ------------------------------------------------
+  assertEqual(report.deleted.trackers, trackersBefore, 'every tracker it had was reported as deleted');
   assertEqual(after.activeTrackerCount, 0, 'and none of them is watching any more');
-  assertEqual(after.modelPending, undefined, 'no model request survives a refresh');
+  assertEqual(after.modelPending, undefined, 'no model request survives the clear');
   assertEqual(statusFor(after, h.clock.now()) === 'ERROR', false, 'and the GOAT is not left in a broken state');
 
-  // --- kept -------------------------------------------------------------
+  /*
+   * Zero residual evidence of the previous session.
+   *
+   * Each of these is asserted individually because "the panel looked empty" and
+   * "the records were deleted" are different claims, and only the second one
+   * survives a reload. A UI that hid them would pass the first and fail this.
+   */
+  assertEqual(h.orchestrator.listThesesForGoal(h.goalId).length, 0, 'its Trade Plan is gone');
+  assertEqual(h.orchestrator.stores.theses.get(thesisId!), undefined, 'the thesis record itself, not just the view');
+  assertEqual(after.evidence.length, 0, 'its evidence is gone');
+  assertEqual(
+    (h.orchestrator.stores.evidence.list() ?? []).length,
+    0,
+    'and the evidence rows themselves',
+  );
+  /*
+   * The agent log.
+   *
+   * Not "length is zero", because the clear itself is recorded — a GOAT that
+   * silently emptied itself would leave the reader unable to tell a clear from a
+   * crash. What must not remain is any event *from the previous session*, so the
+   * assertion is on age rather than count: everything left was written after the
+   * new session began.
+   */
+  const remainingLog = h.orchestrator.agentLog(h.goalId, 500);
+  const stale = remainingLog.filter((entry) => entry.at < report.session.startedAt);
+  assertEqual(
+    stale.length,
+    0,
+    `no log entry predates the new session (${stale.map((entry) => entry.type).join(', ')})`,
+  );
+  /*
+   * The only events left are the clear's own sequence: the session stopping, the
+   * clear being recorded, and — if a request was in flight — the late answer being
+   * refused. All three describe what CLEAR just did, and none of them describes
+   * anything the previous session discovered.
+   */
+  const CLEAR_SEQUENCE = new Set(['SESSION_CLEARED', 'STALE_WORK_REFUSED', 'GOAT_STOPPED']);
+  assert(
+    remainingLog.every((entry) => CLEAR_SEQUENCE.has(entry.type)),
+    `and the only entries belong to the clear itself (${remainingLog.map((entry) => entry.type).join(', ')})`,
+  );
+  assert(
+    remainingLog.some((entry) => entry.type === 'SESSION_CLEARED'),
+    'so the clear is on the record, which is what makes it distinguishable from a crash',
+  );
+
+  // --- and nothing was started -------------------------------------------
+  /*
+   * `currentFor` answers "which deployment is running", and after a clear the
+   * answer is none. Asserted as undefined rather than 'stopped' because that is the
+   * shape of the question: a GOAT is running when it has an active deployment, so a
+   * cleared GOAT having none *is* the stopped state, rather than a stopped flag that
+   * something could disagree with.
+   */
+  assertEqual(
+    h.orchestrator.stores.deployments.currentFor(h.agentId),
+    undefined,
+    'no deployment is active: CLEAR must not start the GOAT',
+  );
+  assertEqual(
+    h.orchestrator.stores.deployments.historyFor(h.agentId)[0]?.status,
+    'stopped',
+    'and the deployment it used is on record as stopped',
+  );
+
+  // --- but the GOAT itself survived --------------------------------------
   assertEqual(h.orchestrator.getGoal(h.goalId)?.id, goal.id, 'the GOAT is the same GOAT');
   assertEqual(h.orchestrator.getGoal(h.goalId)?.statement, goal.statement, 'with the same objective');
   assertEqual(
-    h.orchestrator.stores.deployments.currentFor(h.agentId)?.id,
+    h.orchestrator.stores.deployments.historyFor(h.agentId)[0]?.id,
     deploymentId,
-    'and the same deployment identity — a refresh is not a second deployment',
+    'and the same deployment identity — a clear is not a second deployment',
   );
   assertEqual(after.deployment?.marketId, before.deployment?.marketId, 'pointed at the same market');
-  assertEqual(h.orchestrator.listThesesForGoal(h.goalId).length, before.thesisCount, 'its plan history is intact');
-  assert(after.evidence.length >= evidenceBefore, 'and its evidence is');
-  assertEqual(
-    h.orchestrator.stores.theses.get(thesisId!) !== undefined,
-    true,
-    'the thesis it was holding is still on record, even though nothing watches it now',
+
+  // --- a new session identity --------------------------------------------
+  assert(
+    report.session.generation > 0,
+    `the replacement session has its own generation (${report.session.generation})`,
+  );
+  assert(
+    !h.orchestrator.isSessionCurrent({ ...report.session, sessionId: `${report.session.sessionId}_old` }),
+    'and the old identity is no longer current, so late work carrying it is refused',
   );
 
-  // --- and it is runnable again, without a duplicate runtime -------------
-  const restarted = await h.orchestrator.investigateGoal(h.goalId);
-  assert(restarted.deployed, 'it can be started again immediately');
+  // --- and PLAY, not CLEAR, is what starts it ------------------------------
+  const started = await h.orchestrator.resumeGoat(h.goalId);
+  assert(started.deployment.status === 'active', 'PLAY starts a new session');
   const trackers = h.trackers.listForAgent(h.agentId).filter((tracker) => tracker.lifecycle.status === 'ACTIVE');
   assertEqual(
     trackers.length,
     new Set(trackers.map((tracker) => tracker.purpose)).size,
     'with one watch per condition, never two copies of the same watch',
   );
-  assertEqual(
-    h.orchestrator.stores.deployments.historyFor(h.agentId).filter((entry) => entry.status === 'active').length,
-    1,
-    'and exactly one active deployment for this GOAT',
-  );
 });
 
-test('refresh: a GOAT with no deployment can be refreshed without inventing one', async () => {
+test('clear: a GOAT that never ran can be cleared without inventing a deployment', async () => {
   const clock = makeClock();
   const env = new StubEnvironment();
   const agentRuntime = new AgentRuntime(undefined, undefined, undefined, undefined, new InMemoryAgentTimelineStore());
@@ -1902,20 +1966,25 @@ test('refresh: a GOAT with no deployment can be refreshed without inventing one'
     createdAt: clock.now(), updatedAt: clock.now(),
   });
 
-  const report = await orchestrator.refreshGoat('un');
-  assertEqual(report.kept.deployment, false, 'nothing was deployed, so nothing is reported as kept');
-  assertEqual(orchestrator.stores.deployments.historyFor('un_agent').length, 0, 'and a refresh creates no deployment');
-  assertEqual(report.kept.theses, 0, 'there was nothing to keep');
+  const report = await orchestrator.clearGoatSession('un');
+  assertEqual(report.deleted.theses, 0, 'there was no session to delete');
+  assertEqual(report.deleted.trackers, 0, 'and nothing was watching');
+  assertEqual(
+    orchestrator.stores.deployments.historyFor('un_agent').length,
+    0,
+    'clearing a GOAT that never ran does not create a deployment',
+  );
+  assertEqual(report.kept.goal, true, 'while the GOAT itself is untouched');
 });
 
-test('refresh: an outstanding model request cannot mutate the fresh runtime', async () => {
+test('clear: an outstanding model request cannot resurrect the cleared session', async () => {
   /*
    * The dangerous version of this control.
    *
-   * A request that is in flight when the user refreshes will come back some
-   * time later, against a runtime that no longer exists. If its answer is
-   * applied it will re-form a Trade Plan nobody asked for, on the previous
-   * context. So the pending request is dropped before anything is rebuilt.
+   * A request in flight when the user clears will come back some time later,
+   * carrying an answer computed against a session that no longer exists. If it is
+   * applied it re-forms a Trade Plan nobody asked for, on the previous context —
+   * which is precisely the residue CLEAR exists to guarantee cannot return.
    */
   const gate = new GatedModel();
   const h = makeHarness({ model: gate as unknown as ScriptedModel });
@@ -1928,8 +1997,8 @@ test('refresh: an outstanding model request cannot mutate the fresh runtime', as
   }
   assert(pending, 'a request really is outstanding');
 
-  const report = await h.orchestrator.refreshGoat(h.goalId);
-  assertEqual(report.cleared.pendingModelRequest, true, 'and the refresh says it abandoned one');
+  const report = await h.orchestrator.clearGoatSession(h.goalId);
+  assertEqual(report.deleted.pendingModelRequest, true, 'and the clear reports that it abandoned one');
 
   gate.letGo();
   await investigation;
@@ -1939,10 +2008,15 @@ test('refresh: an outstanding model request cannot mutate the fresh runtime', as
   assertEqual(
     h.orchestrator.pendingModelRequest(h.agentId),
     undefined,
-    'the late answer cannot register itself against the new runtime',
+    'the late answer cannot register itself against the new session',
   );
   assertEqual(after.thesisCount, 0, 'and forms no plan on the way out');
   assertEqual(after.activeTrackerCount, 0, 'nor arms a condition the user just cleared');
+  assertEqual(
+    h.orchestrator.listThesesForGoal(h.goalId).length,
+    0,
+    'and no thesis exists at all, so there is nothing for a late answer to have written into',
+  );
 });
 
 // ---------------------------------------------------------------------------

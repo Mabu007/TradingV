@@ -147,6 +147,15 @@ export interface GoatMission {
   interpretation?: string;
   skillIds: string[];
 
+  /**
+   * Whether the current session has produced anything yet.
+   *
+   * False for a GOAT that has never run, and for one whose session was cleared. The
+   * distinction is what lets the surfaces say "no session yet" rather than
+   * "researching", which would imply work in progress that does not exist.
+   */
+  sessionHasWork: boolean;
+
   stage: MissionStage;
   stageLabel: string;
   runtime: RuntimeStatus;
@@ -244,6 +253,15 @@ export interface MissionInput {
   steering?: SteeringNote[];
   /** The GOAT's recorded history, newest first, when the caller has it. */
   activity?: Array<{ at: number; type: string }>;
+  /**
+   * Whether the current session has produced anything yet.
+   *
+   * False for a GOAT that has never run and for one whose session was cleared.
+   * The distinction matters because "researching" and "no session" are different
+   * claims, and telling somebody who just cleared a session that it is researching
+   * would imply work is under way that does not exist.
+   */
+  sessionHasWork?: boolean;
   /** Skill requirements this goal has not met, resolved by the caller. */
   outstandingConstraints?: string[];
   /** The most recent wake, when one is being processed right now. */
@@ -376,6 +394,7 @@ function deriveNext(input: {
  * Derive the mission. Pure: same input, same answer, no I/O.
  */
 export function buildMission(input: MissionInput): GoatMission {
+  const sessionHasWork = input.sessionHasWork ?? true;
   const { goal, deployment, runtime, now } = input;
 
   // Sorted on a copy. `buildMission` is documented as pure, and this used to
@@ -426,6 +445,7 @@ export function buildMission(input: MissionInput): GoatMission {
   return {
     goalId: goal.id,
     agentId: goal.agentId,
+    sessionHasWork,
     name: goal.name?.trim() || defaultName(goal),
     description: goal.description?.trim() ?? '',
     goal: goal.statement,

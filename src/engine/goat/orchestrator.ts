@@ -68,6 +68,12 @@ import {
   type RuntimeIdentity,
   type RuntimeReport,
 } from './durableRuntime';
+import {
+  createSessionRegistry,
+  staleWorkMessage,
+  type GoatSessionIdentity,
+  type SessionRegistry,
+} from './session';
 import { TRACKER_KINDS } from '../agents/trackers/runtime';
 import { defaultObservationPlan } from '../agents/trackers/contracts';
 import { GoatSkillRegistry, SkillPackage } from './skills';
@@ -405,37 +411,76 @@ export interface GoatDeps {
    * durable runtime is registered — see `runtimeIdentity`.
    */
   runtimeUserId?: () => string | undefined;
+  /**
+   * Remote persistence, so a clear is durable.
+   *
+   * Optional: a replay and most tests have none, and a device-local clear is still
+   * a real clear. When present, `clearGoatSession` removes the session's documents
+   * as well, so a cleared session does not come back on the next sign-in.
+   */
+  persistence?: {
+    readonly available: boolean;
+    clearSession(input: { goalId: string; deploymentId?: string }): Promise<number>;
+  };
 }
 
 /**
- * What a refresh cleared and what it deliberately kept.
+ * What CLEAR removed, and what it kept.
  *
- * Returned rather than logged alone, because "clear the runtime" is a
- * destructive-sounding request and the user is entitled to see the boundary the
- * product drew: the runtime went, the GOAT stayed.
+ * Returned rather than logged alone because "cleared" and "appears cleared" are
+ * different claims. Every count here is something a caller can assert on, and
+ * `kept` is stated positively so the two categories cannot be confused: what is
+ * kept is the GOAT, and nothing else.
  */
-export interface RefreshReport {
-  cleared: {
-    /** Trackers that existed before the refresh. */
+/**
+ * The events a CLEAR leaves behind.
+ *
+ * All of them describe the clear itself — the runtime stopping, the session being
+ * destroyed, a late request being refused — and none describes anything the
+ * destroyed session found. They are what makes a cleared GOAT distinguishable from
+ * a GOAT that crashed, so they are kept rather than removed; and they are excluded
+ * from "does this session have work", because a record of clearing is not work.
+ */
+const CLEAR_SEQUENCE_EVENTS: ReadonlySet<AgentTimelineEventType> = new Set([
+  'SESSION_CLEARED',
+  'STALE_WORK_REFUSED',
+  'GOAT_STOPPED',
+]);
+
+export interface ClearSessionReport {
+  /** What the session wrote and no longer exists. */
+  deleted: {
+    /** Theses — the working thesis and the Trade Plans built from it. */
+    theses: number;
+    /** Evidence records attached to those theses. */
+    evidence: number;
+    /** Trade plans, including ones that were never executed. */
+    tradePlans: number;
+    /** Trackers that existed when the clear began. */
     trackers: number;
     /** Of those, the ones cancelled outright rather than disposed. */
     cancelledTrackers: number;
+    /** Agent-log events removed from the timeline store. */
+    logEvents: number;
     /** True when a model request was outstanding and has been abandoned. */
     pendingModelRequest: boolean;
     /** Unprompted "look again" attempts discarded. */
     reconsiderations: number;
     /** Recorded model timings discarded. */
     modelTimings: boolean;
-    /** The runtime instance was rebuilt. */
-    executor: boolean;
+    /** Session documents removed from remote persistence, when there is one. */
+    remoteDocuments: number;
   };
+  /** What CLEAR deliberately left alone. This is the GOAT, and nothing else. */
   kept: {
     goal: boolean;
-    deployment: boolean;
-    deploymentId?: string;
-    theses: number;
-    evidence: number;
+    market: boolean;
+    timeframes: boolean;
+    skills: boolean;
+    riskConfiguration: boolean;
   };
+  /** The session that replaced the one just cleared. */
+  session: GoatSessionIdentity;
 }
 
 export interface CreateGoatResult {
@@ -591,8 +636,33 @@ export class GoatOrchestrator {
    */
   private readonly runtime: DurableRuntime;
 
+  /**
+   * Session identities, and the one place stale work is refused.
+   *
+   * Held on the orchestrator rather than in a module global so that a second
+   * instance — a test, a second window — has its own view of which session is
+   * current, and a callback cannot be validated against another instance's state.
+   */
+  private readonly sessions: SessionRegistry;
+
+  /**
+   * The session each in-flight operation belongs to, while it is running.
+   *
+   * This is what stops a stale operation from writing to the activity log. The
+   * generation check elsewhere refuses the *mutation* — the plan, the evidence, the
+   * trackers — but a wake that was already inside `reason()` would still have
+   * recorded "reading the market" and "asked the model" after the clear, leaving
+   * exactly the kind of residue CLEAR promises is gone.
+   *
+   * Keyed by agent, set for the duration of a wake, and consulted by
+   * `recordActivity`. An operation that has already finished has removed itself, so
+   * nothing else is affected.
+   */
+  private readonly inFlightSessions = new Map<string, GoatSessionIdentity>();
+
   constructor(private readonly deps: GoatDeps) {
     this.runtime = deps.runtime ?? new InertRuntime();
+    this.sessions = createSessionRegistry(() => this.now());
     this.stores = deps.stores;
     this.steeringStore = deps.stores.steering ?? new SteeringStore('tradinggoats.steering.memory');
     this.capabilities = deps.capabilities ?? capabilityRegistry;
@@ -888,6 +958,17 @@ export class GoatOrchestrator {
     type: AgentTimelineEventType;
     data: unknown;
   }): void {
+    /*
+     * Refuse activity from a superseded session.
+     *
+     * The check is by agent, because that is what an activity event carries, and
+     * it is deliberately conservative: while an operation is in flight for an
+     * agent, anything recorded against that agent must belong to that operation's
+     * session or it is residue from a session the user has already cleared.
+     */
+    const inflight = this.inFlightSessions.get(event.goatId);
+    if (inflight !== undefined && !this.sessions.isCurrent(inflight)) return;
+
     const timestamp = this.now();
     const id = `act_${timestamp.toString(36)}_${(this.sequence = this.sequence + 1).toString(36)}`;
 
@@ -2004,6 +2085,7 @@ export class GoatOrchestrator {
     this.ensureExecutor(goal, deployment);
 
     const generation = this.runtimeGenerationFor(goal.agentId);
+    const session = this.sessions.current(goal.agentId);
     this.investigating.add(goal.agentId);
     try {
       const investigation = await this.proposeInvestigation(goal, deployment);
@@ -2017,7 +2099,15 @@ export class GoatOrchestrator {
        * applying it would form a Trade Plan and arm conditions on a GOAT the user
        * has just emptied. Dropping it is the honest outcome, and it says so.
        */
-      if (this.runtimeGenerationFor(goal.agentId) !== generation) {
+      /*
+       * Both checks are made, and they are not redundant.
+       *
+       * The generation catches a superseded runtime generation; the session
+       * identity catches the same thing more precisely, and is what the rest of the
+       * system stamps work with. Keeping the generation check means the behaviour
+       * does not depend on either mechanism alone.
+       */
+      if (this.runtimeGenerationFor(goal.agentId) !== generation || !this.sessions.isCurrent(session)) {
         return failed(
           'The GOAT was refreshed while this pass was in flight, so its answer was discarded rather than applied.',
           'NOT_DEPLOYED',
@@ -2282,114 +2372,196 @@ export class GoatOrchestrator {
    * Returns what was cleared, because a control that resets something has to be
    * able to say what it reset.
    */
-  async refreshGoat(goalId: string, reason = 'Refreshed by the operator.'): Promise<RefreshReport> {
+  /**
+   * CLEAR — destroy this GOAT's session and leave nothing of it behind.
+   *
+   * This is not a refresh, a reload, or a restart, and the difference is the whole
+   * point of the operation:
+   *
+   *   REFRESH / RESTART   keep the session and rebuild the runtime from it. The
+   *                        thesis, the evidence, the trackers and the log all
+   *                        survive; the GOAT carries on from where it was.
+   *
+   *   CLEAR                destroy the session. Nothing the session wrote
+   *                        survives — not the thesis, not the evidence, not the
+   *                        trackers, not the log, not the trades, not the runtime's
+   *                        state — and the GOAT is left as though it had never run,
+   *                        stopped, waiting for somebody to press PLAY.
+   *
+   * The order below is load-bearing and is the reason this is one method rather than
+   * a flag the UI sets:
+   *
+   *   1. invalidate the session, so nothing in flight can write afterwards
+   *   2. stop the in-tab runtime, so it stops producing work
+   *   3. retire the durable runtime, so the cloud runtime stops waking
+   *   4. delete the session's records, in dependency order
+   *   5. leave the deployment *stopped* rather than reactivating it
+   *
+   * Step 1 before everything else because a model request that resolves
+   * mid-teardown must be refused, and it can only be refused if the session is
+   * already superseded when it comes back. And the last step emphatically: the
+   * previous version of this operation reactivated the deployment, which meant
+   * CLEAR silently started the GOAT again — the exact opposite of what the button
+   * says.
+   *
+   * PLAY and RESTART remain separate operations. This one starts nothing.
+   */
+  async clearGoatSession(
+    goalId: string,
+    reason = 'Session cleared by the operator.',
+  ): Promise<ClearSessionReport> {
     const goal = this.stores.goals.get(goalId);
     if (!goal) throw new Error(`Unknown goal ${goalId}.`);
 
-    const deployment = this.stores.deployments.currentFor(goal.agentId)
-      ?? this.stores.deployments.historyFor(goal.agentId)[0];
+    const at = this.now();
+    const deployment =
+      this.stores.deployments.currentFor(goal.agentId) ??
+      this.stores.deployments.historyFor(goal.agentId)[0];
 
-    /*
-     * Stop everything that could still act.
-     *
-     * In order, and before anything is rebuilt: the pending model request is
-     * cleared so a late reply cannot mutate a runtime that no longer exists, the
-     * "look again" timer is cancelled, and the trackers are disposed. A refresh
-     * that left a tracker armed would produce exactly the duplicate the user is
-     * trying to escape.
-     */
-    const inFlightModel = this.pendingModels.has(goal.agentId);
-    this.pendingModels.delete(goal.agentId);
-    this.clearReconsideration(goal.agentId);
-    /*
-     * Invalidate every reasoning step that is mid-flight for this GOAT. When
-     * those promises come back they will find a newer generation and drop their
-     * answer instead of applying it to the runtime the user just cleared.
-     */
+    // 1. Invalidate first, before anything is torn down.
+    //
+    // `supersede` both bumps the generation — so the in-flight model request's
+    // answer is refused when it returns — and mints the identity the next session
+    // will run under. Holding it now means step 5 has nothing left to decide.
+    const session = this.sessions.supersede(goal.agentId, at);
     this.bumpRuntimeGeneration(goal.agentId);
 
-    const trackersBefore = this.trackers.listForGoal(goalId);
-    const cancelled = this.trackers.cancelTrackersForAgent(goal.agentId, reason);
-    const theses = this.stores.theses.listForGoal(goalId);
-    const evidenceKept = theses.reduce((total, thesis) => total + this.stores.evidence.listForThesis(thesis.id).length, 0);
+    const inFlightModel = this.pendingModels.has(goal.agentId);
+    this.pendingModels.delete(goal.agentId);
+    const reconsiderations = this.clearReconsideration(goal.agentId) ?? 0;
 
+    // 2. Cancel the trackers, *before* the agent is unregistered.
+    //
+    // Cancelling a tracker is an update to it, and the tracker registry refuses an
+    // update whose owner is not a registered agent. Doing this after
+    // `unregisterAgent` therefore throws — which would abandon the clear half-way,
+    // with the session invalidated and the records still on disk. The order is not
+    // cosmetic and it is the kind that only shows up when a GOAT actually has
+    // trackers, which is why it is asserted rather than assumed.
+    const trackersBefore = this.trackers.listForGoal(goalId).length;
+    const cancelled = this.trackers.cancelTrackersForAgent(goal.agentId, reason);
+
+    // 3. Stop the in-tab runtime.
     if (this.deps.agentRuntime.getAgent(goal.agentId)) {
       await this.deps.agentRuntime.stop(goal.agentId);
       this.deps.agentRuntime.unregisterAgent(goal.agentId);
     }
+
+    // 4. Retire the durable runtime, so the cloud side stops waking.
+    //
+    // Awaited: a cleared GOAT whose Durable Object is still registered keeps waking
+    // against a session that no longer exists, and no amount of local tidiness
+    // changes that. Retire rather than suspend — the session is gone, and keeping
+    // its cooldowns would carry the previous session's decisions into the next one.
+    if (deployment) await this.retireRuntime(deployment, reason);
+
+    // 5. Delete what the session wrote.
     this.trackers.disposeAgent(goal.agentId);
     this.modelCalls.delete(goal.agentId);
-    const looksDiscarded = this.noThesisLooks.get(goal.agentId) ?? 0;
     this.noThesisLooks.delete(goal.agentId);
 
-    /*
-     * Release the durable runtime's state for this session.
-     *
-     * A refresh clears the GOAT's *work*, and a runtime's cooldowns and last
-     * evaluation are work: they belong to the session being discarded. Carrying them
-     * into a clean session would make the new one start already muted by decisions
-     * the user just threw away, which is exactly the contamination a refresh is
-     * supposed to prevent. Suspended rather than retired, because the deployment
-     * itself survives — only its session ends.
-     */
-    const liveDeployment = this.stores.deployments.currentFor(goal.agentId);
-    if (liveDeployment) void this.suspendRuntime(liveDeployment, reason);
+    const theses = this.stores.theses.listForGoal(goalId);
+    const ideas = this.stores.ideas.listForGoal(goalId);
+    let evidence = 0;
+    // Children before parents: an evidence row whose thesis no longer exists is an
+    // orphan nothing would ever clean up, and a plan whose thesis is gone cannot be
+    // reasoned about.
+    for (const thesis of theses) evidence += this.stores.evidence.listForThesis(thesis.id).length;
+    for (const thesis of theses) {
+      // `removeForThesis` rather than removing rows one at a time: a session's
+      // evidence is exactly "everything attached to its theses", and deleting by
+      // thesis cannot leave a row behind by missing an id.
+      this.stores.evidence.removeForThesis(thesis.id);
+      this.stores.theses.remove(thesis.id);
+    }
+    for (const idea of ideas) this.stores.ideas.remove(idea.id);
+
+    // 6. The agent log. Deleted, not hidden.
+    const logEvents = (await this.deps.agentRuntime.getTimelineStore().removeForGoat?.(goal.agentId)) ?? 0;
+
+    // 7. Remote session documents, when there is remote persistence.
+    const remoteDocuments = await this.clearRemoteSession(goal, deployment);
 
     /*
-     * Reactivate the same deployment rather than creating one.
+     * The deployment is left *stopped*.
      *
-     * A new deployment id would give the GOAT a second runtime identity, and
-     * anything keyed on deployment identity — the tracker tier's objects, the
-     * history, the risk record — would then describe two deployments where the
-     * user has one.
+     * This is the line between CLEAR and RESTART. A stopped deployment keeps the
+     * GOAT's identity — its id, market, mode and skills — so the definition survives
+     * and PLAY can resume the same GOAT. But nothing is running, no executor is
+     * registered, and no tracker is watching, which is what "as though it had never
+     * run" has to mean for the runtime as well as the records.
      */
     if (deployment) {
-      this.stores.deployments.save({ ...deployment, status: 'active', updatedAt: this.now() });
-      this.stores.goals.save({ ...goal, status: 'MONITORING', updatedAt: this.now() });
+      this.retireDeployment(deployment, reason);
+      this.stores.goals.save({
+        ...goal,
+        status: 'DRAFT',
+        updatedAt: at,
+      });
     }
 
     this.recordActivity({
       goatId: goal.agentId,
       deploymentId: deployment?.id,
       agentId: goal.agentId,
-      type: 'GOAT_RESTARTED',
+      type: 'SESSION_CLEARED',
       data: {
+        sessionId: session.sessionId,
+        generation: session.generation,
+        theses: theses.length,
+        evidence,
+        trackers: trackersBefore,
+        logEvents,
         reason,
-        market: deployment?.marketId,
-        clearedTrackers: trackersBefore.length,
-        keptTheses: theses.length,
-        keptEvidence: evidenceKept,
       },
     });
 
-    /*
-     * Re-register the executor so the GOAT is deployable again immediately. No
-     * investigation is started here: the user pressed Refresh, not Start, and a
-     * silent model call would be the same "quiet seconds" this product stopped
-     * doing three commits ago.
-     */
-    if (deployment) {
-      const refreshed = this.stores.goals.get(goalId)!;
-      this.ensureExecutor(refreshed, this.stores.deployments.currentFor(goal.agentId) ?? deployment);
-    }
-
     return {
-      cleared: {
-        trackers: trackersBefore.length,
+      deleted: {
+        theses: theses.length,
+        evidence,
+        tradePlans: ideas.length,
+        trackers: trackersBefore,
         cancelledTrackers: cancelled.length,
+        logEvents,
         pendingModelRequest: inFlightModel,
-        reconsiderations: looksDiscarded,
-        modelTimings: true,
-        executor: true,
+        reconsiderations,
+        modelTimings: this.modelCalls.size === 0,
+        remoteDocuments,
       },
       kept: {
         goal: true,
-        deployment: deployment !== undefined,
-        deploymentId: deployment?.id,
-        theses: theses.length,
-        evidence: evidenceKept,
+        market: true,
+        timeframes: true,
+        skills: true,
+        riskConfiguration: true,
       },
+      session,
     };
+  }
+
+  /**
+   * Delete a GOAT's session documents from remote persistence.
+   *
+   * Only ever session-scoped data. The GOAT's own record, its deployments and any
+   * financial history are not touched — which is why this exists as its own method
+   * rather than as a flag on the persistence service: the blast radius is the whole
+   * reason the operation is safe.
+   */
+  private async clearRemoteSession(goal: Goal, deployment: GoatDeployment | undefined): Promise<number> {
+    const persistence = this.deps.persistence;
+    if (!persistence?.available) return 0;
+    try {
+      return await persistence.clearSession({
+        goalId: goal.agentId,
+        ...(deployment ? { deploymentId: deployment.id } : {}),
+      });
+    } catch {
+      // Reported through the durable runtime's own failure channel rather than
+      // thrown: a local clear that succeeded must not be presented as a failure
+      // because a network write did.
+      return 0;
+    }
   }
 
   async stopGoat(goalId: string, reason = 'Stopped by the operator.'): Promise<GoatDeployment | undefined> {
@@ -3702,6 +3874,74 @@ export class GoatOrchestrator {
     };
   }
 
+  /**
+   * The session a GOAT is currently in.
+   *
+   * Public because the surfaces that render a session — the detail page, the
+   * backtest runner — have to be able to stamp their work with it, and because a
+   * caller deciding whether to start work needs to compare against the same value
+   * the guard compares against.
+   */
+  currentSession(agentId: string): GoatSessionIdentity {
+    return this.sessions.current(agentId);
+  }
+
+  /**
+   * Whether work carrying this session may still mutate the GOAT.
+   *
+   * The single choke point for stale work. Every asynchronous path calls this
+   * immediately before it writes, so a response, a wake, a retry or a cloud callback
+   * from a cleared session is refused at the moment it would have applied rather
+   * than being noticed afterwards by a UI that no longer shows it.
+   */
+  isSessionCurrent(identity: GoatSessionIdentity): boolean {
+    return this.sessions.isCurrent(identity);
+  }
+
+  /**
+   * Whether the current session has produced anything at all.
+   *
+   * This is what separates two states a GOAT is otherwise indistinguishable in:
+   * one that is *running and has not concluded anything yet*, and one whose
+   * session was *cleared and has never started*. The first should say it is still
+   * gathering evidence; the second must say it has no session, because telling
+   * someone who just wiped a session that it is "researching" implies work is in
+   * progress that does not exist.
+   *
+   * Derived from the records rather than tracked as a flag: a flag can disagree
+   * with the state it describes, and a reload would preserve the disagreement.
+   */
+  sessionHasWork(agentId: string): boolean {
+    const goal = this.stores.goals.getForAgent(agentId);
+    if (!goal) return false;
+    if (this.stores.theses.listForGoal(goal.id).length > 0) return true;
+    if (this.stores.ideas.listForGoal(goal.id).length > 0) return true;
+    if (this.trackers.listForAgent(agentId).some((tracker) => tracker.lifecycle.status === 'ACTIVE')) return true;
+    /*
+     * The log decides it too, excluding the clear's own sequence.
+     *
+     * A log whose only records are "stopped", "session cleared" and "refused
+     * stale work" is the definition of a session with nothing in it. Counting the
+     * stop as work would report a cleared GOAT as though it were mid-session, which
+     * is the confusion this method exists to prevent.
+     */
+    const log = this.agentLog(goal.id, 200);
+    return log.some((entry) => !CLEAR_SEQUENCE_EVENTS.has(entry.type as AgentTimelineEventType));
+  }
+
+  /** The message recorded when work from a cleared session is refused. */
+  private staleWork(what: string, identity: GoatSessionIdentity): ReturnType<typeof staleWorkMessage> {
+    const report = staleWorkMessage(what, identity);
+    const current = this.sessions.peek(identity.goatId);
+    this.recordActivity({
+      goatId: identity.goatId,
+      agentId: identity.goatId,
+      type: 'STALE_WORK_REFUSED',
+      data: { what, reason: report.reason, sessionId: identity.sessionId, generation: identity.generation },
+    });
+    return { ...report, ...(current ? { currentGeneration: current.generation } : {}) };
+  }
+
   /** Move an existing deployment to paused, without losing the record. */
   pauseGoat(goalId: string): GoatDeployment | undefined {
     const deployment = this.currentDeployment(goalId);
@@ -3834,6 +4074,12 @@ export class GoatOrchestrator {
 
     return buildMission({
       goal,
+      /*
+       * Derived from the records, so a reload cannot disagree with it: a GOAT whose
+       * session was cleared has no thesis, no plan, no trackers and a log containing
+       * only the clear, and that combination is what "no session yet" means.
+       */
+      sessionHasWork: this.sessionHasWork(goal.agentId),
       /*
        * The last deployment, not just the active one. A stopped GOAT still
        * knows its market, its mode and whether it may execute, and without
@@ -4210,6 +4456,19 @@ export class GoatOrchestrator {
     const thesis = this.stores.theses.get(wake.thesisId);
     if (!thesis) return undefined;
 
+    /*
+     * The session this wake belongs to, captured before anything is awaited.
+     *
+     * Checked twice: once here, so a wake that is already stale never reaches the
+     * model, and once after the model answers, because that is where a CLEAR
+     * pressed during the request would show up. The second check is the one that
+     * matters — it is the only thing standing between a cleared session and an
+     * answer that was computed against it.
+     */
+    const session = this.sessions.current(wake.agentId);
+    if (!this.sessions.isCurrent(session)) return undefined;
+    this.inFlightSessions.set(wake.agentId, session);
+
     const context = this.loop.buildContext(wake.agentId, wake.thesisId, wake.event);
     if (!context) return undefined;
 
@@ -4257,7 +4516,23 @@ export class GoatOrchestrator {
     });
 
     const decided = plan ?? (await this.reason(context, wake));
+
+    /*
+     * Re-check after the model has been consulted.
+     *
+     * A plan is only applied to the session that asked for it. Without this, a GOAT
+     * that is cleared while a request is outstanding would apply that request's
+     * answer on arrival — recreating the thesis, the evidence and the trackers the
+     * user had just deleted, and logging them into a session that no longer exists.
+     */
+    if (!this.sessions.isCurrent(session)) {
+      this.inFlightSessions.delete(wake.agentId);
+      this.staleWork('A wake decision', session);
+      return undefined;
+    }
+
     const outcome = this.loop.applyPlan(wake, decided);
+    this.inFlightSessions.delete(wake.agentId);
 
     /*
      * Evidence, before the conclusion it produced.
@@ -5257,6 +5532,26 @@ function describeActivity(type: AgentTimelineEventType, data: unknown): string {
      */
     case 'DECISION_REFUSED':
       return text(record.reason) || 'The runtime declined this decision.';
+    case 'STALE_WORK_REFUSED':
+      return text(record.reason) || 'Work from a cleared session was refused.';
+
+    case 'SESSION_CLEARED': {
+      /*
+       * What was removed, counted.
+       *
+       * A clear that reports only "cleared" is indistinguishable from a reload that
+       * happened to look clean, and the reader's question after pressing CLEAR is
+       * exactly "what went". The counts are the answer.
+       */
+      const parts = [
+        isFiniteNumber(record.theses) ? count(record.theses, 'thesis') : undefined,
+        isFiniteNumber(record.evidence) ? count(record.evidence, 'evidence record') : undefined,
+        isFiniteNumber(record.trackers) ? count(record.trackers, 'tracker') : undefined,
+        isFiniteNumber(record.logEvents) ? count(record.logEvents, 'log entry') : undefined,
+      ].filter((part): part is string => part !== undefined);
+      return `Session cleared — ${parts.join(', ') || 'nothing to remove'}. The GOAT itself is unchanged, and nothing is running until you press PLAY.`;
+    }
+
     case 'RUNTIME_REGISTERED':
       return 'Registered with the durable runtime, so it keeps working when this tab closes';
     case 'RUNTIME_UNAVAILABLE': {

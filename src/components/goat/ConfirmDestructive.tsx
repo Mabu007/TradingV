@@ -32,6 +32,17 @@ export interface ConfirmDestructiveProps {
   body: string;
   /** What is *not* destroyed, when there is something worth keeping. */
   keptNote?: string;
+  /**
+   * What will be destroyed, itemised.
+   *
+   * Preferred over `body` for anything irreversible. A sentence summarising a
+   * deletion reads as a summary of consequences; a list is a thing a person can
+   * check against what they expect, which is the only useful thing a confirmation
+   * is for. "Are you sure?" cannot be checked; this can.
+   */
+  items?: string[];
+  /** Stated after the list, when the loss cannot be undone. */
+  irreversibleNote?: string;
   confirmLabel: string;
   cancelLabel?: string;
   busy?: boolean;
@@ -44,6 +55,8 @@ export interface ConfirmDestructiveProps {
 export const ConfirmDestructive: React.FC<ConfirmDestructiveProps> = ({
   open,
   title,
+  items,
+  irreversibleNote,
   body,
   keptNote,
   confirmLabel,
@@ -114,6 +127,7 @@ export const ConfirmDestructive: React.FC<ConfirmDestructiveProps> = ({
         role="dialog"
         aria-modal="true"
         aria-labelledby="confirm-destructive-title"
+        data-testid={testId ? `${testId}-dialog` : undefined}
         onKeyDown={onKeyDown}
         className="w-full max-w-sm rounded-2xl border border-neg/35 bg-surface px-5 py-5 shadow-2xl"
       >
@@ -132,6 +146,24 @@ export const ConfirmDestructive: React.FC<ConfirmDestructiveProps> = ({
               {title}
             </h2>
             <p className="mt-1.5 text-[11.5px] leading-relaxed text-ink-2">{body}</p>
+            {items && items.length > 0 && (
+              <ul className="mt-2.5 space-y-1" data-testid="destructive-items">
+                {items.map((item) => (
+                  <li key={item} className="flex gap-1.5 text-[11px] leading-relaxed text-ink-2">
+                    <span aria-hidden="true" className="text-neg">•</span>
+                    <span>{item}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {irreversibleNote && (
+              <p
+                className="mt-2.5 rounded-lg border border-neg/30 bg-neg/[0.06] px-2.5 py-2 text-[10.5px] leading-relaxed text-neg"
+                data-testid="destructive-irreversible"
+              >
+                {irreversibleNote}
+              </p>
+            )}
             {keptNote && (
               <p className="mt-2 rounded-lg border border-line bg-surface-2 px-2.5 py-2 text-[10.5px] leading-relaxed text-ink-3">
                 {keptNote}
@@ -153,6 +185,7 @@ export const ConfirmDestructive: React.FC<ConfirmDestructiveProps> = ({
             type="button"
             onClick={onConfirm}
             disabled={busy}
+            data-testid={testId}
             className="rounded-lg bg-neg-strong px-3.5 py-2 font-mono text-[11px] font-semibold text-accent-contrast transition-opacity hover:opacity-90 disabled:opacity-40"
           >
             {confirmLabel}

@@ -43,6 +43,36 @@ export class InMemoryAgentTimelineStore implements AgentTimelineStore {
   }
 
   /** Hook for subclasses; keeps persistence off the hot path. */
+  /**
+   * Forget everything recorded for a GOAT.
+   *
+   * Exists for one operation: clearing a session. An agent log is the record of
+   * what a session *did*, so a cleared session's log is not history to be archived
+   * or filtered — it is the residue the clear exists to remove. Hiding it in the UI
+   * while leaving it in the store is exactly how a "cleared" GOAT comes back with
+   * yesterday's events after a reload.
+   *
+   * Returns how many events were dropped, so a caller can assert that a clear
+   * actually cleared rather than trusting that it did.
+   */
+  async removeForGoat(goatId: string): Promise<number> {
+    let removed = 0;
+    for (let index = this.events.length - 1; index >= 0; index -= 1) {
+      if (this.events[index].goatId !== goatId) continue;
+      this.events.splice(index, 1);
+      removed += 1;
+    }
+    if (removed > 0) this.onRemoved(goatId);
+    return removed;
+  }
+
+  /**
+   * Hook for subclasses.
+   *
+   * The persistent store has to write the shortened list through here, and it
+   * cannot ride `append`'s path because a clear produces no append.
+   */
+  protected onRemoved(_goatId: string): void { /* in-memory has nothing to persist */ }
   protected onAppended(_event: AgentTimelineEvent): void { /* in-memory has nothing to do */ }
 
   /**
@@ -201,6 +231,22 @@ export class PersistentAgentTimelineStore extends InMemoryAgentTimelineStore {
     this.scheduleWrite();
   }
 
+  /**
+   * A clear is persisted immediately rather than scheduled.
+   *
+   * Scheduled would be wrong here: the whole point is that a cleared session's log
+   * does not come back, and a debounced write leaves a window in which a reload
+   * restores every event that was just removed.
+   */
+  protected override onRemoved(goatId: string): void {
+    this.writePending = true;
+    if (this.lastWrite !== undefined) {
+      clearTimeout(this.lastWrite);
+      this.lastWrite = undefined;
+    }
+    this.write();
+  }
+
   private restore(): void {
     const storage = getStorageSafely();
     if (!storage) {
@@ -284,8 +330,14 @@ export class PersistentAgentTimelineStore extends InMemoryAgentTimelineStore {
     (this.lastWrite as unknown as { unref?: () => void }).unref?.();
   }
 
+  /**
+   * Write the current list through now.
+   *
+   * Separate from `write()` because a clear must not be deferred: the scheduled
+   * path exists to amortise a burst of appends, and a removal that waits on a timer
+   * is a removal that a reload can undo.
+   */
   private write(): void {
-    if (!this.writePending) return;
     this.writePending = false;
     const storage = getStorageSafely();
     if (!storage) {

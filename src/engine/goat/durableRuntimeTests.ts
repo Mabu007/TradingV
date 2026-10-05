@@ -304,7 +304,7 @@ await test('a refresh discards the session without leaving a runtime behind', as
   orchestrator.deployGoat({ goalId: goalId, market: 'EUR/USD' });
   await settle();
 
-  await orchestrator.refreshGoat(goalId);
+  await orchestrator.clearGoatSession(goalId);
   await settle();
 
   /*

@@ -217,6 +217,23 @@ const STYLE: Record<AgentTimelineEventType, AgentEventStyle> = {
    * is the thing that survives the tab closing, and putting it in the execution
    * channel would imply an order was placed.
    */
+  /*
+   * The session ended.
+   *
+   * Its own event rather than a rephrasing of a stop, because the two are not the
+   * same: a stop leaves the session and its records, and a clear removes them. A log
+   * that recorded both as "stopped" would make the destructive one look routine.
+   */
+  SESSION_CLEARED: { channel: 'CONTROL', tone: 'warning', weight: 'important', label: 'CLEARED' },
+  /*
+   * Refused stale work.
+   *
+   * Neutral, and deliberately not styled as an error: refusing a late answer is the
+   * system working correctly, and a session is not permanently in trouble because one
+   * request was in flight when it was cleared. Logged at all because "it was
+   * refused" and "it was lost" are different claims and only one of them is safe.
+   */
+  STALE_WORK_REFUSED: { channel: 'CONTROL', tone: 'neutral', weight: 'normal', label: 'STALE' },
   RUNTIME_REGISTERED: { channel: 'RUNTIME', tone: 'positive', weight: 'normal', label: 'RUNTIME' },
   RUNTIME_UNAVAILABLE: { channel: 'RUNTIME', tone: 'warning', weight: 'normal', label: 'RUNTIME' },
   TRADE_CLOSED: { channel: 'EXECUTION', tone: 'positive', weight: 'important', label: 'EXECUTION' },

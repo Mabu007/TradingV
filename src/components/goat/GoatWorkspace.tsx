@@ -23,7 +23,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Compass, History, Loader2, Pause, Play, RefreshCw, Rocket, Send, Trash2 } from 'lucide-react';
+import { Compass, Eraser, History, Loader2, Pause, Play, Rocket, Send, Trash2 } from 'lucide-react';
 
 import type { GoatOrchestrator } from '../../engine/goat/orchestrator';
 import type { AgentEventView } from '../../engine/goat/agentEvents';
@@ -57,15 +57,14 @@ export interface GoatWorkspaceProps {
    */
   onBacktest?: () => void;
   /**
-   * Start the agent again from a clean runtime state.
+   * Destroy this GOAT's session.
    *
-   * Deliberately not "Delete" and not "Deploy". The GOAT, its market, its
-   * skills and its history survive; what goes is the runtime — the agent
-   * instance, its conditions, their cooldowns, and anything it was part-way
-   * through answering. Confirmation is required, because a control that resets
-   * an agent should never be one tap away from a muscle memory.
+   * Named for what it does rather than how it looks. The previous name was
+   * `onRefresh`, and the button it drove was labelled Refresh — which described
+   * the *implementation* (a rebuild from existing state) rather than the *effect*
+   * (a session destroyed), and told users it was safe to press.
    */
-  onRefresh?: () => void;
+  onClear?: () => void;
   onArchive?: () => void;
 }
 
@@ -78,7 +77,7 @@ export const GoatWorkspace: React.FC<GoatWorkspaceProps> = ({
   onDismissError,
   onDeploy,
   onBacktest,
-  onRefresh,
+  onClear,
   onArchive,
 }) => {
   /*
@@ -172,8 +171,17 @@ export const GoatWorkspace: React.FC<GoatWorkspaceProps> = ({
    * sort of phrase that makes someone hesitate for the wrong reason: nothing
    * permanent is at stake, and a GOAT that has drifted needs this.
    */
-  const [confirmRefresh, setConfirmRefresh] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [clearing, setClearing] = useState(false);
+
+  /*
+   * Whether the GOAT is actually running.
+   *
+   * Read from the mission rather than from the button set, because the two can
+   * disagree — a GOAT can be resumed from elsewhere — and the confirmation has to
+   * describe what will actually happen rather than what this view last saw.
+   */
+  const isRunning = mission.runtime === 'RUNNING' || mission.modelPending !== undefined;
 
   const [steeringOpen, setSteeringOpen] = useState(false);
   const [steeringText, setSteeringText] = useState('');
@@ -206,7 +214,7 @@ export const GoatWorkspace: React.FC<GoatWorkspaceProps> = ({
         onPlay={() => void orchestrator.resumeGoat(mission.goalId).then(onChanged)}
         onDeploy={onDeploy}
         onBacktest={onBacktest}
-        onRefresh={onRefresh}
+        onClear={onClear && (() => setConfirmClear(true))}
         onArchive={onArchive ? () => setConfirmDelete(true) : undefined}
       />
 
@@ -263,22 +271,36 @@ export const GoatWorkspace: React.FC<GoatWorkspaceProps> = ({
         />
       </div>
 
-      {onRefresh && (
+      {onClear && (
         <ConfirmDestructive
-          open={confirmRefresh}
-          busy={refreshing}
-          title={`Start "${mission.name || 'this GOAT'}" fresh?`}
-          body="Its runtime is cleared: the running agent, the conditions it is watching, their cooldowns, and anything it was part-way through answering."
-          keptNote="The GOAT itself is kept — its objective, skills, market, deployment, Trade Plan history and evidence all stay. It will read the market again and form a new plan."
-          confirmLabel="Start fresh"
-          testId="goat-refresh-confirm"
+          open={confirmClear}
+          busy={clearing}
+          title="Clear GOAT session?"
+          body={
+            isRunning
+              ? 'This GOAT is running. Clearing will stop it and discard the session it is in the middle of.'
+              : 'This GOAT is stopped. Clearing discards the session it last ran.'
+          }
+          items={[
+            'Trade Plan and thesis',
+            'research and evidence',
+            'trackers and watchers',
+            'agent log',
+            'simulated orders and positions',
+            'trades from this session',
+            'model and runtime state',
+          ]}
+          irreversibleNote="This cannot be undone."
+          keptNote="Your GOAT configuration will remain unchanged — its name, objective, description, skills, market, resolutions and risk settings all stay."
+          confirmLabel="Clear session"
+          testId="goat-clear-confirm"
           onConfirm={() => {
-            setRefreshing(true);
-            onRefresh?.();
-            setConfirmRefresh(false);
-            window.setTimeout(() => setRefreshing(false), 600);
+            setClearing(true);
+            onClear?.();
+            setConfirmClear(false);
+            window.setTimeout(() => setClearing(false), 600);
           }}
-          onCancel={() => setConfirmRefresh(false)}
+          onCancel={() => setConfirmClear(false)}
         />
       )}
 
@@ -314,15 +336,14 @@ interface GoatHeaderProps {
   onDeploy: () => void;
   onBacktest?: () => void;
   /**
-   * Start the agent again from a clean runtime state.
+   * Destroy this GOAT's session.
    *
-   * Deliberately not "Delete" and not "Deploy". The GOAT, its market, its
-   * skills and its history survive; what goes is the runtime — the agent
-   * instance, its conditions, its cooldowns and anything it was mid-way through
-   * answering. Confirmation is required, because a control that resets an agent
-   * should never be one tap away from a muscle memory.
+   * Not a refresh and not a restart: the session's plan, research, evidence,
+   * trackers, log and trades are removed and the GOAT is left stopped. Confirmed,
+   * because a control that destroys a session should never be one tap away from a
+   * muscle memory.
    */
-  onRefresh?: () => void;
+  onClear?: () => void;
   onArchive?: () => void;
 }
 
@@ -334,7 +355,7 @@ interface GoatHeaderProps {
  * that is the order the questions arrive in.
  */
 const GoatHeader: React.FC<GoatHeaderProps> = ({
-  mission, now, live, steeringPending, busy, onSteer, onStop, onPlay, onDeploy, onBacktest, onRefresh, onArchive,
+  mission, now, live, steeringPending, busy, onSteer, onStop, onPlay, onDeploy, onBacktest, onClear, onArchive,
 }) => {
   const stopped = mission.runtime === 'STOPPED' || mission.runtime === 'PAUSED';
   return (
@@ -353,7 +374,13 @@ const GoatHeader: React.FC<GoatHeaderProps> = ({
             Stop
           </ControlButton>
         ) : mission.deployment ? (
-          <ControlButton onClick={onPlay} disabled={busy} icon={<Play className="h-3 w-3" />}>
+          <ControlButton
+            onClick={onPlay}
+            disabled={busy}
+            icon={<Play className="h-3 w-3" aria-hidden="true" />}
+            testId="goat-play"
+            label="Play: start a new session for this GOAT"
+          >
             Play
           </ControlButton>
         ) : (
@@ -378,15 +405,28 @@ const GoatHeader: React.FC<GoatHeaderProps> = ({
             Backtest
           </ControlButton>
         )}
-        {onRefresh && (
+        {onClear && (
+          /*
+           * CLEAR.
+           *
+           * Visually separated from the neutral controls on purpose: the two actions
+           * beside it are reversible and this one is not. An icon that reads as
+           * "refresh" next to the word CLEAR would be a lie in the other direction —
+           * the button used to be called Refresh and look like one, and users
+           * reasonably read it as harmless.
+           */
           <ControlButton
-            onClick={onRefresh}
+            // The parent owns the confirmation: this component only knows that the
+            // action exists, not what it will destroy, so the dialog — and the
+            // decision to open it — live with the state that has to survive it.
+            onClick={onClear}
             disabled={busy}
-            icon={<RefreshCw className="h-3 w-3" />}
-            testId="goat-refresh"
-            label="Start fresh: clear this GOAT's runtime and let it reason again"
+            icon={<Eraser className="h-3 w-3" aria-hidden="true" />}
+            testId="goat-clear"
+            label="Clear this GOAT's session: its trade plan, research, evidence, trackers, log and trades. The GOAT itself is kept."
+            tone="destructive"
           >
-            Refresh
+            Clear
           </ControlButton>
         )}
         <ControlButton onClick={onSteer} icon={<Compass className="h-3 w-3" />}>
@@ -484,10 +524,19 @@ interface ControlButtonProps {
   label?: string;
   /** Named for the flows that assert on a control by its role. */
   testId?: string;
+  /**
+   * Marks a control that destroys something irreversible.
+   *
+   * Separate from `primary` because the two answer different questions: `primary`
+   * says "this is the thing you would press", and this says "this cannot be
+   * taken back". CLEAR is not primary — it sits beside PLAY, not before it — and
+   * giving it the accent would invite the mistake the confirmation exists to prevent.
+   */
+  tone?: 'neutral' | 'destructive';
 }
 
 const ControlButton: React.FC<ControlButtonProps> = ({
-  onClick, children, icon, disabled, primary, label, testId,
+  onClick, children, icon, disabled, primary, label, testId, tone = 'neutral',
 }) => (
   <button
     type="button"
@@ -495,10 +544,13 @@ const ControlButton: React.FC<ControlButtonProps> = ({
     disabled={disabled}
     aria-label={label}
     data-testid={testId}
+    data-destructive={tone === 'destructive' ? 'true' : undefined}
     className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 font-mono text-[10px] tracking-[0.1em] transition-colors disabled:opacity-40 ${
       primary
         ? 'border-accent/40 bg-accent-soft/40 text-accent-ink'
-        : 'border-line text-ink-3 hover:border-accent/40 hover:text-ink-2'
+        : tone === 'destructive'
+          ? 'border-neg/30 text-neg/90 hover:border-neg/60 hover:bg-neg/[0.06] hover:text-neg'
+          : 'border-line text-ink-3 hover:border-accent/40 hover:text-ink-2'
     }`}
   >
     {icon}

@@ -351,7 +351,8 @@ export const GoatCommandCenter: React.FC<GoatCommandCenterProps> = ({
       {/* ------------------------------------------------------------ trade plan */}
       <TradePlanPanel
         plan={mission.tradePlan}
-        thesis={mission.thesis}
+        thesis={mission.sessionHasWork ? mission.thesis : undefined}
+        sessionHasWork={mission.sessionHasWork}
         mayExecute={mission.mayExecute}
         mode={mission.mode}
       />
@@ -428,6 +429,8 @@ const ActionButton: React.FC<{
  */
 const TradePlanPanel: React.FC<{
   plan?: TradeIdea;
+  /** False when this GOAT has no session at all — never run, or just cleared. */
+  sessionHasWork?: boolean;
   /**
    * The GOAT's working thesis, shown in place of an absent plan.
    *
@@ -440,7 +443,7 @@ const TradePlanPanel: React.FC<{
   thesis?: { statement: string; invalidation?: string; direction?: string };
   mayExecute: boolean;
   mode?: string;
-}> = ({ plan, thesis, mayExecute, mode }) => (
+}> = ({ plan, thesis, sessionHasWork, mayExecute, mode }) => (
   <section className="rounded-2xl border border-line bg-surface">
     <header className="flex items-center gap-3 border-b border-line px-5 py-3.5">
       <div className="rounded-xl bg-accent-soft p-2 text-accent">
@@ -488,13 +491,24 @@ const TradePlanPanel: React.FC<{
         </p>
       </div>
     ) : !plan ? (
+      /*
+       * Two different empty states, and the difference is the whole point.
+       *
+       * A GOAT that has run and has not concluded anything is *researching*, and
+       * saying so is true and useful. A GOAT whose session was cleared — or that has
+       * never run — has no session at all, and telling it it is researching implies
+       * work under way that does not exist. The first says what it is doing; the
+       * second says what it would need to start doing, which is the user's next
+       * action.
+       */
       <div className="px-5 py-4">
-        <p className="text-[11px] leading-relaxed text-ink-2">
-          FORMING TRADE PLAN — the GOAT is still collecting evidence.
+        <p className="text-[11px] font-semibold tracking-wide text-ink-2">
+          {sessionHasWork === false ? 'NO TRADE PLAN' : 'FORMING TRADE PLAN'}
         </p>
         <p className="mt-1 text-[11px] leading-relaxed text-ink-3">
-          Doing nothing is a real outcome here: a plan built without evidence would be a guess with an
-          entry price on it.
+          {sessionHasWork === false
+            ? 'The GOAT has not started a session yet. Press PLAY to start one; it will read the market and work out what it needs to watch.'
+            : 'The GOAT is still collecting evidence. Doing nothing is a real outcome here: a plan built without evidence would be a guess with an entry price on it.'}
         </p>
       </div>
     ) : (

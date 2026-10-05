@@ -92,7 +92,18 @@ type Screen = 'home' | 'create' | 'review' | 'deploy' | 'detail' | 'backtest';
  */
 type Tab = 'mine' | 'explore' | 'skills';
 
-type Activity = 'idle' | 'creating' | 'deploying' | 'starting' | 'stopping' | 'archiving' | 'reading' | 'refresh';
+type Activity = 'idle' | 'creating' | 'deploying' | 'starting' | 'stopping' | 'archiving' | 'reading' | 'clear';
+
+/**
+ * "1 trade plan" / "3 trade plans".
+ *
+ * A hand-rolled plural in prose is easy to get wrong and reads as a bug when it
+ * is — "0 log entrys" is the kind of thing that makes a person distrust every
+ * other number on the screen.
+ */
+function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? '' : 's'}`;
+}
 
 export const GoatView: React.FC<GoatViewProps> = ({
   orchestrator,
@@ -695,13 +706,14 @@ export const GoatView: React.FC<GoatViewProps> = ({
               onChanged={refresh}
               onDeploy={() => setScreen('deploy')}
               onBacktest={() => backtestGoat(mission)}
-              onRefresh={() => {
-                setActivity('refresh');
+              onClear={() => {
+                setActivity('clear');
                 void orchestrator
-                  .refreshGoat(mission.goalId)
+                  .clearGoatSession(mission.goalId)
                   .then((report) => {
+                    const deleted = report.deleted;
                     setNotice(
-                      `Started fresh. Cleared ${report.cleared.trackers} condition${report.cleared.trackers === 1 ? '' : 's'}, its runtime state and anything it was mid-way through answering. The GOAT, its market, its skills and its history are untouched.`,
+                      `Session cleared. Removed ${plural(deleted.theses, 'trade plan')}, ${plural(deleted.evidence, 'evidence record')} and ${plural(deleted.trackers, 'tracker')}. Your GOAT is unchanged and nothing is running — press PLAY to start a new session.`,
                     );
                   })
                   .catch((caught: unknown) => setError(describe(caught)))
