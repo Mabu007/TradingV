@@ -25,15 +25,27 @@
 
 import {
   AgentPlan,
+  AgentPlanStep,
   Evidence,
   Thesis,
   ThesisState,
   TrackerEvent,
+  TrackerKind,
   TrackerRequest,
   TradeIdeaRequest,
   WakeRequest,
 } from './types';
 import { canTransitionThesis } from './types';
+import {
+  applyConfidence,
+  clampConfidence,
+  detectConflicts,
+  hysteresisVerdict,
+  provenanceKey,
+  readSufficiency,
+  weighEvidence,
+  type SufficiencyReadout,
+} from './reasoning';
 import {
   EvidenceStore,
   GoalStore,
@@ -64,6 +76,30 @@ export interface GoatLoopDeps {
    * only in a harness that has not deployed anything.
    */
   currentDeployment?(agentId: string): DeploymentContext | undefined;
+  /**
+   * The last market reading this GOAT made, if there is one.
+   *
+   * Present only as a *record of something already read*. It exists so a resumed
+   * observation plan can ask whether the questions it was asking are still the
+   * right ones, and it is deliberately the last reading rather than a fresh one:
+   * recalibration that triggered a market fetch would be an unscheduled market read
+   * in a system whose whole premise is that a GOAT reads when it is woken, and in a
+   * backtest it would be a read of a moment the simulation had not reached.
+   *
+   * Absent means the GOAT has not read anything this session, and the answer is
+   * then "leave the plan alone" rather than a guess.
+   */
+  lastMarketReading?(agentId: string): MarketReading | undefined;
+}
+
+/**
+ * A market reading a GOAT already made, kept for the question "is this plan stale".
+ */
+export interface MarketReading {
+  symbol: string;
+  price: number;
+  timeframe?: string;
+  at: number;
 }
 
 export interface AgentContext {
@@ -103,6 +139,15 @@ export interface AgentContext {
   constraints: string[];
   /** The environment this is running in. Identical in backtest and live. */
   environment: string;
+  /**
+   * Whether there is enough here to decide anything, in the runtime's own terms.
+   *
+   * Computed from counts and weights, never from elapsed time: a GOAT that is still
+   * waiting is doing exactly the right thing, and a budget that punished waiting
+   * would turn patience into a failure. The model may disagree with the word, but
+   * the gates that act on it are not the model's to overrule.
+   */
+  sufficiency: SufficiencyReadout;
 }
 
 /**
@@ -169,6 +214,14 @@ export interface InvestigationRequest {
   /** Absolute time at which this line of enquiry stops being worth budget. */
   validUntil?: number;
   /**
+   * The thesis this investigation is the opposing reading of.
+   *
+   * Present only where the goal's skills allow a second live hypothesis, and
+   * refused by `createThesis` otherwise — the ceiling is not relaxed for this, it
+   * is the same ceiling.
+   */
+  competesWith?: string;
+  /**
    * Attach to the live thesis instead of refusing.
    *
    * For the case where the hypothesis survived and its observation plan
@@ -195,6 +248,33 @@ export interface InvestigationOutcome {
    */
   created: boolean;
 }
+
+/**
+ * How many times a thesis may be re-proposed after the risk layer refused it.
+ *
+ * Three, and the number is the point rather than the value. One refusal means the
+ * construction was wrong. Two means the GOAT is learning. Three means it is not
+ * going to solve this by trying again, and continuing would be a loop the GOAT
+ * cannot leave: propose, be refused, propose the same thing, be refused. After the
+ * bound the loop refuses another proposal and says so, which is the only honest
+ * outcome available to a reasoning system that cannot move the gate it is being
+ * held at.
+ *
+ * Overridable per goal by a skill constraint, because a strategy that expects to
+ * be re-priced around a moving account is a real thing.
+ */
+export const MAX_RISK_REVISIONS = 3;
+
+/**
+ * The most steps one composite plan may contain.
+ *
+ * A bound on transaction size, not a budget for ambition. Four is enough for
+ * "record this, weaken that, drop that watch, ask a better question", which is the
+ * shape of a real wake; anything longer is a model trying to do a morning's work in
+ * one turn, and a pass that fails half way through it is worse than a pass that did
+ * one thing.
+ */
+export const MAX_COMPOSITE_STEPS = 4;
 
 /**
  * Runs the loop for one agent at a time.
@@ -267,6 +347,17 @@ export class GoatLoop {
       .listEventsForThesis(thesisId)
       .slice(-10);
 
+    /*
+     * Evidence, bounded and ordered by what it does to belief.
+     *
+     * A thesis that has been awake for a week can hold hundreds of items, and
+     * sending all of them would crowd out the market context — which is the part
+     * that decides anything. The strongest opposing evidence comes first even
+     * though it is oldest, because the case against is what a GOAT is most likely
+     * to have stopped looking at.
+     */
+    const evidence = this.boundedEvidence(thesisId);
+
     return {
       agentId,
       goalId: goal.id,
@@ -275,12 +366,47 @@ export class GoatLoop {
       goal: goal.statement,
       thesis,
       watching,
-      evidence: this.deps.evidence.listForThesis(thesisId),
+      evidence,
       recentEvents,
       wakeEvent,
       constraints: this.deps.skills.describeConstraints(goal.skillIds),
       environment: this.deps.env?.mode ?? 'AGENTIC',
+      sufficiency: readSufficiency({
+        thesis,
+        evidence: this.deps.evidence.listForThesis(thesisId),
+        ...(this.thesisTimeframe(thesis) ? { thesisTimeframe: this.thesisTimeframe(thesis) } : {}),
+        now: this.now(),
+      }),
     };
+  }
+
+  /**
+   * The evidence worth showing a model, and nothing else.
+   *
+   * A count, not a trim: the newest items, the heaviest on each side, and the
+   * strongest contradiction always survive, because those are the three ways a
+   * piece of evidence changes what someone should do next. Everything in between is
+   * still on the timeline and in the store.
+   */
+  private boundedEvidence(thesisId: string, limit = 16): Evidence[] {
+    const all = this.deps.evidence.listForThesis(thesisId);
+    if (all.length <= limit) return all;
+
+    const chosen = new Map<string, Evidence>();
+    const take = (items: Evidence[]): void => {
+      for (const item of items.slice(-limit)) chosen.set(item.id, item);
+    };
+    take(all);
+    for (const side of ['SUPPORTS', 'CONTRADICTS'] as const) {
+      take(
+        all
+          .filter((item) => item.polarity === side)
+          .sort((left, right) => Math.abs(right.weight ?? 0) - Math.abs(left.weight ?? 0))
+          .slice(0, 4),
+      );
+    }
+    // Newest last, so the sequence a reader follows is still chronological.
+    return [...chosen.values()].sort((left, right) => left.createdAt - right.createdAt);
   }
 
   /**
@@ -298,6 +424,16 @@ export class GoatLoop {
     requiredConfirmation?: string[];
     invalidation: string;
     confidence?: number;
+    /**
+     * The thesis this one is the opposing reading of.
+     *
+     * A tournament, not a second agent: both sides belong to the same goal, each
+     * keeps its own evidence and its own trackers, and the ceiling above still
+     * bounds how many can exist. Refused unless the goal's skills permit more than
+     * one live thesis, because the whole difference between a tournament and an
+     * unbounded branching agent is that the ceiling applies to it too.
+     */
+    competesWith?: string;
   }): Thesis {
     const now = this.now();
     const maxTheses = this.thesisCeiling(input.goalId);
@@ -307,6 +443,8 @@ export class GoatLoop {
         `Goal ${input.goalId} already has ${live} live theses (limit ${maxTheses}). Abandon or complete one first.`,
       );
     }
+
+    const competesWith = this.validCompetingThesis(input, maxTheses);
 
     const thesis: Thesis = {
       id: `ths_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
@@ -319,12 +457,79 @@ export class GoatLoop {
       state: 'DRAFT',
       confidence: input.confidence,
       revision: 0,
+      ...(competesWith ? { competesWith } : {}),
       createdAt: now,
       updatedAt: now,
     };
 
     this.deps.theses.save(thesis);
+
+    /*
+     * The relationship is stored on both sides.
+     *
+     * One-directional would leave the surviving half unable to find the hypothesis
+     * it was competing with, so invalidating it could not close the pair — and the
+     * loser would keep its trackers armed against a question that now has one
+     * answer.
+     */
+    if (competesWith) {
+      const counterpart = this.deps.theses.get(competesWith);
+      if (counterpart && counterpart.agentId === input.agentId && !counterpart.competesWith) {
+        this.deps.theses.save({ ...counterpart, competesWith: thesis.id });
+      }
+    }
+
     return thesis;
+  }
+
+  /**
+   * Whether a proposed competing hypothesis is admissible.
+   *
+   * Four conditions, all of them about integrity rather than taste: the counterpart
+   * exists and belongs to this goal, the ceiling permits two live theses, the two
+   * disagree about direction (a tournament between two bullish readings is one
+   * thesis written twice), and the counterpart is not already in a tournament with
+   * somebody else. Anything else is refused with the reason, and a refusal simply
+   * means the GOAT has one hypothesis rather than two.
+   */
+  private validCompetingThesis(
+    input: { goalId: string; agentId: string; direction?: Thesis['direction']; competesWith?: string },
+    maxTheses: number,
+  ): string | undefined {
+    const counterpartId = input.competesWith;
+    if (!counterpartId) return undefined;
+
+    if (maxTheses < 2) {
+      throw new Error(
+        'This goal may hold one live hypothesis at a time, so a competing hypothesis cannot be opened.',
+      );
+    }
+    const counterpart = this.deps.theses.get(counterpartId);
+    if (!counterpart || counterpart.goalId !== input.goalId || counterpart.agentId !== input.agentId) {
+      throw new Error(
+        `Thesis ${counterpartId} is not a hypothesis of goal ${input.goalId} owned by agent ${input.agentId}.`,
+      );
+    }
+    if (isTerminalThesisState(counterpart.state)) {
+      throw new Error(
+        `Thesis ${counterpartId} is ${counterpart.state}, so it is not competing with anything.`,
+      );
+    }
+    if (counterpart.competesWith && counterpart.competesWith !== counterpartId) {
+      throw new Error(
+        `Thesis ${counterpartId} is already in a tournament with ${counterpart.competesWith}.`,
+      );
+    }
+    if (
+      input.direction !== undefined &&
+      counterpart.direction !== undefined &&
+      input.direction === counterpart.direction
+    ) {
+      throw new Error(
+        `Thesis ${counterpartId} already reads ${input.direction}; two ${input.direction} readings of one question are not competing hypotheses.`,
+      );
+    }
+    return counterpartId;
   }
 
   /**
@@ -349,7 +554,7 @@ export class GoatLoop {
     }
 
     const live = this.deps.theses.listLiveForGoal(request.goalId);
-    if (live.length > 0 && !request.attachToLive) {
+    if (live.length > 0 && !request.attachToLive && !request.competesWith) {
       outcome.thesisId = live[0].id;
       outcome.thesis = live[0];
       outcome.rejections.push(
@@ -372,6 +577,7 @@ export class GoatLoop {
         direction: request.thesis.direction,
         invalidation: request.thesis.invalidation,
         requiredConfirmation: request.thesis.requiredConfirmation,
+        ...(request.competesWith ? { competesWith: request.competesWith } : {}),
       });
     } catch (error) {
       outcome.rejections.push(this.describeRejection(error));
@@ -489,26 +695,41 @@ export class GoatLoop {
 
     const permitted = only ? new Set(only) : undefined;
 
+    /*
+     * The market as this GOAT last read it.
+     *
+     * Read once, from a record — never fetched. A restore that fetched the market
+     * would be an unscheduled read in a system that reads when it is woken, and in
+     * a backtest it would be a read of an instant the simulation had not reached.
+     * With nothing on the record the answer is "the plan is not known to be stale",
+     * which is the safe direction: leaving a stale question in place costs one wake
+     * on a condition that may never fire, and recalibrating a plan on invented
+     * context would cost the question itself.
+     */
+    const reading = this.deps.lastMarketReading?.(agentId);
+
     for (const previous of this.deps.trackers.listForThesis(thesis.id)) {
       if (previous.lifecycle.status === 'ACTIVE') continue;
       if (permitted && !permitted.has(previous.id)) continue;
       if (alreadyRestored.has(intentKey(previous))) continue;
       try {
+        const intent = this.recalibrate(previous, reading);
         const tracker = sdk.create(thesis.id, {
-          purpose: previous.purpose,
-          kind: previous.kind,
-          config: { ...previous.config },
-          ...(previous.symbol ? { symbol: previous.symbol } : {}),
-          ...(previous.timeframe ? { timeframe: previous.timeframe } : {}),
-          ...(previous.evaluation.priority !== undefined
-            ? { priority: previous.evaluation.priority }
-            : {}),
-          ...(previous.evaluation.cooldownMs !== undefined
-            ? { cooldownMs: previous.evaluation.cooldownMs }
-            : {}),
+          purpose: intent.purpose,
+          kind: intent.kind,
+          config: { ...intent.config },
+          ...(intent.symbol ? { symbol: intent.symbol } : {}),
+          ...(intent.timeframe ? { timeframe: intent.timeframe } : {}),
+          ...(intent.priority !== undefined ? { priority: intent.priority } : {}),
+          ...(intent.cooldownMs !== undefined ? { cooldownMs: intent.cooldownMs } : {}),
         });
         restored.push(tracker.id);
         alreadyRestored.add(intentKey(tracker));
+        if (intent.recalibrated) {
+          this.lastRestoreRefusals.push(
+            `${previous.purpose || previous.kind}: re-asked as "${intent.purpose}" because the original level is behind the market as this GOAT last read it.`,
+          );
+        }
       } catch (error) {
         // One unrestorable tracker is reported rather than allowed to stop
         // the rest of the plan coming back.
@@ -519,6 +740,87 @@ export class GoatLoop {
     }
 
     return restored;
+  }
+
+  /**
+   * Whether a restored tracker is still asking a meaningful question.
+   *
+   * A tracker that watched "price above 1.1700" is stale the moment the market is at
+   * 1.1900: it can never fire, and worse, it looks armed. Recalibration here is the
+   * narrowest possible version of the idea — it re-asks the *same* question at the
+   * price the market is actually at, and it changes nothing else.
+   *
+   * The limits are deliberate, and each one exists because the alternative is worse
+   * than not recalibrating:
+   *
+   *   * only for a level-carrying tracker, because a question without a level has
+   *     no price in it that could have gone stale
+   *   * only from a reading this GOAT made, never a fresh one
+   *   * only in the direction that restores the question's intent — a "reached"
+   *     threshold above the market is still reachable, and re-asking it below would
+   *     be answering a different question
+   *   * never invented: if the level cannot be derived from the recorded price, the
+   *     original tracker is restored untouched
+   *
+   * No volatility estimate, no ATR, no ratio: the recalibrated level is the recorded
+   * price, because that is a number the system actually has rather than one it would
+   * have to assume.
+   */
+  private recalibrate(
+    previous: {
+      purpose: string;
+      kind: TrackerKind;
+      config: unknown;
+      symbol?: string;
+      timeframe?: string;
+      evaluation: { priority?: number; cooldownMs?: number };
+    },
+    reading: MarketReading | undefined,
+  ): {
+    purpose: string;
+    kind: TrackerKind;
+    config: Record<string, unknown>;
+    symbol?: string;
+    timeframe?: string;
+    priority?: number;
+    cooldownMs?: number;
+    recalibrated: boolean;
+  } {
+    const original = {
+      purpose: previous.purpose,
+      kind: previous.kind,
+      config: { ...(previous.config as Record<string, unknown>) },
+      ...(previous.symbol ? { symbol: previous.symbol } : {}),
+      ...(previous.timeframe ? { timeframe: previous.timeframe } : {}),
+      ...(previous.evaluation.priority !== undefined ? { priority: previous.evaluation.priority } : {}),
+      ...(previous.evaluation.cooldownMs !== undefined ? { cooldownMs: previous.evaluation.cooldownMs } : {}),
+      recalibrated: false,
+    };
+
+    if (!reading || !Number.isFinite(reading.price) || reading.price <= 0) return original;
+    const level = original.config['level'];
+    if (typeof level !== 'number' || !Number.isFinite(level) || level <= 0) return original;
+
+    const above = original.config['operator'] === 'ABOVE' || original.config['direction'] === 'ABOVE';
+    const below = original.config['operator'] === 'BELOW' || original.config['direction'] === 'BELOW';
+    if (!above && !below) return original;
+
+    /*
+     * Stale means unreachable, not merely distant: a "reached 1.1700 from below"
+     * condition that the market is already far above has been answered, and asking
+     * it again would be re-asking a settled question. A threshold the market has not
+     * reached is untouched however far away it is, because the GOAT may have wanted
+     * exactly that patience.
+     */
+    const stale = above ? reading.price >= level : reading.price <= level;
+    if (!stale) return original;
+
+    return {
+      ...original,
+      config: { ...original.config, level: reading.price },
+      purpose: `${original.purpose} (re-asked at the last price this GOAT read)`,
+      recalibrated: true,
+    };
   }
 
   /**
@@ -583,9 +885,21 @@ export class GoatLoop {
    * Re-evaluate a thesis after a wake, and apply the agent's plan.
    *
    * The whole of the agent's response to a tracker event happens here:
-   * interpret the event, record evidence, revise the thesis, and adjust
-   * what is being watched. The agent gets one pass, and the outcome is
-   * recorded whether or not it changed anything.
+   * interpret the event, record evidence with its provenance and weight, revise
+   * the thesis, and adjust what is being watched. The agent gets one pass, and the
+   * outcome is recorded whether or not it changed anything.
+   *
+   * A composite plan is the same pass, expressed as several decisions. It is
+   * applied in a defined order — evidence, then thesis, then trackers, then a trade
+   * idea — because the order is not cosmetic: a thesis revision that escalated the
+   * thesis to ACTIONABLE is what makes a proposal in the same plan legal, and a
+   * tracker created before a thesis was revised could arm itself against a thesis
+   * that does not exist yet.
+   *
+   * Each step is validated on its own and refused on its own. There is no rollback,
+   * and pretending otherwise would be worse than the partial application it would
+   * replace: `WakeOutcome.rejections` records exactly which steps were refused, and
+   * every step that did apply is independently safe on its own terms.
    */
   applyPlan(wake: WakeRequest, plan: AgentPlan): WakeOutcome {
     const outcome: WakeOutcome = {
@@ -604,126 +918,10 @@ export class GoatLoop {
     this.inflight.add(wake.event.id);
 
     try {
-      switch (plan.kind) {
-        case 'WAIT':
-          break;
-
-        case 'CONFIRM_THESIS': {
-          outcome.evidenceRecorded.push(this.recordWakeEvidence(wake, 'SUPPORTS').id);
-          outcome.thesis = this.reviseThesis(wake.thesisId, {
-            state: 'STRENGTHENING',
-            confidence: this.adjustedConfidence(wake.thesis, 0.1),
-          });
-          break;
-        }
-
-        case 'WEAKEN_THESIS': {
-          outcome.evidenceRecorded.push(this.recordWakeEvidence(wake, 'CONTRADICTS').id);
-          outcome.thesis = this.reviseThesis(wake.thesisId, {
-            state: 'WEAKENING',
-            confidence: this.adjustedConfidence(wake.thesis, -0.15),
-          });
-          break;
-        }
-
-        case 'INVALIDATE_THESIS': {
-          outcome.evidenceRecorded.push(this.recordWakeEvidence(wake, 'CONTRADICTS').id);
-          outcome.thesis = this.reviseThesis(wake.thesisId, { state: 'INVALIDATED' });
-          // A rejected thesis must stop costing wake budget.
-          for (const tracker of this.deps.trackers.cancelTrackersForThesis(
-            wake.thesisId,
-            'Thesis invalidated.',
-          )) {
-            outcome.trackerChanges.push({ action: 'cancelled', trackerId: tracker.id });
-          }
-          break;
-        }
-
-        case 'REVISE_THESIS': {
-          outcome.evidenceRecorded.push(this.recordWakeEvidence(wake, 'SUPPORTS').id);
-          outcome.thesis = this.reviseThesis(wake.thesisId, {
-            statement: plan.statement,
-            invalidation: plan.invalidation,
-            confidence: plan.confidence,
-            state: 'ACTIVE',
-          });
-          break;
-        }
-
-        case 'ESCALATE_THESIS': {
-          /*
-           * Promotion, through the gate that already exists.
-           *
-           * `reviseThesis` refuses a thesis that does not meet its skills' bar, so
-           * escalation cannot be used to bypass evidence requirements — it can
-           * only express that the model believes the bar is met. A refusal is
-           * reported rather than thrown, because "your skills are not satisfied
-           * yet" is a legitimate answer to a wake, not a crash.
-           *
-           * The wake's own `thesisId` is authoritative and the plan's is ignored.
-           * The wake already says which thesis this reasoning is about; a model that
-           * named a different one would otherwise be able to escalate somebody
-           * else's thesis, which is the same ownership hazard `buildContext` refuses
-           * to even reach.
-           */
-          const thesis = this.deps.theses.get(wake.thesisId);
-          if (!thesis) {
-            outcome.rejections.push(`Thesis ${wake.thesisId} no longer exists.`);
-            break;
-          }
-          if (thesis.state === 'ACTIONABLE') {
-            // Already there. Saying so is better than a redundant write, and the
-            // next wake can price the trade.
-            outcome.thesis = thesis;
-            outcome.rejections.push('This thesis is already actionable.');
-            break;
-          }
-          outcome.evidenceRecorded.push(this.recordWakeEvidence(wake, 'SUPPORTS').id);
-          try {
-            outcome.thesis = this.reviseThesis(wake.thesisId, { state: 'ACTIONABLE' });
-          } catch (error) {
-            outcome.rejections.push(this.describeRejection(error));
-          }
-          break;
-        }
-
-        case 'CREATE_TRACKER': {
-          try {
-            const tracker = this.deps
-              .sdkFor(wake.agentId)
-              .create(plan.thesisId, plan.spec);
-            outcome.trackerChanges.push({ action: 'created', trackerId: tracker.id });
-            // A new tracker means a new question, so the thesis is
-            // investigating again.
-            if (this.deps.theses.get(plan.thesisId)?.state === 'ACTIONABLE') {
-              outcome.thesis = this.reviseThesis(plan.thesisId, { state: 'ACTIVE' });
-            }
-          } catch (error) {
-            outcome.rejections.push(this.describeRejection(error));
-          }
-          break;
-        }
-
-        case 'REMOVE_TRACKER': {
-          try {
-            const tracker = this.deps
-              .sdkFor(wake.agentId)
-              .remove(plan.trackerId, plan.reason);
-            outcome.trackerChanges.push({ action: 'cancelled', trackerId: tracker.id });
-          } catch (error) {
-            outcome.rejections.push(this.describeRejection(error));
-          }
-          break;
-        }
-
-        case 'PROPOSE_TRADE_IDEA': {
-          const ideaId = this.createTradeIdea(wake, plan, outcome);
-          if (ideaId) outcome.tradeIdeaId = ideaId;
-          break;
-        }
-
-        default:
-          outcome.rejections.push('Unrecognised plan.');
+      if (plan.kind === 'COMPOSITE') {
+        this.applyComposite(wake, plan, outcome);
+      } else {
+        this.applyStep(wake, plan, outcome);
       }
     } finally {
       // Bounded: an id is only remembered long enough to catch a
@@ -735,21 +933,522 @@ export class GoatLoop {
   }
 
   /**
+   * Validate a composite plan before any of it is applied.
+   *
+   * The whole plan is refused on a structural problem — nesting, a duplicated
+   * step, or too many steps — because a malformed composite is a malformed
+   * *transaction*, and applying half of one the runtime does not understand is how
+   * a system ends up with a thesis that was strengthened and evidence that was
+   * never recorded. A step that is individually invalid is a different case: that
+   * one is refused in place, by `applyStep`, and the rest of the plan proceeds.
+   */
+  private validateComposite(plan: Extract<AgentPlan, { kind: 'COMPOSITE' }>): string | undefined {
+    if (!Array.isArray(plan.steps) || plan.steps.length === 0) {
+      return 'A composite plan needs at least one step.';
+    }
+    if (plan.steps.length > MAX_COMPOSITE_STEPS) {
+      return `A composite plan may contain at most ${MAX_COMPOSITE_STEPS} steps; this one had ${plan.steps.length}.`;
+    }
+    const kinds = new Set<string>();
+    for (const step of plan.steps) {
+      if (!isRecord(step) || typeof step.kind !== 'string') {
+        return 'A composite step was not a recognisable decision.';
+      }
+      // Narrowed away by the type; checked anyway, because this is untrusted input.
+      if ((step as { kind: string }).kind === 'COMPOSITE') {
+        return 'A composite plan cannot contain another composite plan.';
+      }
+      if (kinds.has(step.kind)) {
+        return `A composite plan cannot contain two ${step.kind} steps; the second would silently undo the first.`;
+      }
+      kinds.add(step.kind);
+    }
+    return undefined;
+  }
+
+  /**
+   * Apply a composite plan, in the one order that is coherent.
+   *
+   * Evidence first, because everything after it is a conclusion drawn from that
+   * evidence. Thesis decisions next, because an escalation is what authorises a
+   * proposal in the same pass. Trackers after the thesis, so a watch is armed
+   * against the belief it exists to test. The trade idea last, because it is the
+   * only step that needs every preceding one to have landed.
+   */
+  private applyComposite(
+    wake: WakeRequest,
+    plan: Extract<AgentPlan, { kind: 'COMPOSITE' }>,
+    outcome: WakeOutcome,
+  ): void {
+    const problem = this.validateComposite(plan);
+    if (problem) {
+      outcome.rejections.push(`Composite plan refused: ${problem} Nothing in it was applied.`);
+      return;
+    }
+
+    const order: Record<AgentPlanStep['kind'], number> = {
+      CONFIRM_THESIS: 0,
+      WEAKEN_THESIS: 0,
+      INVALIDATE_THESIS: 0,
+      REVISE_THESIS: 1,
+      ESCALATE_THESIS: 1,
+      CREATE_TRACKER: 2,
+      REMOVE_TRACKER: 2,
+      PROPOSE_TRADE_IDEA: 3,
+      WAIT: 4,
+    };
+
+    const steps = [...plan.steps].sort(
+      (left, right) => (order[left.kind] ?? 9) - (order[right.kind] ?? 9),
+    );
+
+    for (const step of steps) {
+      /*
+       * A thesis that is no longer live stops the rest of the plan. Not a
+       * refusal — an observation that the plan's later steps were written against a
+       * thesis that no longer exists.
+       */
+      const current = this.deps.theses.get(wake.thesisId);
+      if (!current || isTerminalThesisState(current.state)) {
+        outcome.rejections.push(
+          `The remaining steps were not applied: thesis ${wake.thesisId} is no longer live.`,
+        );
+        return;
+      }
+      this.applyStep(wake, step, outcome);
+    }
+  }
+
+  /**
+   * Apply one decision.
+   *
+   * Everything the composite path needs is here, and everything here is
+   * individually safe: an invalid action is refused and recorded, and no refusal
+   * leaves the thesis, the evidence or the trackers in a state that a later step
+   * would read as permission it was not given.
+   */
+  private applyStep(wake: WakeRequest, plan: AgentPlanStep, outcome: WakeOutcome): void {
+    /*
+     * A terminal thesis refuses everything, at the door.
+     *
+     * Not a nicety: `reviseThesis` throws on an illegal transition, and a wake that
+     * reached it with a closed thesis would take the whole pass with it. In practice
+     * the tracker runtime never delivers such a wake — invalidating a thesis cancels
+     * its watches, and a cancelled watch cannot produce an observation — so this is
+     * the second of two fail-closed checks rather than the first. Both are wanted:
+     * the first is what stops it happening, the second is what stops it mattering if
+     * something upstream changes.
+     */
+    const current = this.deps.theses.get(wake.thesisId);
+    if (!current) {
+      outcome.rejections.push(`Thesis ${wake.thesisId} no longer exists.`);
+      return;
+    }
+    if (isTerminalThesisState(current.state)) {
+      outcome.evidenceRecorded.push(this.recordWakeEvidence(wake, 'SUPPORTS', 0).id);
+      outcome.rejections.push(
+        `Thesis ${wake.thesisId} is ${current.state}, so this wake was recorded but nothing was decided.`,
+      );
+      return;
+    }
+
+    switch (plan.kind) {
+      case 'WAIT':
+        return;
+
+      case 'CONFIRM_THESIS': {
+        this.applyConfidenceWake(wake, 'SUPPORTS', 'STRENGTHENING', outcome);
+        return;
+      }
+
+      case 'WEAKEN_THESIS': {
+        this.applyConfidenceWake(wake, 'CONTRADICTS', 'WEAKENING', outcome);
+        return;
+      }
+
+      case 'INVALIDATE_THESIS': {
+        outcome.evidenceRecorded.push(this.recordWakeEvidence(wake, 'CONTRADICTS', 0).id);
+        outcome.thesis = this.reviseThesis(wake.thesisId, { state: 'INVALIDATED' });
+        // A rejected thesis must stop costing wake budget.
+        for (const tracker of this.deps.trackers.cancelTrackersForThesis(
+          wake.thesisId,
+          'Thesis invalidated.',
+        )) {
+          outcome.trackerChanges.push({ action: 'cancelled', trackerId: tracker.id });
+        }
+        /*
+         * A hypothesis tournament has exactly one survivor, and "this one was
+         * disproven" is the only moment the record supports saying so about the
+         * other. Never the other way round, and never silently: the counterpart is
+         * closed with a reason rather than left running against a question that no
+         * longer has two answers.
+         */
+        this.resolveCompetingThesis(wake.thesisId, outcome);
+        return;
+      }
+
+      case 'REVISE_THESIS': {
+        outcome.evidenceRecorded.push(this.recordWakeEvidence(wake, 'SUPPORTS', 0).id);
+        outcome.thesis = this.reviseThesis(wake.thesisId, {
+          statement: plan.statement,
+          invalidation: plan.invalidation,
+          /*
+           * The model's stated confidence is an *input* to belief, never the
+           * output. It is recorded, clamped, and bounded by how much it is allowed
+           * to move the number the runtime computed: a model that restates its
+           * thesis and declares 99% certainty cannot rewrite four minutes of
+           * evidence into certainty.
+           */
+          confidence: this.boundedStatedConfidence(
+            plan.confidence,
+            this.deps.theses.get(wake.thesisId) as Thesis,
+          ),
+          state: 'ACTIVE',
+        });
+        return;
+      }
+
+      case 'ESCALATE_THESIS': {
+        /*
+         * Promotion, through the gate that already exists.
+         *
+         * `reviseThesis` refuses a thesis that does not meet its skills' bar, so
+         * escalation cannot be used to bypass evidence requirements — it can
+         * only express that the model believes the bar is met. A refusal is
+         * reported rather than thrown, because "your skills are not satisfied
+         * yet" is a legitimate answer to a wake, not a crash.
+         *
+         * The wake's own `thesisId` is authoritative and the plan's is ignored.
+         * The wake already says which thesis this reasoning is about; a model that
+         * named a different one would otherwise be able to escalate somebody
+         * else's thesis, which is the same ownership hazard `buildContext` refuses
+         * to even reach.
+         */
+        const thesis = this.deps.theses.get(wake.thesisId);
+        if (!thesis) {
+          outcome.rejections.push(`Thesis ${wake.thesisId} no longer exists.`);
+          return;
+        }
+        if (thesis.state === 'ACTIONABLE') {
+          // Already there. Saying so is better than a redundant write, and the
+          // next wake can price the trade.
+          outcome.thesis = thesis;
+          outcome.rejections.push('This thesis is already actionable.');
+          return;
+        }
+        outcome.evidenceRecorded.push(this.recordWakeEvidence(wake, 'SUPPORTS', 0).id);
+        try {
+          outcome.thesis = this.reviseThesis(wake.thesisId, { state: 'ACTIONABLE' });
+        } catch (error) {
+          outcome.rejections.push(this.describeRejection(error));
+        }
+        return;
+      }
+
+      case 'CREATE_TRACKER': {
+        try {
+          const tracker = this.deps
+            .sdkFor(wake.agentId)
+            .create(plan.thesisId, plan.spec);
+          outcome.trackerChanges.push({ action: 'created', trackerId: tracker.id });
+          // A new tracker means a new question, so the thesis is
+          // investigating again.
+          if (this.deps.theses.get(plan.thesisId)?.state === 'ACTIONABLE') {
+            outcome.thesis = this.reviseThesis(plan.thesisId, { state: 'ACTIVE' });
+          }
+        } catch (error) {
+          outcome.rejections.push(this.describeRejection(error));
+        }
+        return;
+      }
+
+      case 'REMOVE_TRACKER': {
+        try {
+          const tracker = this.deps
+            .sdkFor(wake.agentId)
+            .remove(plan.trackerId, plan.reason);
+          outcome.trackerChanges.push({ action: 'cancelled', trackerId: tracker.id });
+        } catch (error) {
+          outcome.rejections.push(this.describeRejection(error));
+        }
+        return;
+      }
+
+      case 'PROPOSE_TRADE_IDEA': {
+        const ideaId = this.createTradeIdea(wake, plan, outcome);
+        if (ideaId) outcome.tradeIdeaId = ideaId;
+        return;
+      }
+
+      default:
+        outcome.rejections.push('Unrecognised plan.');
+    }
+  }
+
+  /**
+   * The confidence half of a wake: record the evidence, then move belief by an
+   * amount the runtime computed.
+   *
+   * Two decisions are taken here and neither is the model's to make:
+   *
+   *   *how far* belief moves — from severity, resolution, novelty, independence
+   *   and the model's own (discount-only) stated confidence
+   *   *whether the state* moves at all — from the hysteresis floor, so a marginal
+   *   observation moves the number and leaves the state alone
+   *
+   * A repeated observation is still recorded — the market did something, and the
+   * record of it is the point of evidence — but it moves nothing, because a
+   * condition being true for the fourth time is not four confirmations.
+   */
+  private applyConfidenceWake(
+    wake: WakeRequest,
+    polarity: 'SUPPORTS' | 'CONTRADICTS',
+    target: 'STRENGTHENING' | 'WEAKENING',
+    outcome: WakeOutcome,
+  ): void {
+    const thesis = this.deps.theses.get(wake.thesisId);
+    if (!thesis) {
+      outcome.rejections.push(`Thesis ${wake.thesisId} no longer exists.`);
+      return;
+    }
+
+    const prior = this.deps.evidence.listForThesis(wake.thesisId);
+    const weight = weighEvidence({
+      event: wake.event,
+      polarity,
+      ...(this.thesisTimeframe(thesis) ? { thesisTimeframe: this.thesisTimeframe(thesis) } : {}),
+      priorEvidence: prior,
+      ...(polarity === 'CONTRADICTS'
+        ? { strongestCounterWeight: strongestWeight(prior, 'SUPPORTS') }
+        : { strongestCounterWeight: strongestWeight(prior, 'CONTRADICTS') }),
+    });
+
+    const evidence = this.recordWakeEvidence(wake, polarity, weight.effect, weight);
+    outcome.evidenceRecorded.push(evidence.id);
+
+    const confidence = applyConfidence(thesis.confidence, weight.effect);
+    const verdict = hysteresisVerdict({
+      polarity,
+      effect: weight.effect,
+      repeated: weight.repeated,
+    });
+
+    if (!verdict.changesState) {
+      /*
+       * Belief moved, state did not. Written as a revision anyway, because a
+       * confidence that changed is a change to the thesis and hiding it would make
+       * the number drift without a visible history.
+       */
+      outcome.thesis = this.reviseThesis(wake.thesisId, { confidence });
+      if (verdict.reason) outcome.rejections.push(verdict.reason);
+      return;
+    }
+
+    outcome.thesis = this.reviseThesis(wake.thesisId, {
+      state: target,
+      confidence,
+    });
+  }
+
+  /**
+   * The deterministic risk layer's verdict, as something the GOAT can reason about.
+   *
+   * This is the seam between the two halves of the system. The risk engine decides;
+   * the loop cannot see an account, cannot re-price anything, and has no way to
+   * make a refusal disappear. What it does is turn the refusal into evidence and a
+   * bounded allowance to try again — so a GOAT that was refused for placing its
+   * stop inside the noise can re-propose with a wider one, and a GOAT that is being
+   * refused for the same reason three times is told its allowance is spent rather
+   * than being left to discover it.
+   *
+   * Idempotent by plan id: the same refusal delivered twice is one refusal.
+   */
+  recordRiskFeedback(input: {
+    planId: string;
+    thesisId: string;
+    approved: boolean;
+    reason: string;
+    metrics?: Record<string, number | string>;
+  }): { attempts: number; remaining: number; abandoned: boolean } | undefined {
+    const thesis = this.deps.theses.get(input.thesisId);
+    if (!thesis) return undefined;
+
+    if (input.approved) {
+      /*
+       * Approval ends the construction, and only now.
+       *
+       * The thesis used to be completed the moment an idea was written, which put
+       * the risk check after the end of the line: a refused plan left a thesis in a
+       * terminal state with no way to re-evaluate, so the GOAT's only remaining
+       * option was to form a brand-new hypothesis over the same market and try
+       * again. Completing on approval instead means the thesis stays live exactly
+       * as long as there is something left to do about the refusal.
+       */
+      if (thesis.state !== 'COMPLETED') {
+        this.reviseThesis(input.thesisId, { state: 'COMPLETED' });
+      }
+      return { attempts: thesis.riskAttempts ?? 0, remaining: 0, abandoned: false };
+    }
+
+    const attempts = (thesis.riskAttempts ?? 0) + 1;
+    const limit = this.riskRevisionCeiling(thesis.goalId);
+    const remaining = Math.max(0, limit - attempts);
+    const abandoned = attempts >= limit;
+
+    this.recordEvidence({
+      thesisId: input.thesisId,
+      polarity: 'CONTRADICTS',
+      summary: `The risk layer refused this trade construction: ${input.reason}`,
+      source: 'RISK_FEEDBACK',
+      confidence: undefined,
+      observed: {
+        planId: input.planId,
+        attempt: attempts,
+        limit,
+        ...(input.metrics ?? {}),
+      },
+      provenance: `risk:${input.planId}:${attempts}`,
+      /*
+       * A refusal is not evidence about the market, so it is weighted as nothing
+       * in particular: it must not drag a thesis's confidence toward zero just
+       * because the account was small. It belongs in the record and in the
+       * reasoning context, and it moves no number.
+       */
+      weight: 0,
+      novelty: 1,
+    });
+
+    /*
+     * Belief in the *thesis* is untouched; what is exhausted is the allowance to
+     * re-propose. Separating the two is what stops a sizing problem from being
+     * mistaken for a thesis being wrong — and it is why this is written straight to
+     * the record rather than through `reviseThesis`, whose fields are about belief.
+     */
+    const updated: Thesis = {
+      ...thesis,
+      riskAttempts: attempts,
+      revision: thesis.revision + 1,
+      updatedAt: this.now(),
+    };
+    this.deps.theses.save(updated);
+
+    return { attempts, remaining, abandoned };
+  }
+
+  /**
+   * Close the other half of a hypothesis tournament.
+   *
+   * Only ever called when one side is disproven, and only for the thesis it names
+   * as its counterpart — so a thesis cannot be closed by a decision about a
+   * question it is not part of.
+   */
+  private resolveCompetingThesis(thesisId: string, outcome: WakeOutcome): void {
+    const winner = this.deps.theses.get(thesisId);
+    const counterpartId = winner?.competesWith;
+    if (!counterpartId) return;
+
+    const counterpart = this.deps.theses.get(counterpartId);
+    if (!counterpart || counterpart.agentId !== winner?.agentId) return;
+    if (isTerminalThesisState(counterpart.state)) return;
+
+    try {
+      this.reviseThesis(counterpartId, { state: 'ABANDONED' });
+      for (const tracker of this.deps.trackers.cancelTrackersForThesis(
+        counterpartId,
+        'The competing hypothesis was disproven.',
+      )) {
+        outcome.trackerChanges.push({ action: 'cancelled', trackerId: tracker.id });
+      }
+      outcome.rejections.push(
+        `Its competing hypothesis (${counterpartId}) was closed: the question this goal asked now has one answer, not two.`,
+      );
+    } catch (error) {
+      outcome.rejections.push(this.describeRejection(error));
+    }
+  }
+
+  /**
+   * How much belief a stated confidence is allowed to add.
+   *
+   * Bounded by a fraction of the runtime's own number, so restating a thesis cannot
+   * rewrite its history. Absent means "the model did not say", which is not a claim
+   * of certainty and leaves the computed number alone.
+   */
+  private boundedStatedConfidence(stated: number | undefined, thesis: Thesis): number | undefined {
+    if (typeof stated !== 'number' || !Number.isFinite(stated)) return undefined;
+    const computed = clampConfidence(thesis.confidence ?? 0.5);
+    const requested = clampConfidence(stated);
+    const maxMove = 0.15;
+    const bounded = Math.max(
+      computed - maxMove,
+      Math.min(computed + maxMove, requested),
+    );
+    return clampConfidence(bounded);
+  }
+
+  /** How many re-proposals this goal is allowed after a risk refusal. */
+  private riskRevisionCeiling(goalId: string): number {
+    const goal = this.deps.goals.get(goalId);
+    if (!goal) return MAX_RISK_REVISIONS;
+    for (const constraint of this.deps.skills.resolveConstraints(goal.skillIds)) {
+      if (constraint.kind === 'MAX_RISK_REVISIONS') return constraint.maximum;
+    }
+    return MAX_RISK_REVISIONS;
+  }
+
+  /**
    * Turn a wake into evidence.
    *
    * The event itself is recorded verbatim. What the event means for
    * the thesis is the agent's judgement, and that judgement is the
    * `summary`, not the `reason` the runtime produced.
    */
-  private recordWakeEvidence(wake: WakeRequest, polarity: 'SUPPORTS' | 'CONTRADICTS'): Evidence {
+  private recordWakeEvidence(
+    wake: WakeRequest,
+    polarity: 'SUPPORTS' | 'CONTRADICTS',
+    effect = 0,
+    detail?: {
+      novelty?: number;
+      conflicting?: boolean;
+      conflictingWith?: Array<{ evidenceId: string; because: string }>;
+    },
+  ): Evidence {
+    const key = provenanceKey(wake.event);
+    const prior = this.deps.evidence.listForThesis(wake.thesisId);
+    const conflicts = detectConflicts({
+      incoming: {
+        polarity,
+        weight: Math.abs(effect),
+        ...(wake.event.trackerId ? { sourceTrackerId: wake.event.trackerId } : {}),
+        ...(wake.event.timeframe ? { timeframe: wake.event.timeframe } : {}),
+      },
+      prior,
+    });
+
     return this.recordEvidence({
       thesisId: wake.thesisId,
       polarity,
       summary: `Tracker event: ${wake.event.reason}`,
       source: 'TRACKER_EVENT',
-      observed: wake.event.observedValues,
-      confidence: wake.event.confidence,
+      ...(wake.event.observedValues ? { observed: wake.event.observedValues } : {}),
+      ...(typeof wake.event.confidence === 'number'
+        ? { confidence: wake.event.confidence }
+        : {}),
       trackerEventId: wake.event.id,
+      provenance: key,
+      ...(wake.event.trackerId ? { sourceTrackerId: wake.event.trackerId } : {}),
+      ...(wake.event.timeframe ? { timeframe: wake.event.timeframe } : {}),
+      ...(wake.event.symbol ? { symbol: wake.event.symbol } : {}),
+      weight: effect,
+      novelty: detail?.novelty ?? 1,
+      ...(conflicts.length > 0
+        ? {
+            conflictsWith: conflicts.map((conflict) => ({
+              evidenceId: conflict.evidenceId,
+              because: conflict.because,
+            })),
+          }
+        : {}),
     });
   }
 
@@ -814,6 +1513,48 @@ export class GoatLoop {
     }
 
     /*
+     * One construction in flight per thesis.
+     *
+     * A thesis used to complete the moment an idea was written, which incidentally
+     * prevented a second idea from the same hypothesis — by making the hypothesis
+     * unusable rather than by refusing the proposal. Now that the thesis stays live
+     * until the risk layer approves, the refusal has to be explicit: while a plan is
+     * still waiting to be checked, another one from the same thesis would be a
+     * second answer to a question that has not been asked yet.
+     *
+     * A plan that has already been checked — approved or refused — does not block
+     * another, because that is the retry this whole path exists to allow, and it is
+     * bounded above.
+     */
+    const inFlight = this.deps.ideas
+      .listForThesis(thesis.id)
+      .find((idea) => idea.status === 'PROPOSED' || idea.status === 'RISK_CHECK');
+    if (inFlight) {
+      outcome.rejections.push(
+        `Trade plan ${inFlight.id} from this thesis is still waiting to be risk-checked, so no second construction was built.`,
+      );
+      return undefined;
+    }
+
+    /*
+     * The retry bound, checked before anything is written.
+     *
+     * A GOAT that has been refused by the risk layer N times has learned everything
+     * it is going to learn from being refused N times. Refusing here — with the
+     * count and the reason in the message — is what stops the alternative, which is
+     * a loop with no exit: propose, be refused, propose the same construction, be
+     * refused. The thesis stays live; what is exhausted is this route to a trade.
+     */
+    const attempts = thesis.riskAttempts ?? 0;
+    const limit = this.riskRevisionCeiling(thesis.goalId);
+    if (attempts >= limit) {
+      outcome.rejections.push(
+        `The risk layer has refused ${attempts} constructions from this thesis (limit ${limit}). No further trade idea will be built from it until new evidence changes the thesis itself.`,
+      );
+      return undefined;
+    }
+
+    /*
      * The market, checked against the deployment rather than trusted.
      *
      * Shape validation says the numbers are coherent; it says nothing about
@@ -869,7 +1610,17 @@ export class GoatLoop {
       updatedAt: now,
     });
 
-    this.reviseThesis(thesis.id, { state: 'COMPLETED' });
+    /*
+     * The thesis is *not* completed here.
+     *
+     * It used to be, one line before this evidence was recorded, and that single
+     * line put the end of the chain in front of the risk layer: `COMPLETED` is a
+     * terminal state, so a refused plan left a thesis that could not be revised,
+     * re-priced or re-evaluated, with no way to respond to the refusal except to
+     * invent a brand-new hypothesis over the same market. The thesis now completes
+     * when the risk layer approves the construction — `recordRiskFeedback` — so it
+     * stays live for exactly as long as there is something left to do.
+     */
     outcome.evidenceRecorded.push(
       this.recordEvidence({
         thesisId: thesis.id,
@@ -880,6 +1631,9 @@ export class GoatLoop {
           entry: plan.idea.entry,
           invalidationLevel: plan.idea.invalidationLevel,
         },
+        provenance: `plan:${id}`,
+        weight: 0,
+        novelty: 1,
       }).id,
     );
     outcome.thesis = this.deps.theses.get(thesis.id) as Thesis;
@@ -1127,4 +1881,22 @@ function validateIdeaShape(idea: TradeIdeaRequest): string | undefined {
     }
   }
   return undefined;
+}
+
+/** The largest single effect any recorded evidence carries. */
+function strongestWeight(
+  evidence: readonly Evidence[],
+  polarity: Evidence['polarity'],
+): number {
+  return evidence
+    .filter((item) => item.polarity === polarity)
+    .reduce((max, item) => Math.max(max, Math.abs(item.weight ?? 0)), 0);
+}
+
+function isTerminalThesisState(state: ThesisState): boolean {
+  return state === 'INVALIDATED' || state === 'ABANDONED' || state === 'COMPLETED';
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

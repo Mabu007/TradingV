@@ -1059,10 +1059,21 @@ test('wake behaviour: confirming a thesis strengthens it and records evidence', 
 test('wake behaviour: weakening a thesis lowers its confidence', async () => {
   const h = makeHarness();
   const thesis = seedThesis(h, { confidence: 0.6 });
+  /*
+   * A watch the GOAT itself marked NOTABLE, rather than a bare one.
+   *
+   * Severity is the runtime's, derived from tracker priority, and the hysteresis
+   * floor is set against the weakest severity the tables produce: a routine touch of
+   * a level now moves confidence without moving the state, and only an observation
+   * the GOAT itself rated above routine argues a thesis out of ACTIVE. That is the
+   * anti-flapping rule, and this test is about the transition, so it asks for an
+   * observation that is entitled to make one.
+   */
   const tracker = h.orchestrator.trackers.createTracker(thesis.id, h.agentId, {
     purpose: 'Watch for a failed reclaim',
     kind: 'PRICE_THRESHOLD',
     config: { level: 1.11, operator: 'BELOW' },
+    priority: 20,
   });
   h.orchestrator.trackers.ingestEvent(makeTrackerEvent(tracker, h.clock.now()));
   const wake = h.orchestrator.trackers.latestWakeRequest()!;
@@ -1198,7 +1209,25 @@ test('trade idea: an actionable thesis produces an idea with its invalidation', 
   assertEqual(idea.invalidationLevel, 1.0985, 'the idea carries the invalidation level');
   assert(idea.invalidation.length > 0, 'the idea restates the thesis invalidation');
   assertEqual(idea.takeProfits.length, 2, 'the idea carries its targets');
-  assertEqual(h.orchestrator.stores.theses.get(thesis.id)!.state, 'COMPLETED', 'a realised idea completes the thesis');
+  /*
+   * The thesis completes when the *risk layer* says so, not when the idea is written.
+   *
+   * It used to complete one line before the risk check was even asked, which put the
+   * end of the chain in front of the gate: `COMPLETED` is terminal, so a refused plan
+   * left a thesis that could not be revised or re-priced, and a GOAT's only remaining
+   * response to "the risk layer refused your stop distance" was to invent a brand-new
+   * hypothesis over the same market. Here the harness's account satisfies the plan, so
+   * the whole path runs and the thesis ends where it should — after the verdict.
+   */
+  assertEqual(
+    h.orchestrator.stores.theses.get(thesis.id)!.state,
+    'COMPLETED',
+    'the thesis completed because the risk layer approved the construction, not because an idea was written',
+  );
+  assert(
+    h.orchestrator.stores.ideas.get(outcome.tradeIdeaId!)!.riskCheck?.approved === true,
+    'and the approval that ended it is on the plan\'s own record',
+  );
 });
 
 test('trade idea: a skill that forbids an order type blocks the idea', async () => {

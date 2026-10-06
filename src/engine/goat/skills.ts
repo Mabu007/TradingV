@@ -131,7 +131,17 @@ export type SkillConstraint =
   | { kind: 'MAX_TRACKERS'; maximum: number }
   | { kind: 'MAX_THESES'; maximum: number }
   | { kind: 'FORBID_ORDER_TYPE'; orderType: 'MARKET' | 'LIMIT' | 'STOP' }
-  | { kind: 'REQUIRE_HIGHER_TIMEFRAME_CONFIRMATION' };
+  | { kind: 'REQUIRE_HIGHER_TIMEFRAME_CONFIRMATION' }
+  /**
+   * How many times a trade construction may be re-proposed after the risk layer
+   * refuses it.
+   *
+   * Exists because a strategy around a moving account may legitimately need to
+   * re-price several times, and a fixed global bound would be a claim about every
+   * strategy made by one of them. It bounds the *retry*, never the gate: no value of
+   * this lets a GOAT place anything the risk layer refused.
+   */
+  | { kind: 'MAX_RISK_REVISIONS'; maximum: number };
 
 export class SkillValidationError extends Error {
   constructor(message: string) {
@@ -260,6 +270,7 @@ export class GoatSkillRegistry {
           break;
         case 'MAX_TRACKERS':
         case 'MAX_THESES':
+        case 'MAX_RISK_REVISIONS':
           if (!Number.isInteger(constraint.maximum) || constraint.maximum < 1) {
             throw new SkillValidationError(
               `Skill "${skill.id}" constraint ${constraint.kind} needs a positive integer.`,
@@ -405,6 +416,7 @@ function constraintKey(constraint: SkillConstraint): string {
       return `${constraint.kind}`;
     case 'MAX_TRACKERS':
     case 'MAX_THESES':
+    case 'MAX_RISK_REVISIONS':
       return `${constraint.kind}`;
     case 'FORBID_ORDER_TYPE':
       return `${constraint.kind}:${constraint.orderType}`;
@@ -419,6 +431,11 @@ function tighter(a: SkillConstraint, b: SkillConstraint): SkillConstraint {
   }
   if (a.kind === 'MAX_THESES' && b.kind === 'MAX_THESES') {
     return { kind: 'MAX_THESES', maximum: Math.min(a.maximum, b.maximum) };
+  }
+  if (a.kind === 'MAX_RISK_REVISIONS' && b.kind === 'MAX_RISK_REVISIONS') {
+    // The tighter of two bounds wins, and so does the *smaller* of two: a skill that
+    // allows three retries does not license a second skill to allow five.
+    return { kind: 'MAX_RISK_REVISIONS', maximum: Math.min(a.maximum, b.maximum) };
   }
   if (
     a.kind === 'REQUIRE_EVIDENCE_BEFORE_ACTIONABLE' &&
@@ -439,6 +456,8 @@ export function describeConstraint(constraint: SkillConstraint): string {
       return `At most ${constraint.maximum} trackers may be active at once.`;
     case 'MAX_THESES':
       return `At most ${constraint.maximum} live theses per goal.`;
+    case 'MAX_RISK_REVISIONS':
+      return `A refused trade construction may be re-proposed at most ${constraint.maximum} times before the thesis gives up on it.`;
     case 'FORBID_ORDER_TYPE':
       return `${constraint.orderType} orders are not permitted.`;
     case 'REQUIRE_HIGHER_TIMEFRAME_CONFIRMATION':

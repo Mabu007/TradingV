@@ -30,7 +30,7 @@ import type { AgentTimelineEventType } from '../agents/timeline/types';
 import { styleForEvent, type AgentEventView } from './agentEvents';
 import { agentTimeframes } from '../agents/types';
 
-import { GoatLoop, InvestigationRequest, DeploymentContext } from './loop';
+import { GoatLoop, InvestigationRequest, DeploymentContext, MarketReading } from './loop';
 import { GOAT_CORE_SKILL, GOAT_CORE_SKILL_ID } from './coreSkill';
 import {
   GoatMission,
@@ -103,6 +103,7 @@ import {
 } from './definition';
 import {
   AgentPlan,
+  AgentPlanStep,
   Evidence,
   Goal,
   Thesis,
@@ -771,6 +772,14 @@ export class GoatOrchestrator {
       clock: deps.clock,
       env: this.deps.env,
       currentDeployment: (agentId) => this.deploymentContextFor(agentId),
+      /*
+       * A record of something already read, offered so a resumed observation
+       * plan can notice that one of its questions is no longer reachable. It is
+       * never a fetch: reading the market here would be an unscheduled read in a
+       * system that reads when it is woken, and in a backtest it would be a read of
+       * an instant the simulation had not reached.
+       */
+      lastMarketReading: (agentId) => this.marketReadings.get(agentId),
     });
 
     /*
@@ -2292,6 +2301,13 @@ export class GoatOrchestrator {
         trackers: plan,
         validUntil: this.now() + DEFAULT_INVESTIGATION_WINDOW_MS,
         attachToLive: options.redeploy === true && live.length > 0,
+        /*
+         * A competing hypothesis, where the model proposed one and this goal's
+         * skills permit a second. The loop refuses the pair if the ceiling does not
+         * allow it, and says so in the rejections below — so the attempt is visible
+         * rather than silently dropped.
+         */
+        ...(proposal.proposed.competesWith ? { competesWith: proposal.proposed.competesWith } : {}),
       });
 
       const rejections = [...outcome.rejections];
@@ -3088,6 +3104,37 @@ export class GoatOrchestrator {
    * different conclusions depending on what the agent is trying to learn from
    * them.
    */
+  /**
+   * The newest evidence, and what it is in tension with.
+   *
+   * Rendered as a small table rather than a paragraph because the distinction the
+   * reasoning engine actually needs is three-way and a sentence hides it: this
+   * observation *supports*, it *contradicts*, or it *repeats* something already
+   * recorded. A GOAT handed an undifferentiated evidence list cannot tell the third
+   * from the first, and that is exactly the confusion that let a level being
+   * touched four times look like four confirmations.
+   */
+  private renderEvidenceConflict(context: ReturnType<GoatLoop['buildContext']> & object): string[] {
+    const recent = context.evidence.slice(-6);
+    if (recent.length === 0) return [];
+    const lines = recent.map((item) => {
+      const verdict = item.polarity === 'SUPPORTS' ? 'SUPPORTS' : 'CONTRADICTS';
+      const novelty = (item.novelty ?? 1) === 0
+        ? 'repeats an earlier observation'
+        : (item.novelty ?? 1) < 0.6
+          ? 'mostly repeats an earlier observation'
+          : 'new information';
+      const weight = typeof item.weight === 'number' ? `, weight ${item.weight.toFixed(3)}` : '';
+      const from = item.timeframe ?? item.sourceTrackerId ?? item.source;
+      return `- ${verdict} thesis · ${from ?? 'unknown source'}${weight} · ${novelty}${
+        item.conflictsWith && item.conflictsWith.length > 0
+          ? `\n    IN TENSION WITH an earlier ${item.conflictsWith[0].evidenceId}: ${item.conflictsWith[0].because}`
+          : ''
+      }\n    ${item.summary}`;
+    });
+    return ['EVIDENCE, most recent last:', ...lines];
+  }
+
   private renderTimeframeContexts(contexts: TimeframeContext[]): string {
     return contexts
       .map(({ context, role, reason }) => {
@@ -3110,6 +3157,16 @@ export class GoatOrchestrator {
    * reported as an empty observation rather than as zeros: a GOAT told
    * "equity is 0" reasons about an account it does not have.
    */
+  /**
+   * The last market reading this GOAT made, per agent.
+   *
+   * Written whenever a pass reads a quote, and read only by the observation-plan
+   * restore. Kept as a record rather than re-read so the two halves of the system
+   * agree on what "the current price" means: one that was actually observed, at a
+   * time the GOAT was awake for.
+   */
+  private readonly marketReadings = new Map<string, MarketReading>();
+
   private async buildObservation(
     instance: AgentInstance,
     input: {
@@ -3173,6 +3230,18 @@ export class GoatOrchestrator {
       observation.market.quote = input.market.quote;
       observation.market.quotes = [input.market.quote];
       observation.timestamp = input.market.quote.timestamp;
+      const mid =
+        Number.isFinite(input.market.quote.bid) && Number.isFinite(input.market.quote.ask)
+          ? (input.market.quote.bid + input.market.quote.ask) / 2
+          : input.market.quote.bid;
+      if (Number.isFinite(mid) && mid > 0) {
+        this.marketReadings.set(instance.agent.id, {
+          symbol: input.market.quote.symbol,
+          price: mid,
+          ...(input.market.timeframe ? { timeframe: input.market.timeframe } : {}),
+          at: input.market.quote.timestamp,
+        });
+      }
     }
 
     // Spread and session come from the same deterministic read as the quote.
@@ -3564,6 +3633,13 @@ export class GoatOrchestrator {
   }): Promise<{ response: AgentModelResponse; elapsedMs: number }> {
     const { goal, deployment, instance, timeframe, reads, steering, instructions, round } = input;
     const market = reads[0].context;
+    /*
+     * Any live hypothesis for this goal, read once and used only to describe the
+     * tournament option. It is not modified here: `investigate` owns whether a
+     * second hypothesis may exist at all, and a prompt that could create one by
+     * mentioning it would be a prompt that bypasses the ceiling.
+     */
+    const live = this.stores.theses.listLiveForGoal(goal.id);
     const observation = await this.buildObservation(instance, {
       symbol: deployment.marketId,
       skillIds: goal.skillIds,
@@ -3645,6 +3721,18 @@ export class GoatOrchestrator {
           '  read it and ask you again. Do that instead of guessing.',
           '- If you genuinely cannot form a plan from what you have, say so in "thought" and',
           '  return no "thesis" key. That is an acceptable answer and is not a failure.',
+          ...(live[0]
+            ? [
+                '',
+                `A HYPOTHESIS IS ALREADY LIVE for this goal: "${live[0].statement}" (${live[0].state}).`,
+                'Two readings of one question are permitted only where this goal\'s skills allow a',
+                'second live thesis, and only when they genuinely disagree about direction. If this',
+                `market admits a real opposite case, return "competingWith": "${live[0].id}" alongside a`,
+                'thesis with the other direction. If the runtime refuses the pair, you will be told',
+                'why and you keep working the hypothesis you have. Never write a second bullish',
+                'reading of the same idea and call it competition.',
+              ]
+            : []),
         ].join('\n'),
         skillsInstructions: instructions,
         toolHistory: [],
@@ -4750,7 +4838,47 @@ export class GoatOrchestrator {
           entry: outcome.plan.kind === 'PROPOSE_TRADE_IDEA' ? outcome.plan.idea.entry : undefined,
         },
       });
-      await this.riskCheckTradePlan(outcome.tradeIdeaId);
+      const checked = await this.riskCheckTradePlan(outcome.tradeIdeaId);
+
+      /*
+       * A refusal, turned into something the GOAT can reason about.
+       *
+       * Until this existed the chain simply ended: the plan went to WAITING, a line
+       * was written to the activity feed, and the GOAT had no way to know. Its
+       * thesis had already been completed by the construction, so there was not
+       * even a live hypothesis left to revise — the only honest response available
+       * to a GOAT refused for a bad stop distance was to invent a new hypothesis
+       * over the same market and try again, which is exactly the behaviour the
+       * feedback exists to replace.
+       *
+       * The verdict is recorded and the allowance is bounded. The risk layer is
+       * still the one that decided; this hands the GOAT the decision and lets it
+       * respond, which is the whole of what "learning from a refusal" can mean
+       * without the GOAT becoming the risk layer.
+       */
+      if (checked) {
+        const approved = checked.riskCheck?.approved === true;
+        const feedback = this.loop.recordRiskFeedback({
+          planId: checked.id,
+          thesisId: checked.thesisId,
+          approved,
+          reason: checked.riskCheck?.reason ?? 'The risk layer did not approve this construction.',
+          ...(checked.riskCheck?.metrics ? { metrics: checked.riskCheck.metrics } : {}),
+        });
+        if (feedback?.abandoned) {
+          this.recordActivity({
+            goatId: context.agentId,
+            deploymentId: context.deployment.deploymentId,
+            agentId: wake.agentId,
+            type: 'DECISION_REFUSED',
+            data: {
+              kind: 'TRADE_CONSTRUCTION',
+              reason: `The risk layer refused ${feedback.attempts} constructions from this thesis. It will stop building trade ideas from it until new evidence changes the hypothesis.`,
+              thesisId: wake.thesisId,
+            },
+          });
+        }
+      }
     }
 
     /*
@@ -5142,6 +5270,25 @@ export class GoatOrchestrator {
               : 'nothing'
           }`,
           '',
+          'THE RUNTIME\'S READING OF ITS OWN CASE.',
+          'Counted from the evidence you have already been shown. It is not advice and',
+          'you cannot overrule it — it is the state of the record.',
+          `Sufficiency: ${context.sufficiency.sufficiency}`,
+          `  ${context.sufficiency.independentSupport} independent supporting observation(s) of ${context.sufficiency.supporting} recorded; ${context.sufficiency.contradicting} contradicting, heaviest worth ${context.sufficiency.strongestCounter.toFixed(3)}.`,
+          context.sufficiency.higherTimeframeSupport > 0
+            ? `  ${context.sufficiency.higherTimeframeSupport} supporting observation(s) came from a higher timeframe than the setup.`
+            : '  No supporting observation has come from a higher timeframe than the setup.',
+          context.sufficiency.saturated
+            ? '  Everything it has recorded so far is a repeat of an observation it has already counted.'
+            : '',
+          ...this.renderEvidenceConflict(context),
+          context.thesis.riskAttempts
+            ? `  The risk layer has refused ${context.thesis.riskAttempts} trade construction(s) from this thesis. The reasons are in the evidence below.`
+            : '',
+          context.thesis.competesWith
+            ? '  A competing hypothesis is live for this goal. Your evidence is your own: say what it says about THIS thesis.'
+            : '',
+          '',
           'MARKET CONTEXT — measured now, by deterministic tools.',
           'Each resolution is labelled with the job it is doing for you:',
           this.renderTimeframeContexts(reads),
@@ -5163,6 +5310,13 @@ export class GoatOrchestrator {
           '- ESCALATE_THESIS the evidence now meets your skills\' bar for trading',
           '- PROPOSE_TRADE_IDEA the thesis is already ACTIONABLE and you can price it',
           '- WAIT            not enough to act on',
+          '',
+          'Or, if one wake genuinely implies several decisions, return COMPOSITE with an',
+          `ordered "steps" array drawn from that same list — at most ${4} steps, no duplicates,`,
+          'never another COMPOSITE. A step the runtime refuses does not undo the steps',
+          'that already applied, and it will tell you which. Use it when the honest answer',
+          'is "record this AND drop that watch AND ask a better question", not to do more',
+          'than one wake is for.',
           '',
           'ESCALATE_THESIS and PROPOSE_TRADE_IDEA are two different steps, not two ways',
           'of saying the same thing. A thesis is only ACTIONABLE after an escalation,',
@@ -5849,6 +6003,16 @@ export interface InvestigationProposal {
   trackers: TrackerRequest[];
   /** Proposals the runtime cannot watch, and therefore discarded. */
   dropped: number;
+  /**
+   * The live thesis this one is the opposing reading of, when the model proposes
+   * one.
+   *
+   * Read from the response and passed to the loop, which decides whether it is
+   * admissible — the goal's thesis ceiling, the goal it belongs to, and whether the
+   * two readings actually disagree. The model asking for a second hypothesis is
+   * not the same as the system allowing one, and only the second is a gate.
+   */
+  competesWith?: string;
 }
 
 /**
@@ -5870,6 +6034,7 @@ export function parseInvestigation(
   response: AgentModelResponse,
 ): InvestigationProposal | undefined {
   const json = response.payload ?? extractJson(response.thought);
+  // `competingWith` is read from the canonical payload like every other field.
   if (!json) return undefined;
 
   const thesis = json['thesis'];
@@ -5934,6 +6099,9 @@ export function parseInvestigation(
         : {}),
     },
     trackers,
+    ...(typeof json.competingWith === 'string' && json.competingWith.length > 0
+      ? { competesWith: json.competingWith }
+      : {}),
   };
 }
 
@@ -5955,6 +6123,7 @@ export function isDeliberateWait(response: AgentModelResponse): boolean {
 /** Parse a goal interpretation out of a model response. */
 function parseInterpretation(response: AgentModelResponse): GoalInterpretation | undefined {
   const json = response.payload ?? extractJson(response.thought);
+  // `competingWith` is read from the canonical payload like every other field.
   if (!json) return undefined;
   const record = json as Record<string, unknown>;
   if (typeof record.actionable !== 'boolean') return undefined;
@@ -5977,6 +6146,7 @@ function parseInterpretation(response: AgentModelResponse): GoalInterpretation |
 /** Parse an agent plan out of a model response. */
 function parsePlan(response: AgentModelResponse): AgentPlan | undefined {
   const json = response.payload ?? extractJson(response.thought);
+  // `competingWith` is read from the canonical payload like every other field.
   if (!json) return undefined;
   const record = json as Record<string, unknown>;
   const kind = record.kind;
@@ -5986,6 +6156,31 @@ function parsePlan(response: AgentModelResponse): AgentPlan | undefined {
   switch (kind) {
     case 'WAIT':
       return { kind: 'WAIT', reason };
+
+    case 'COMPOSITE': {
+      /*
+       * A composite is parsed step by step, through the same parser as a single
+       * decision, and any step that does not parse takes the whole plan with it.
+       *
+       * Dropping the unreadable step instead would be the friendlier-looking
+       * choice and the dangerous one: the GOAT would believe it had done three
+       * things when it had done one, and the record of the plan would not match the
+       * record of the world. A composite the runtime cannot read completely is a
+       * composite it refuses.
+       */
+      const steps = record.steps;
+      if (!Array.isArray(steps) || steps.length === 0) return undefined;
+      const parsed: AgentPlanStep[] = [];
+      for (const candidate of steps) {
+        if (!isRecord(candidate)) return undefined;
+        const step = parsePlan({ ...response, payload: candidate } as AgentModelResponse);
+        if (!step || step.kind === 'COMPOSITE') return undefined;
+        parsed.push(step);
+      }
+      if (typeof record.thesisId !== 'string') return undefined;
+      return { kind: 'COMPOSITE', thesisId: record.thesisId, reason, steps: parsed };
+    }
+
     case 'CONFIRM_THESIS':
     case 'WEAKEN_THESIS':
     case 'INVALIDATE_THESIS':

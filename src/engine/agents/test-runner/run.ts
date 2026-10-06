@@ -6,6 +6,7 @@ import { runHistoricalValidationTests } from '../../backtester/historicalTests';
 import { runActivityPersistenceTests, runTimelineWriteCoalescingTests } from '../activityTests';
 import { runExecutionRiskTests } from '../../execution/tests';
 import { runGoatTests } from '../../goat/tests';
+import { runReasoningTests } from '../../goat/reasoningTests';
 import { runDefinitionTests } from '../../goat/definitionTests';
 
 await runAgentInfrastructureTests();
@@ -18,5 +19,6 @@ await runExecutionRiskTests();
 await runActivityPersistenceTests();
 await runTimelineWriteCoalescingTests();
 await runGoatTests();
+await runReasoningTests();
 await runDefinitionTests();
 console.log('Agent infrastructure, tracker and timeline tests passed.');

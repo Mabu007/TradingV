@@ -1279,9 +1279,22 @@ test('recovery: a wake the state machine refuses is recorded, not thrown into th
     'and no trade plan was fabricated out of the failure',
   );
 
-  const reported = activity.find(
-    (entry) => entry.type === 'GOAT_WAITING' && /could not be applied/i.test(entry.text),
-  );
+  /*
+   * The refusal has to reach the feed — but it is no longer a *thrown* one.
+   *
+   * The loop now refuses a wake aimed at a terminal thesis at the door, records the
+   * observation and returns, rather than letting `reviseThesis` throw and be caught
+   * upstream. Same guarantee for the reader, a better one for the system: the reason
+   * is specific ("it is INVALIDATED") instead of being an exception, and a thrown wake
+   * could have taken an unrelated step with it.
+   */
+  const reported =
+    activity.find(
+      (entry) => entry.type === 'DECISION_REFUSED' && /INVALIDATED/i.test(entry.text),
+    ) ??
+    activity.find(
+      (entry) => entry.type === 'GOAT_WAITING' && /could not be applied/i.test(entry.text),
+    );
   assert(
     reported !== undefined,
     `the refusal is reported in the activity feed: ${JSON.stringify(activity.map((entry) => entry.text))}`,
@@ -1299,16 +1312,24 @@ test('recovery: a plan the loop refuses leaves the thesis exactly as it was', as
   h.orchestrator.loop.reviseThesis(thesis.id, { state: 'INVALIDATED' });
   const before = h.orchestrator.stores.theses.get(thesis.id)!;
 
-  let refused = false;
-  try {
-    h.orchestrator.loop.applyPlan(fakeWake(thesis, eventFor({ id: 'trk_x', agentId: h.agentId, kind: 'PRICE_CROSS', eventType: 'CONDITION_MET', evaluation: {} }, 1)), {
+  /*
+   * Refused by being reported rather than by being thrown.
+   *
+   * A wake aimed at a terminal thesis used to reach `reviseThesis`, which threw —
+   * correct as a rule, wrong as a control flow, because a throw from the middle of a
+   * reasoning pass takes any step it had not yet completed with it. The loop now
+   * refuses at the door and says so; the guarantee this test exists for is unchanged,
+   * and the mechanism is one that cannot have collateral.
+   */
+  const outcome = h.orchestrator.loop.applyPlan(
+    fakeWake(thesis, eventFor({ id: 'trk_x', agentId: h.agentId, kind: 'PRICE_CROSS', eventType: 'CONDITION_MET', evaluation: {} }, 1)),
+    {
       kind: 'CONFIRM_THESIS',
       thesisId: thesis.id,
       reason: 'the model was optimistic',
-    });
-  } catch {
-    refused = true;
-  }
+    },
+  );
+  const refused = outcome.rejections.length > 0;
   assert(refused, 'the transition out of a terminal state is refused');
   assertEqual(
     h.orchestrator.stores.theses.get(thesis.id)!.state,

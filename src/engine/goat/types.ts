@@ -189,6 +189,30 @@ export interface Thesis {
    * which is what makes a thesis history readable as a sequence.
    */
   revision: number;
+  /**
+   * The thesis this one is a competing reading of, if any.
+   *
+   * A pair of opposing hypotheses about one question, not two agents. Both belong
+   * to the same goal, each keeps its own evidence and its own trackers, and the
+   * ceiling above still bounds how many may exist. Set only where a goal's skills
+   * allow more than one live thesis; the runtime refuses the link otherwise, which
+   * is the difference between a hypothesis tournament and an unbounded branching
+   * agent.
+   *
+   * There is no automatic winner. Evidence that invalidates one ends the pair by
+   * abandoning the other, because that is the only moment the record actually
+   * supports a conclusion.
+   */
+  competesWith?: string;
+  /**
+   * How many trade constructions the risk layer has refused for this thesis.
+   *
+   * Bounded, and read by the loop before it will accept another proposal. It
+   * exists because the alternative is a loop the GOAT cannot leave: propose,
+   * be refused, propose the same thing again, be refused, until something else
+   * happens to interrupt it. See `MAX_RISK_REVISIONS` in `loop.ts`.
+   */
+  riskAttempts?: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -283,6 +307,37 @@ export interface Evidence {
   confidence?: number;
   /** Identifier of the tracker event that produced it, when applicable. */
   trackerEventId?: string;
+  /**
+   * Identity of the *observation*, as distinct from the event that reported it.
+   *
+   * Two wakes can report one market observation; without this, belief is moved
+   * twice for one thing that happened. See `provenanceKey`.
+   */
+  provenance?: string;
+  /** The tracker that produced it, when a tracker did. */
+  sourceTrackerId?: string;
+  /** The resolution the observation was made at. */
+  timeframe?: string;
+  /** The market the observation was made on. */
+  symbol?: string;
+  /**
+   * How much of an effect this evidence was worth, and what remains of it.
+   *
+   * `weight` is the signed effect the runtime computed; `novelty` is the fraction
+   * that survived repetition. Both are recorded because a reader looking at why a
+   * thesis reached a confidence needs the arithmetic, not just the number it
+   * produced.
+   */
+  weight?: number;
+  novelty?: number;
+  /**
+   * What this evidence is in tension with, when it is.
+   *
+   * Contradiction is not the same as disagreement with the thesis: evidence can
+   * support the thesis and still conflict with an earlier supporting claim. The
+   * model is shown both facts separately for that reason.
+   */
+  conflictsWith?: Array<{ evidenceId: string; because: string }>;
   createdAt: number;
 }
 
@@ -290,7 +345,16 @@ export type EvidenceSource =
   | 'TRACKER_EVENT'
   | 'SKILL'
   | 'AGENT_INVESTIGATION'
-  | 'MARKET_DATA';
+  | 'MARKET_DATA'
+  /**
+   * The deterministic risk layer's verdict on a trade construction.
+   *
+   * Not evidence about the market — the market was never consulted — and recorded
+   * as such, because a GOAT that has been refused twice for the same reason and
+   * proposes it a third time is not reasoning badly, it is reasoning without
+   * having been told.
+   */
+  | 'RISK_FEEDBACK';
 
 /**
  * A structured trade proposal.
@@ -421,7 +485,38 @@ export type AgentPlan =
    */
   | { kind: 'ESCALATE_THESIS'; thesisId: string; reason: string }
   | { kind: 'PROPOSE_TRADE_IDEA'; thesisId: string; idea: TradeIdeaRequest; reason: string }
-  | { kind: 'WAIT'; reason: string };
+  | { kind: 'WAIT'; reason: string }
+  /*
+   * Several decisions, taken together, from one wake.
+   *
+   * A wake that means "record this, weaken that, and stop watching the stale
+   * condition" previously cost three wakes, and two of them were wakes the GOAT
+   * could not ask for — it had to wait for the market to oblige. That is not
+   * precision, it is latency charged against the GOAT's own reasoning.
+   *
+   * What this is *not*: a program. The steps are drawn from the same finite
+   * vocabulary as a single decision, they may not nest, at most one step of each
+   * kind may appear, and the length is capped by the loop before anything is
+   * applied. Every step still passes through the same validation it would have
+   * passed on its own — the composite changes the transaction, never the
+   * authority.
+   */
+  | {
+      kind: 'COMPOSITE';
+      thesisId: string;
+      reason: string;
+      /** Ordered, non-nested, and deduplicated by kind by the loop. */
+      steps: AgentPlanStep[];
+    };
+
+/**
+ * One step of a composite plan.
+ *
+ * The same vocabulary as a single decision, minus the composite itself, so a
+ * composite cannot contain a composite and cannot grow a new vocabulary by
+ * accident.
+ */
+export type AgentPlanStep = Exclude<AgentPlan, { kind: 'COMPOSITE' }>;
 
 export interface TradeIdeaRequest {
   symbol: string;
