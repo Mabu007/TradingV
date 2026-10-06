@@ -475,6 +475,9 @@ export async function runTrackerTimelineTests(): Promise<void> {
   const toolRuntime = new AgentRuntime(toolCaps, toolSkillRegistry, new ActionValidator(), toolModel, toolTimeline);
   const toolAgent = { ...eurAgent, id: 'tool-agent', skills: ['quote-skill'], capabilities: ['test.quote'] };
   toolRuntime.registerAgent(toolAgent, env);
+  // Started: a capability runs only for an agent that is running, so the
+  // instrumentation being asserted here is an instrumentation of a live agent.
+  await toolRuntime.start(toolAgent.id);
   await toolRuntime.step(toolAgent.id);
   const toolEvents = await toolTimeline.getByAgent(toolAgent.id);
   assert(toolEvents.some((event) => event.type === 'CAPABILITY_CALL') && toolEvents.some((event) => event.type === 'CAPABILITY_RESULT'), 'capability request/result timeline events recorded');

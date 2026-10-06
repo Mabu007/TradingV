@@ -346,6 +346,102 @@ export class SimulationEnvironment implements ITradingEnvironment {
     return this.visibleCount;
   }
 
+  /** One base bar, in epoch milliseconds. */
+  get baseStepMs(): number {
+    return this.baseSeconds * 1000;
+  }
+
+  /**
+   * The instant the next unseen bar closes, or undefined when there are none.
+   *
+   * The replay loop advances to this rather than by a duration of its own. It is
+   * how "no intermediate bar is skipped" is enforced structurally instead of by
+   * arithmetic: the clock is only ever moved to a boundary the dataset actually
+   * has, so a speed that would have jumped three minutes in one frame moves three
+   * minutes as three boundaries, each of them processed in turn.
+   */
+  nextBarClose(): number | undefined {
+    this.catchUpTo(this.clock.now());
+    const bar = this.bars[this.visibleCount];
+    return bar ? (bar.time + this.baseSeconds) * 1000 : undefined;
+  }
+
+  /**
+   * The account as it stands, synchronously.
+   *
+   * `getAccountState` is the async contract every capability reads, and its
+   * implementation was already synchronous — but a trade decision needs the
+   * account *while* it is being sized, on a path that cannot await without
+   * becoming async all the way up through the engine. Two names for one reading,
+   * with the async one delegating, so there is one calculation.
+   */
+  accountSnapshot(): {
+    balance: number;
+    equity: number;
+    margin: number;
+    freeMargin: number;
+    dailyPnL: number;
+    drawdownPercent: number;
+    openPositions: number;
+    maxEquity: number;
+  } {
+    const unrealized = this.unrealized();
+    const equity = this.balance + unrealized;
+    const margin = [...this.positions.values()].reduce(
+      (sum, position) => sum + (Math.abs(position.volume) * position.currentPrice) / this.leverage,
+      0,
+    );
+    return {
+      balance: this.round2(this.balance),
+      equity: this.round2(equity),
+      margin: this.round2(margin),
+      freeMargin: this.round2(Math.max(0, equity - margin)),
+      dailyPnL: this.round2(equity - this.initialBalance),
+      drawdownPercent: this.round2(
+        this.maxEquitySeen > 0 ? ((this.maxEquitySeen - equity) / this.maxEquitySeen) * 100 : 0,
+      ),
+      openPositions: this.positions.size,
+      maxEquity: this.round2(this.maxEquitySeen),
+    };
+  }
+
+  /** Every resting or settled order this replay has known about, oldest first. */
+  orderHistory(): SimulatedOrder[] {
+    return [...this.orders];
+  }
+
+  /**
+   * How close the market came to an order's price while it was resting.
+   *
+   * Scans the bars that existed during the order's life and reports the
+   * smallest price distance the market ever came to it. This is the difference
+   * between "the order expired" and "the order missed by 0.01", which are very
+   * different things to read about a GOAT's patience — and the difference
+   * between a replay that only celebrates fills and one that can show what the
+   * setup nearly was.
+   *
+   * A filled order has no near miss: it got its price.
+   */
+  nearestApproach(order: SimulatedOrder): { distance: number; at: number; price: number } | undefined {
+    if (order.status !== 'PENDING' && order.status !== 'EXPIRED' && order.status !== 'CANCELLED') return undefined;
+    if (order.filledAt !== undefined) return undefined;
+    const from = order.placedAt;
+    const to = order.expiresAt ?? (this.bars.length > 0 ? this.bars[this.bars.length - 1].time + this.baseSeconds : from);
+    let best: { distance: number; at: number; price: number } | undefined;
+
+    for (const bar of this.bars) {
+      if (bar.time < from || bar.time > to) continue;
+      // The touch that matters is the one on the order's own side of the market.
+      const touch = order.side === 'BUY' ? bar.low : bar.high;
+      const distance = Math.abs(order.entryPrice - touch);
+      if (!best || distance < best.distance) {
+        best = { distance: this.round(Math.min(distance, Math.abs(order.entryPrice - bar.close))), at: bar.time * 1000, price: touch };
+      }
+    }
+
+    return best;
+  }
+
   /** The whole dataset, for the simulator's own use. Never handed to the agent. */
   dataset(): Bar[] {
     return [...this.bars];
@@ -503,21 +599,28 @@ export class SimulationEnvironment implements ITradingEnvironment {
   // Account
   // -------------------------------------------------------------------------
 
+  /**
+   * The simulation clock, as the environment's own answer to "now".
+   *
+   * Optional on the environment contract, and implemented here because the
+   * backtest genuinely knows the answer: without it, a caller that only wanted a
+   * timestamp had to fetch a whole market quote to get one, several times a
+   * cycle.
+   */
+  now(): number {
+    return this.clock.now();
+  }
+
   async getAccountState() {
-    const unrealized = this.unrealized();
-    const equity = this.balance + unrealized;
-    const margin = [...this.positions.values()].reduce(
-      (sum, position) => sum + (Math.abs(position.volume) * position.currentPrice) / this.leverage,
-      0,
-    );
-    const drawdown = this.maxEquitySeen > 0 ? ((this.maxEquitySeen - equity) / this.maxEquitySeen) * 100 : 0;
+    const account = this.accountSnapshot();
     return {
-      balance: this.round2(this.balance),
-      equity: this.round2(equity),
-      margin: this.round2(margin),
-      freeMargin: this.round2(Math.max(0, equity - margin)),
-      dailyPnL: this.round2(equity - this.initialBalance),
-      drawdownPercent: this.round2(drawdown),
+      balance: account.balance,
+      equity: account.equity,
+      margin: account.margin,
+      freeMargin: account.freeMargin,
+      dailyPnL: account.dailyPnL,
+      drawdownPercent: account.drawdownPercent,
+      realisedSessionPnL: this.balance - this.initialBalance,
     };
   }
 

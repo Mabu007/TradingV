@@ -16,9 +16,13 @@
  * manager survives a detached view, is handed back intact when a view returns,
  * and releases its timer only when someone actually asks.
  *
- * The clock's timer is injected here, the same seam the audit's reproduction
- * used, so "did the timer survive?" is answered by counting armed handles rather
- * than by waiting on wall-clock time.
+ * The clock's timer is still injected here, the same seam the audit's
+ * reproduction used. It is no longer how the replay is driven — the loop paces
+ * itself, because an interval that fires every 250ms cannot wait for a GOAT that
+ * is still deciding — so what these tests count is no longer armed handles. What
+ * they assert instead is the property those handles were standing in for: a
+ * running replay advances by itself, a view detaching changes nothing about that,
+ * and execution stops when someone asks and only then.
  */
 
 import type { IAgentModel } from '../../agents/model/types';
@@ -141,9 +145,30 @@ function makeSession(timers: CountingScheduler, market = 'USD/JPY'): BacktestSes
   });
 }
 
-/** Advance the replay by hand: one call is one step of the platform timer. */
-function step(timers: CountingScheduler, times = 8): void {
-  for (let index = 0; index < times; index += 1) timers.fire();
+/**
+ * Whether a replay is driving its own market.
+ *
+   * The replacement for "an interval is armed". A session paces itself now, so
+   * the question is not whether a handle exists but whether the simulated instant
+   * moves without anything outside the session asking it to.
+ */
+function isDriving(session: BacktestSession): boolean {
+  return session.snapshot().state === 'RUNNING';
+}
+
+/** Let the loop run until `condition` holds, or give up and return false. */
+async function waitFor(condition: () => boolean, budgetMs = 3_000): Promise<boolean> {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    if (condition()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return condition();
+}
+
+/** Wait until the replay has actually moved through historical time. */
+async function advanced(session: BacktestSession, from: number): Promise<boolean> {
+  return waitFor(() => session.simulatedClock.now() > from);
 }
 
 async function startHarness(market?: string): Promise<Harness> {
@@ -161,19 +186,18 @@ async function startHarness(market?: string): Promise<Harness> {
 test('ownership: a started replay is registered and survives the view detaching', async () => {
   const manager = createBacktestManager();
   const key = 'goat-alpha';
-  const { session, timers } = await startHarness();
+  const { session } = await startHarness();
 
   manager.register(key, session);
-  assert(timers.armed === 1, 'the replay armed exactly one timer');
+  assert(isDriving(session), 'the replay is running on its own, with no view attached');
 
   // The surface unmounts here. It releases its listeners and nothing else.
   assert(manager.get(key) === session, 'the session is still reachable after the view detaches');
-  assert(timers.armed === 1, 'the clock is still armed, because nobody asked it to stop');
+  assert(isDriving(session), 'the replay is still driving itself, because nobody asked it to stop');
   assertEqual(session.snapshot().state, 'RUNNING', 'the replay is still running');
 
   const before = session.simulatedClock.now();
-  step(timers);
-  assert(session.simulatedClock.now() > before, 'simulated time kept moving after detaching');
+  assert(await advanced(session, before), 'simulated time kept moving after detaching, with nothing firing it');
   assert(session.snapshot().simulatedMinutes > 0, 'and the snapshot reports the progress it made');
   assert(session.snapshot().trades !== undefined, 'the session kept its trade book');
 
@@ -183,9 +207,9 @@ test('ownership: a started replay is registered and survives the view detaching'
 test('ownership: a replay in progress is not disturbed by the view unmounting', async () => {
   const manager = createBacktestManager();
   const key = 'goat-alpha';
-  const { session, timers } = await startHarness();
+  const { session } = await startHarness();
   manager.register(key, session);
-  step(timers);
+  await advanced(session, session.simulatedClock.now());
   const detachedSnapshot = session.snapshot();
 
   // Re-attaching is what navigation does, and it must observe, never disturb.
@@ -209,23 +233,29 @@ test('ownership: a replay in progress is not disturbed by the view unmounting', 
 test('orphan: a detached replay is still reachable, and releasing it stops the timer', async () => {
   const manager = createBacktestManager();
   const key = 'goat-orphan';
-  const { session, timers } = await startHarness();
+  const { session } = await startHarness();
   manager.register(key, session);
 
-  assert(timers.armed === 1, 'one timer armed while running');
+  assert(isDriving(session), 'the replay is driving itself while running');
 
   /*
    * The original defect in the shape the audit reproduced it: after the view is
-   * gone the interval is still registered, and the session is still RUNNING. The
+   * gone the replay is still going, and the session is still RUNNING. The
    * difference from before is that the manager can now name it.
    */
-  assert(manager.get(key) === session, 'the still-ticking session is reachable by key');
+  assert(manager.get(key) === session, 'the still-running session is reachable by key');
   assertEqual(session.snapshot().state, 'RUNNING', 'and still reported as running');
 
-  await manager.dispose(key, 'Disposed by the test.');
+  const before = session.simulatedClock.now();
+  assert(await advanced(session, before), 'and genuinely still advancing with no view attached');
 
-  assertEqual(timers.armed, 0, 'disposing released the clock timer');
+  await manager.dispose(key, 'Disposed by the test.');
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
   assertEqual(session.snapshot().state, 'STOPPED', 'the session ended, rather than being orphaned');
+  const afterDispose = session.simulatedClock.now();
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assertEqual(session.simulatedClock.now(), afterDispose, 'disposing stopped the market moving');
   assertEqual(manager.get(key), undefined, 'the manager no longer exposes it');
 });
 
@@ -236,12 +266,13 @@ test('orphan: a detached replay is still reachable, and releasing it stops the t
 test('stop: an explicit stop halts execution but keeps the report readable', async () => {
   const manager = createBacktestManager();
   const key = 'goat-stopped';
-  const { session, timers } = await startHarness();
+  const { session } = await startHarness();
   manager.register(key, session);
 
   await manager.stop(key, 'Stopped from the surface.');
+  await new Promise((resolve) => setTimeout(resolve, 60));
 
-  assertEqual(timers.armed, 0, 'stopping released the timer');
+  assert(!isDriving(session), 'stopping stopped the replay driving itself');
   assertEqual(session.snapshot().state, 'STOPPED', 'the replay stopped');
   assert(session.snapshot().report !== undefined, 'a stopped replay still has a report to read');
   assertEqual(manager.get(key), session, 'and it is still filed under its GOAT');
@@ -252,13 +283,14 @@ test('stop: an explicit stop halts execution but keeps the report readable', asy
 test('stop: disposing a stopped replay does not stop it twice', async () => {
   const manager = createBacktestManager();
   const key = 'goat-stopped';
-  const { session, timers } = await startHarness();
+  const { session } = await startHarness();
   manager.register(key, session);
 
   await manager.stop(key);
   await manager.dispose(key);
+  await new Promise((resolve) => setTimeout(resolve, 60));
 
-  assertEqual(timers.armed, 0, 'still exactly zero timers, no double release');
+  assert(!isDriving(session), 'still stopped, with no second teardown to corrupt it');
   assertEqual(session.snapshot().state, 'STOPPED', 'and still stopped, not corrupted');
 });
 
@@ -277,34 +309,37 @@ test('isolation: two GOATs run independently and stopping one leaves the other r
   assert(manager.get('goat-a') !== manager.get('goat-b'), 'each GOAT has its own session');
   assert(manager.keys().length === 2, 'both are filed');
 
-  step(alpha.timers);
+  await advanced(alpha.session, alpha.session.simulatedClock.now());
+  const alphaAtStop = alpha.session.simulatedClock.now();
   const betaBefore = beta.session.simulatedClock.now();
 
   await manager.stop('goat-a');
+  await new Promise((resolve) => setTimeout(resolve, 60));
 
-  assertEqual(alpha.timers.armed, 0, "stopping A released A's timer");
-  assertEqual(alpha.session.snapshot().state, 'STOPPED', "A stopped");
-  assertEqual(beta.timers.armed, 1, "B's timer is untouched");
+  assert(!isDriving(alpha.session), "stopping A stopped A driving itself");
+  assertEqual(alpha.session.snapshot().state, 'STOPPED', 'A stopped');
+  assertEqual(alpha.session.simulatedClock.now(), alphaAtStop, "and A's market stopped with it");
+  assert(isDriving(beta.session), "B's replay is untouched");
   assertEqual(beta.session.snapshot().state, 'RUNNING', 'B is still running');
-  assertEqual(beta.session.simulatedClock.now(), betaBefore, "B's progress did not move when A stopped");
 
-  step(beta.timers);
-  assert(beta.session.simulatedClock.now() > betaBefore, 'B advances on its own timer');
+  assert(await advanced(beta.session, betaBefore), 'B keeps advancing on its own loop');
 
   await manager.dispose('goat-b');
-  assertEqual(alpha.timers.armed + beta.timers.armed, 0, 'both timers released');
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert(!isDriving(alpha.session) && !isDriving(beta.session), 'both replays released');
 });
 
 test('isolation: replacing a replay for one GOAT stops the incumbent timer', async () => {
   const manager = createBacktestManager();
   const first = await startHarness('USD/JPY');
   manager.register('goat-a', first.session);
-  assertEqual(first.timers.armed, 1, 'the first replay is armed');
+  assert(isDriving(first.session), 'the first replay is running');
 
   const second = await startHarness('USD/JPY');
   manager.register('goat-a', second.session);
+  await new Promise((resolve) => setTimeout(resolve, 60));
 
-  assertEqual(first.timers.armed, 0, 'the replaced replay did not keep its timer');
+  assert(!isDriving(first.session), 'the replaced replay did not keep running');
   assert(manager.get('goat-a') === second.session, 'the newer replay is the one filed');
 
   await manager.dispose('goat-a');
@@ -327,9 +362,9 @@ test('keys: a GOAT and an ad-hoc replay are filed separately', () => {
 test('remount: a view mounting after the run started is handed the running replay', async () => {
   const manager = createBacktestManager();
   const key = 'goat-late';
-  const { session, timers } = await startHarness();
+  const { session } = await startHarness();
   manager.register(key, session);
-  step(timers);
+  await advanced(session, session.simulatedClock.now());
 
   // The view comes back only now, well after the run began.
   let received: BacktestSession | undefined;

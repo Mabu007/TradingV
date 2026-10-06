@@ -100,6 +100,19 @@ export class BacktestEnvironment implements ITradingEnvironment {
     return this.bars[this.currentBarIndex];
   }
 
+  /**
+   * The simulated clock, in milliseconds.
+   *
+   * The same value the environment puts on every quote it returns, so a
+   * caller that needs a timestamp for a log line gets the market's time
+   * without paying for a quote. `Date.now()` is deliberately not used: a
+   * replay of 2023 candles must not be stamped with the wall clock.
+   */
+  now(): number {
+    const bar = this.getCurrentBar() ?? this.bars[0];
+    return (bar ? bar.time : Date.now()) * 1000;
+  }
+
   getBarIndex(): number {
     return this.currentBarIndex;
   }

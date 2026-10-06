@@ -164,6 +164,16 @@ export interface AgentTimelineEvent {
   orderId?: string;
   positionId?: string;
   correlationId?: string;
+  /**
+   * The reasoning cycle that wrote this event, when it was written by one.
+   *
+   * Additive, and distinct from `correlationId` on purpose: a correlation id
+   * follows a lineage and can be shared by several cycles woken by the same
+   * tracker, while this names the single `step()` that produced the event. It
+   * is what lets a log be read as "this observation, these tool calls, that
+   * verdict, this order" instead of as a chronological list.
+   */
+  cycleId?: string;
   data: unknown;
 }
 

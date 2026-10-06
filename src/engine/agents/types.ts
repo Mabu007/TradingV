@@ -132,6 +132,19 @@ export interface MarketFacts {
 
 export interface ITradingEnvironment {
   mode: TradingEnvironmentMode;
+  /**
+   * The environment's own "now", in market/event milliseconds.
+   *
+   * Optional, and only the simulated environments need it. It exists so
+   * asking what time it is never has to cost a market-data request: a
+   * BACKTEST environment already knows its simulated time, and the runtime
+   * used to fetch a full quote for every timestamp it wrote.
+   *
+   * Deliberately not required. An environment that cannot answer without
+   * trading data simply does not implement it, and the runtime falls back to
+   * reading the timestamp off a quote rather than assuming a clock.
+   */
+  now?(): number;
   getMarketQuote(symbol: string): Promise<NormalizedQuote>;
   getMarketBars(symbol: string, timeframe: string, count: number): Promise<Bar[]>;
   /** Canonical instrument metadata, when the environment can provide it. */
@@ -278,6 +291,33 @@ export type AgentDecision =
     };
 
 /**
+ * What became of a cycle's proposed action.
+ *
+ * Deliberately separate from `AgentActionValidationResult`, which answers a
+ * different question: "did policy and risk permit this?". The two were
+ * collapsed into one status field, which let an audit record and an agent's
+ * own memory say `APPROVED` about an order the environment had already
+ * rejected. Approval is not execution, and a reader of a log cannot tell the
+ * difference unless the record keeps them apart.
+ *
+ *   WAIT          — nothing was proposed that reaches execution
+ *   NOT_ACTIONABLE— something was proposed the runtime has no route for
+ *   REJECTED      — policy or risk refused it; nothing was sent
+ *   APPROVED      — permitted, but nothing was executed for it
+ *   EXECUTED      — permitted and the environment accepted it
+ *   FAILED        — permitted, attempted, and did not happen
+ *   CANCELLED     — the agent lost the right to execute before it was sent
+ */
+export type AgentActionOutcome =
+  | 'WAIT'
+  | 'NOT_ACTIONABLE'
+  | 'REJECTED'
+  | 'APPROVED'
+  | 'EXECUTED'
+  | 'FAILED'
+  | 'CANCELLED';
+
+/**
  * Policy & Action Validation Result
  */
 export interface AgentActionValidationResult {
@@ -371,6 +411,17 @@ export interface AgentAuditRecord {
   }>;
   decision: AgentDecision;
   validation: AgentActionValidationResult;
+  /** What became of the decision, which is not the same as what validated it. */
+  outcome?: AgentActionOutcome;
+  /**
+   * The reasoning cycle this record belongs to.
+   *
+   * One `step()` is one cycle, so this is the identity that ties an
+   * observation, its tool calls, its decision, its risk verdict and its order
+   * together — `correlationId` is a wake lineage that a cycle can share with
+   * another, and an order id arrives too late to connect anything.
+   */
+  cycleId?: string;
   executionResult?: unknown;
   error?: string;
 }

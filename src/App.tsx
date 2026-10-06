@@ -1127,7 +1127,7 @@ function App() {
   // ==========================================================
 
   const handleEmergencyKillSwitch =
-    () => {
+    async () => {
       /*
        * Engage the engine's kill switch first, before anything else.
        *
@@ -1149,42 +1149,68 @@ function App() {
       );
 
       /*
-       * Close every currently open position.
+       * Stop every running agent, and wait for it.
        *
-       * Each close is a floating promise that can reject (a vanished
-       * position, a failed quote). Collecting the failures means the user
-       * finds out which position did not close instead of the rejection
-       * disappearing into the console.
+       * This used to reach into `listAgents()` and fire a `void stop()` per
+       * agent, which left the runtime's own rule for "what is running" written
+       * down in the UI as well as in the runtime. `stopAll()` is that rule,
+       * and awaiting it means the flatten below cannot begin while an agent
+       * still holds an in-flight cycle that might submit an order against the
+       * closes being sent.
        */
-      const flattenFailures: string[] = [];
-      positions.forEach((position) => {
-        void handleClosePosition(
-          position.id
-        ).catch((error: unknown) => {
-          flattenFailures.push(`${position.symbol}: ${(error as Error).message}`);
-        });
-      });
-      if (flattenFailures.length > 0) {
-        setSafetyNotice(
-          `Kill switch engaged, but ${flattenFailures.length} position(s) did not close: ${flattenFailures.join('; ')}`,
+      const stoppedAgents =
+        await agentRuntime.stopAll(
+          'Emergency kill switch engaged.',
         );
-      }
 
       /*
-       * Stop every running agent.
+       * Close every currently open position.
        *
-       * This used to iterate a `bots` array held in React state, which
-       * meant the kill switch only knew about agents something had
-       * remembered to record. The runtime is the authority on what is
-       * running, so the kill switch asks the runtime — otherwise a GOAT
-       * the UI had lost track of would have kept its trackers alive
-       * through a kill switch, which is the opposite of what a kill
-       * switch is for.
+       * Awaited, and all of them: these were floating promises, so the failure
+       * check below ran before a single close had resolved and always reported
+       * that everything closed. A user reading "all positions closed" while
+       * two were still open is worse off than one who was told what failed —
+       * which is what the safety notice exists for.
        */
-      for (const instance of agentRuntime.listAgents()) {
-        if (instance.isRunning) {
-          void agentRuntime.stop(instance.agent.id);
+      const flattenFailures: string[] = [];
+
+      const closeResults =
+        await Promise.allSettled(
+          positions.map(
+            (position) =>
+              handleClosePosition(
+                position.id
+              ),
+          ),
+        );
+
+      closeResults.forEach(
+        (result, index) => {
+          const position =
+            positions[index];
+
+          if (!position) return;
+
+          if (result.status === 'rejected') {
+            flattenFailures.push(
+              `${position.symbol}: ${
+                result.reason instanceof Error
+                  ? result.reason.message
+                  : String(result.reason)
+              }`
+            );
+          }
         }
+      );
+
+      if (flattenFailures.length > 0) {
+        setSafetyNotice(
+          `Kill switch engaged, but ${flattenFailures.length} position(s) did not close: ${flattenFailures.join('; ')}`
+        );
+      } else if (stoppedAgents.length > 0) {
+        setSafetyNotice(
+          `Kill switch engaged. ${stoppedAgents.length} agent(s) stopped and ${positions.length} position(s) closed.`
+        );
       }
 
       setShowKillSwitchModal(

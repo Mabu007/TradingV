@@ -1,5 +1,75 @@
 import { AgentCapability } from '../types';
 
+/**
+ * What each execution capability means, stated next to the capability.
+ *
+ * ## Why this table exists rather than a descriptor on the capability
+ *
+ * The obvious design is an optional `execution` field on `AgentCapability`, read
+ * off the registered object. It was tried and it cannot be adopted safely yet:
+ * capabilities are registered by id in several places that have no business knowing
+ * about trading decisions — tests, the wallet harness, the adapter tests — and an
+ * id-only registration would silently become "unknown capability" instead of being
+ * validated. A validation table that only half the registrations answer to is worse
+ * than one every registration answers to.
+ *
+ * So the knowledge moved here, beside the definitions it describes, and the runtime
+ * asks this module rather than spelling out capability names in the middle of its
+ * execution gate. `CapabilityRegistry` spreading an extra field is not relied upon;
+ * when every registration can carry its own shape, this table becomes the default
+ * that a capability overrides, and the runtime stops caring either way.
+ *
+ * ## Why the runtime still decides
+ *
+ * This says what a capability *is*. It says nothing about whether the agent may use
+ * it, whether policy allows it, or whether risk permits it — those are the runtime's
+ * answers, and they are computed from the account and the deployment, never from
+ * this table.
+ */
+export interface ExecutionCapabilityShape {
+  /** The decision this capability is a way of asking for. */
+  decision: 'OPEN_POSITION' | 'CLOSE_POSITION' | 'MODIFY_POSITION';
+  /**
+   * Refused by the execution contract itself.
+   *
+   * A capability the environment cannot serve is refused with the reason rather
+   * than being validated and then failing at the venue, which would be a worse
+   * place to learn it.
+   */
+  unsupported?: string;
+  /** Closes part of a position, which is a different act from closing all of it. */
+  partial?: boolean;
+  /** Which field of the input carries the invalidation, when the capability takes one. */
+  invalidationField?: 'stopLoss' | 'takeProfit';
+  /** The input field carrying the volume to close, for a partial close. */
+  volumeField?: string;
+}
+
+export const EXECUTION_CAPABILITY_SHAPES: Readonly<Record<string, ExecutionCapabilityShape>> = {
+  'orders.market': { decision: 'OPEN_POSITION' },
+  'positions.close': { decision: 'CLOSE_POSITION' },
+  'positions.partialClose': { decision: 'CLOSE_POSITION', partial: true, volumeField: 'volumeToClose' },
+  'positions.modifyStopLoss': { decision: 'MODIFY_POSITION', invalidationField: 'stopLoss' },
+  'positions.modifyTakeProfit': { decision: 'MODIFY_POSITION', invalidationField: 'takeProfit' },
+  'orders.limit': {
+    decision: 'OPEN_POSITION',
+    unsupported:
+      'is not supported by the configured environment execution contract.',
+  },
+  'orders.cancel': {
+    decision: 'OPEN_POSITION',
+    unsupported:
+      'is not supported by the configured environment execution contract.',
+  },
+};
+
+/** The shape of an execution capability, when it has one. */
+export function executionShapeFor(
+  id: string,
+): ExecutionCapabilityShape | undefined {
+  return EXECUTION_CAPABILITY_SHAPES[id];
+}
+
 export const ordersMarketCapability: AgentCapability<
   { symbol: string; side: 'BUY' | 'SELL'; volume: number; stopLoss?: number; takeProfit?: number; comment?: string },
   { success: boolean; positionId?: string; fillPrice?: number; error?: string }

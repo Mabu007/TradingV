@@ -26,6 +26,9 @@
  *      would be wrong twice over.
  *   3. A long range is *paged*, because the venue caps a single response. A
  *      silently truncated history is a result about a window nobody chose.
+ *   4. Pages that overlap at a boundary are de-duplicated rather than rejected.
+ *   5. The same window requested twice is served from memory, because "run it
+ *      again" is the loop this product is built around.
  *
  * The candle-response fixture below is the real shape the venue returns,
  * including the millisecond timestamps and the `xyz:` prefixed symbol, so a
@@ -281,6 +284,78 @@ test('provider: the historical contract is documented in seconds', () => {
     '1h',
     'and the only other thing a caller supplies is a resolution the venue publishes',
   );
+});
+
+test('candles: pages that overlap at a boundary are de-duplicated, not rejected', async () => {
+  /*
+   * A venue is free to include the boundary candle of the previous page in the
+   * next response, and `validateHistoricalBars` — correctly — refuses a dataset
+   * that is not strictly chronological. Without de-duplication that turned a
+   * survivable overlap into a failed backtest whose error said "duplicate candles"
+   * and nothing about the cause.
+   */
+  let page = 0;
+  const provider = new HyperliquidHistoricalMarketDataProvider({
+    getBarsInRange: (async (_symbol: string, _timeframe: string, start: number, end: number) => {
+      const stepSeconds = 60;
+      // Every page after the first repeats one candle the previous page already gave.
+      const from = page === 0 ? start : start - stepSeconds * 1_000;
+      page += 1;
+      const out = [];
+      for (let t = from; t < end && out.length < 10; t += stepSeconds * 1_000) {
+        out.push({ time: Math.floor(t / 1_000), open: 1, high: 2, low: 0.5, close: 1.5, volume: 1 });
+      }
+      return out;
+    }) as never,
+  });
+
+  const result = await provider.getBars({
+    marketId: 'xyz:GOLD',
+    timeframe: '1m',
+    start: BASE_SECONDS,
+    end: BASE_SECONDS + 600,
+  });
+
+  const times = result.bars.map((bar) => bar.time);
+  assertEqual(new Set(times).size, times.length, 'every candle appears exactly once');
+  for (let index = 1; index < times.length; index += 1) {
+    assert((times[index] as number) > (times[index - 1] as number), 'and they are in order');
+  }
+});
+
+test('candles: re-running the same window is served from memory', async () => {
+  /*
+   * The loop this product is built around is "run it again". Paying the network
+   * for the same candles twice is pure waste, and the cache is keyed by the exact
+   * request — never by market — because returning a month of candles for a request
+   * about a week would be the same silent substitution this file exists to stop.
+   */
+  let calls = 0;
+  const provider = new HyperliquidHistoricalMarketDataProvider({
+    getBarsInRange: (async (_symbol: string, _timeframe: string, start: number, end: number) => {
+      calls += 1;
+      const out = [];
+      for (let t = start; t < end; t += 60_000) {
+        out.push({ time: Math.floor(t / 1_000), open: 1, high: 2, low: 0.5, close: 1.5, volume: 1 });
+      }
+      return out;
+    }) as never,
+  });
+
+  const request: HistoricalBarsRequest = {
+    marketId: 'xyz:GOLD',
+    timeframe: '1m',
+    start: BASE_SECONDS,
+    end: BASE_SECONDS + 3_600,
+  };
+
+  const first = await provider.getBars(request);
+  const second = await provider.getBars(request);
+  assertEqual(calls, 1, 'the second run asked the venue nothing');
+  assertEqual(second.bars.length, first.bars.length, 'and returned the same window');
+
+  await provider.getBars({ ...request, start: request.start + 1_800 });
+  assertEqual(calls, 2, 'a different window is not answered from the first window');
 });
 
 /* ------------------------------------------------------------------ *

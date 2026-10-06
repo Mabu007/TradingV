@@ -254,6 +254,14 @@ export async function runAgentInfrastructureTests(): Promise<void> {
     async run() { return { thought: 'approved', decision: validOpen }; },
   });
   approvedRuntime.registerAgent(tradingAgent, executionEnv);
+  /*
+   * Started, because that is the condition under which an agent may execute at
+   * all. A cycle on an agent that was never started still reasons and still
+   * decides — a manual wake and a backtest replay both need that — but the
+   * execution boundary refuses it, so an approval that reaches the environment
+   * here is an approval of a *running* agent rather than of any agent at all.
+   */
+  await approvedRuntime.start(tradingAgent.id);
   await approvedRuntime.step(tradingAgent.id);
   assert(executed, 'approved structured decision reaches environment only after validation');
 
@@ -268,6 +276,7 @@ export async function runAgentInfrastructureTests(): Promise<void> {
     async run(request) { Object.assign(modelRequest, request); return { thought: 'order', toolCall: { capability: 'orders.market', input: { symbol: 'GBPUSD', side: 'BUY', volume: 1000, stopLoss: 1.09 } } }; },
   });
   blockedRuntime.registerAgent(blockedAgent, env);
+  await blockedRuntime.start(blockedAgent.id);
   await blockedRuntime.step(blockedAgent.id);
   assert(!riskBypassCalled, 'execution tool cannot bypass agent symbol policy');
   assert(JSON.stringify(blockedRuntime.getAuditTrail(blockedAgent.id)).includes('REJECTED'), 'policy failure is returned and audited');
@@ -299,6 +308,184 @@ export async function runAgentInfrastructureTests(): Promise<void> {
   const replay = await replayAgentBacktest(backtestRuntime, backtestAgent.id, backtestEnvironment);
   assert(replay.length === historical.length, 'same runtime supports deterministic historical event replay');
   assert(!['window', 'document', 'fetch', 'filesystem'].some((name) => name in modelRequest), 'model request excludes ambient execution APIs');
+
+  /*
+   * Lifecycle against a cycle that is already running.
+   *
+   * `stop()` used to set a flag that nothing read again, so a cycle already
+   * inside a model call went on to submit its order afterwards. Each of these
+   * revocations happens *from inside* the model call — the window a flag cannot
+   * cover — and the model still gets to return a decision.
+   *
+   * The restart case is the one that needs the execution generation rather than
+   * the flag: by the time the decision is executed the agent is running again,
+   * is the same registered instance, and still holds the cycle slot, so nothing
+   * about its *state* says the cycle it is finishing belongs to a previous
+   * lifecycle.
+   */
+  const revocations = [
+    { label: 'stopped', apply: async (target: AgentRuntime, id: string) => { await target.stop(id); } },
+    { label: 'unregistered', apply: (target: AgentRuntime, id: string) => { target.unregisterAgent(id); } },
+    {
+      label: 'restarted',
+      apply: async (target: AgentRuntime, id: string) => {
+        await target.stop(id);
+        await target.start(id);
+      },
+    },
+  ];
+
+  for (const revocation of revocations) {
+    let placed = false;
+    const revocationEnv: ITradingEnvironment = {
+      ...executionEnv,
+      async placeMarketOrder(params) {
+        placed = true;
+        return executionEnv.placeMarketOrder(params);
+      },
+    };
+    const revocationSkills = new SkillRegistry();
+    revocationSkills.register({ id: 'entry', name: 'Entry', description: 'Entry skill', instructions: '', requiredCapabilities: ['orders.market'], enabled: true });
+    const revocationRegistry = new CapabilityRegistry();
+    revocationRegistry.register(orderCapability);
+    const revocationAgent: TradingAgent = { ...tradingAgent, id: `${revocation.label}-agent` };
+
+    let revocationRuntime!: AgentRuntime;
+    revocationRuntime = new AgentRuntime(
+      revocationRegistry,
+      revocationSkills,
+      new ActionValidator(),
+      {
+        async run() {
+          await revocation.apply(revocationRuntime, revocationAgent.id);
+          return { thought: 'too late', decision: validOpen };
+        },
+      }
+    );
+    revocationRuntime.registerAgent(revocationAgent, revocationEnv);
+    await revocationRuntime.start(revocationAgent.id);
+
+    const lateDecision = await revocationRuntime.step(revocationAgent.id);
+    assert(lateDecision.type === 'OPEN_POSITION', `a ${revocation.label} cycle still returns what the model decided`);
+    assert(!placed, `a cycle ${revocation.label} mid-flight cannot submit an order`);
+
+    const lateRecord = revocationRuntime.getAuditTrail(revocationAgent.id)[0];
+    assert(lateRecord?.validation?.valid === true, `the ${revocation.label} cycle was validly approved before it was revoked`);
+    assert(lateRecord?.outcome === 'CANCELLED', `a ${revocation.label} cycle is recorded CANCELLED, not as an approval`);
+    assert(lateRecord?.executionResult === undefined, `a ${revocation.label} cycle records no execution result`);
+  }
+
+  const killRuntime = new AgentRuntime(runtimeCapabilities, skills, new ActionValidator(), model);
+  killRuntime.registerAgent({ ...agent, id: 'kill-switch-a' }, env);
+  killRuntime.registerAgent({ ...agent, id: 'kill-switch-b' }, env);
+  await killRuntime.start('kill-switch-a');
+  const stoppedByKillSwitch = await killRuntime.stopAll();
+  assert(stoppedByKillSwitch.join(',') === 'kill-switch-a', 'stopAll stops the running agents and names the ones it stopped');
+  assert(killRuntime.listAgents().every((instance) => !instance.isRunning), 'nothing is left running after a kill switch');
+
+  /*
+   * No market, no observation.
+   *
+   * This used to fall back to EURUSD, so an agent bound to nothing read a
+   * market nobody deployed it on and every conclusion it drew was about an
+   * instrument the record never mentioned.
+   */
+  const symbollessAgent: TradingAgent = { ...agent, id: 'symbolless-agent', symbols: [] };
+  const symbollessRuntime = new AgentRuntime(runtimeCapabilities, skills, new ActionValidator(), model);
+  symbollessRuntime.registerAgent(symbollessAgent, env);
+  let symbollessReason = '';
+  try { await symbollessRuntime.observe(symbollessAgent.id); } catch (error: unknown) { symbollessReason = error instanceof Error ? error.message : String(error); }
+  assert(/no configured symbol/.test(symbollessReason), 'an agent with no market refuses the observation rather than reading a substitute');
+  await symbollessRuntime.step(symbollessAgent.id);
+  assert(
+    (await symbollessRuntime.getTimelineStore().getByAgent(symbollessAgent.id)).some((event) => event.type === 'ERROR'),
+    'the missing market is recorded on the timeline instead of being papered over'
+  );
+
+  /*
+   * A refused order is not an approved one.
+   *
+   * Both facts are true here and they used to be recorded in one field: policy
+   * and risk said yes, and the environment said no. A log that can only say
+   * "approved" cannot say which happened.
+   */
+  const refusingEnv: ITradingEnvironment = {
+    ...env,
+    async placeMarketOrder() { return { success: false, error: 'Insufficient margin' }; },
+  };
+  const refusingAgent: TradingAgent = { ...tradingAgent, id: 'refused-order-agent' };
+  const refusingRuntime = new AgentRuntime(orderRegistry, tradingSkills, new ActionValidator(), {
+    async run() { return { thought: 'enter', decision: validOpen }; },
+  });
+  refusingRuntime.registerAgent(refusingAgent, refusingEnv);
+  await refusingRuntime.start(refusingAgent.id);
+  await refusingRuntime.step(refusingAgent.id);
+
+  const refusedRecord = refusingRuntime.getAuditTrail(refusingAgent.id)[0];
+  assert(refusedRecord?.validation?.valid === true, 'the refused order really did pass policy and risk');
+  assert(refusedRecord?.outcome === 'FAILED', 'an order the environment refused is recorded FAILED');
+  assert(
+    refusingRuntime.getAgent(refusingAgent.id)?.memory.get<{ status: string }>('lastActionResult')?.status === 'FAILED',
+    "an agent's own memory no longer calls a refused order APPROVED"
+  );
+
+  /*
+   * Two clocks, kept apart.
+   *
+   * The backtest environment's clock and the wall clock are different domains.
+   * A tool duration used to be their difference, so in BACKTEST it reported
+   * however many years separated a simulated candle from now.
+   */
+  const clockRuntime = new AgentRuntime(runtimeCapabilities, skills, new ActionValidator(), {
+    async run(request) {
+      if (request.iteration === 1) return { thought: 'read', toolCall: { capability: 'test.increment', input: { amount: 1 } } };
+      return { thought: 'done', decision: { type: 'WAIT', reason: 'done' } };
+    },
+  });
+  clockRuntime.registerAgent({ ...agent, id: 'clock-agent' }, backtestEnvironment);
+  await clockRuntime.start('clock-agent');
+  backtestEnvironment.setBarIndex(2);
+  await clockRuntime.step('clock-agent');
+
+  const clockEvents = await clockRuntime.getTimelineStore().getByAgent('clock-agent');
+  assert(
+    clockEvents.find((event) => event.type === 'OBSERVATION')?.timestamp === 3000,
+    'a backtest observation is stamped with the simulated bar, not with the wall clock'
+  );
+  const clockDuration = (clockEvents.find((event) => event.type === 'CAPABILITY_RESULT')?.data as { durationMs?: number } | undefined)?.durationMs;
+  assert(
+    typeof clockDuration === 'number' && clockDuration >= 0 && clockDuration < 60_000,
+    'a backtest tool duration is real elapsed time rather than simulated market time'
+  );
+
+  /*
+   * ANALYZE is a way of asking, not a way around.
+   *
+   * It used to call the capability registry directly, so an execution
+   * capability named in an ANALYZE decision reached the environment without the
+   * policy validator, `riskManager` or the lifecycle gate — a bypass of all
+   * three, available by phrasing a trade as analysis.
+   */
+  let analyzeBypass = false;
+  const analyzeRegistry = new CapabilityRegistry();
+  analyzeRegistry.register({ ...actionCapability, async execute() { analyzeBypass = true; return { success: true }; } });
+  const analyzeAgent: TradingAgent = { ...agent, id: 'analyze-agent', skills: ['trade-entry'], capabilities: ['orders.market'] };
+  const analyzeRuntime = new AgentRuntime(analyzeRegistry, executionSkills, validator, {
+    async run() {
+      return {
+        thought: 'analyse it',
+        decision: { type: 'ANALYZE', capability: 'orders.market', input: { symbol: 'GBPUSD', side: 'BUY', volume: 1000, stopLoss: 1.09 } },
+      };
+    },
+  });
+  analyzeRuntime.registerAgent(analyzeAgent, env);
+  await analyzeRuntime.start(analyzeAgent.id);
+  assert((await analyzeRuntime.step(analyzeAgent.id)).type === 'WAIT', 'an ANALYZE decision is a capability call, not a final decision');
+  assert(!analyzeBypass, 'ANALYZE cannot reach an execution capability around policy, risk and the lifecycle gate');
+  assert(
+    analyzeRuntime.getAuditTrail(analyzeAgent.id)[0]?.toolCalls.every((call) => JSON.stringify(call.result).includes('REJECTED')),
+    'the refusal is reported back to the model rather than silently swallowed'
+  );
 }
 
 function makePosition(): Position {

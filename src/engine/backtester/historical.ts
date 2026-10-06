@@ -72,11 +72,48 @@ export const MAX_CANDLES_PER_VENUE_REQUEST = 5_000;
 const MAX_HISTORICAL_PAGES = 200;
 
 export class HyperliquidHistoricalMarketDataProvider implements HistoricalMarketDataProvider {
-  constructor(private readonly adapter: Pick<HyperliquidMarketDataAdapter, 'getBarsInRange'> = hyperliquidMarketData) {}
+  constructor(
+    private readonly adapter: Pick<HyperliquidMarketDataAdapter, 'getBarsInRange'> = hyperliquidMarketData,
+    /**
+     * How many datasets are remembered.
+     *
+     * Bounded on purpose. A backtester that cached a month of one-minute candles
+     * forever would be a memory leak wearing a feature label, and this runs in a
+     * browser tab next to a chart. Four entries is enough for the loop this
+     * product actually has: "run again", "compare against the period before",
+     * "switch resolution once", and "switch market once".
+     */
+    private readonly cacheEntries = 4,
+  ) {}
+
+  /**
+   * Datasets already fetched, newest first.
+   *
+   * Keyed by the exact request rather than by market, because a cached window is
+   * only reusable if it *is* the window: returning a month's candles for a
+   * request about a week would be the same silent substitution this whole module
+   * exists to prevent, and it would be invisible — the candles would be real, just
+   * not the ones that were asked for.
+   *
+   * Re-running the same period is the common case (the "what if" loop), and it
+   * costs the user nothing but a network round trip they would otherwise pay
+   * twice.
+   */
+  private readonly cache = new Map<string, HistoricalBarsResult>();
 
   async getBars(request: HistoricalBarsRequest): Promise<HistoricalBarsResult> {
     if (!request.marketId || !Number.isFinite(request.start) || !Number.isFinite(request.end) || request.end <= request.start) {
       throw new Error('Choose a valid historical start and end time.');
+    }
+
+    const cacheKey = `${request.marketId}|${request.timeframe}|${request.start}|${request.end}`;
+    const cached = this.cache.get(cacheKey);
+    if (cached) {
+      // Refresh its position: a dataset that is about to be used again is the one
+      // worth keeping when the cache overflows.
+      this.cache.delete(cacheKey);
+      this.cache.set(cacheKey, cached);
+      return { bars: cached.bars.map((bar) => ({ ...bar })), gaps: [...cached.gaps] };
     }
 
     const secondsPerCandle = timeframeSeconds(request.timeframe);
@@ -112,8 +149,36 @@ export class HyperliquidHistoricalMarketDataProvider implements HistoricalMarket
       cursorMs = nextMs;
     }
 
-    return validateHistoricalBars(collected, request.timeframe);
+    const result = validateHistoricalBars(dedupeByTime(collected), request.timeframe);
+
+    this.cache.set(cacheKey, { bars: result.bars.map((bar) => ({ ...bar })), gaps: [...result.gaps] });
+    while (this.cache.size > this.cacheEntries) {
+      const oldest = this.cache.keys().next();
+      if (oldest.done) break;
+      this.cache.delete(oldest.value);
+    }
+
+    return result;
   }
+}
+
+/**
+ * One candle per instant, in order.
+ *
+ * Pagination asks a venue for successive ranges, and a venue is free to include
+ * the boundary candle of the previous page in the next response. `validateHistoricalBars`
+ * — correctly — rejects a dataset that is not strictly chronological, so an
+ * overlapping page turned a survivable overlap into a failed backtest with an
+ * error about "duplicate candles" that said nothing about the cause.
+ *
+ * De-duplicating here is the difference between tolerating an overlapping page
+ * and treating it as corruption. Last write wins, because a later page's copy of
+ * a candle is the venue's freshest answer for it.
+ */
+function dedupeByTime(bars: Bar[]): Bar[] {
+  const byTime = new Map<number, Bar>();
+  for (const bar of bars) byTime.set(bar.time, bar);
+  return [...byTime.values()].sort((a, b) => a.time - b.time);
 }
 
 /**

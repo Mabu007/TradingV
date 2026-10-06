@@ -89,6 +89,16 @@ export interface AgentLogProps {
   now: number;
   /** Called when the reader asks to see an artefact a line points at. */
   onOpenArtifact?: (artifact: NonNullable<AgentEventView['artifact']>) => void;
+  /**
+   * Highlight and scroll to one entry.
+   *
+   * Added for the replay's key-moments list: a moment is a claim about a line in
+   * this log, and a list of moments a reader cannot follow into the log is a
+   * summary rather than a way in. Passing an id that is not in the rendered window
+   * does nothing — the log only ever draws its tail, and scrolling to something it
+   * is not showing would be a lie about what is on screen.
+   */
+  focusEntryId?: string;
   className?: string;
 }
 
@@ -109,9 +119,11 @@ export const AgentLog: React.FC<AgentLogProps> = ({
   liveLabel = 'LIVE',
   now,
   onOpenArtifact,
+  focusEntryId,
   className = '',
 }) => {
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const lineRefs = useRef(new Map<string, HTMLLIElement | null>());
   const [following, setFollowing] = useState(true);
   const [missed, setMissed] = useState(0);
   const [freshIds, setFreshIds] = useState<ReadonlySet<string>>(new Set());
@@ -176,6 +188,21 @@ export const AgentLog: React.FC<AgentLogProps> = ({
     if (following) return;
     setMissed((count) => Math.min(count + 1, 999));
   }, [entries.length, following]);
+
+  /*
+   * Follow a key moment into the log.
+   *
+   * Scrolling is the whole of it, and it only happens when the line is actually
+   * rendered: the log draws its tail, so a moment pointing at something older than
+   * the window is a moment the surface cannot take the reader to, and pretending
+   * otherwise would be a worse small lie than a highlight that does not move.
+   */
+  useEffect(() => {
+    if (!focusEntryId) return;
+    const node = lineRefs.current.get(focusEntryId);
+    if (!node) return;
+    node.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, [focusEntryId, entries.length]);
 
   const jumpToLatest = useCallback(() => {
     const node = scrollRef.current;
@@ -253,6 +280,11 @@ export const AgentLog: React.FC<AgentLogProps> = ({
                   fresh={freshIds.has(entry.id)}
                   now={now}
                   onOpenArtifact={onOpenArtifact}
+                  focused={focusEntryId === entry.id}
+                  registerRef={(node) => {
+                    if (node) lineRefs.current.set(entry.id, node);
+                    else lineRefs.current.delete(entry.id);
+                  }}
                 />
               ))}
             </ol>
@@ -287,6 +319,9 @@ interface LogLineProps {
   fresh: boolean;
   now: number;
   onOpenArtifact?: (artifact: NonNullable<AgentEventView['artifact']>) => void;
+  /** Set when a key moment pointed the reader at this line. */
+  focused?: boolean;
+  registerRef?: (node: HTMLLIElement | null) => void;
 }
 
 /**
@@ -307,7 +342,7 @@ interface LogLineProps {
  *   important   EVIDENCE, PLAN, RESEARCH, STEER — the working narrative
  *   critical    INVALIDATION, EXECUTION, ERROR, RISK — stop and read this
  */
-const LogLine: React.FC<LogLineProps> = ({ entry, fresh, now, onOpenArtifact }) => {
+const LogLine: React.FC<LogLineProps> = ({ entry, fresh, now, onOpenArtifact, focused, registerRef }) => {
   const { style } = entry;
   const critical = style.weight === 'critical';
   const important = style.weight === 'important';
@@ -315,8 +350,10 @@ const LogLine: React.FC<LogLineProps> = ({ entry, fresh, now, onOpenArtifact }) 
 
   return (
     <li
+      ref={registerRef}
       data-event-type={entry.type}
       data-weight={style.weight}
+      data-focused={focused ? 'true' : undefined}
       className={[
         'group relative border-l-2 py-3 pl-3.5 pr-1 transition-colors',
         critical
@@ -325,6 +362,7 @@ const LogLine: React.FC<LogLineProps> = ({ entry, fresh, now, onOpenArtifact }) 
             ? 'border-l-accent/35'
             : 'border-l-line-soft hover:bg-surface-2/40',
         fresh && announces ? 'animate-log-enter' : '',
+        focused ? 'bg-accent-soft/25 ring-1 ring-inset ring-accent/40' : '',
       ].join(' ')}
     >
       <div className="flex items-center gap-2">

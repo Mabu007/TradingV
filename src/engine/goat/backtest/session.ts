@@ -59,7 +59,6 @@ import type { Goal } from '../types';
 import {
   SimulationClock,
   DEFAULT_SIMULATION_SPEED,
-  SIMULATION_STEP_MS,
   isSimulationSpeed,
   type SimulationSpeed,
 } from './clock';
@@ -75,6 +74,19 @@ import {
   type TimeframePlan,
 } from '../timeframes';
 import { summariseBehaviour, summarisePerformance, type BacktestReport } from './results';
+import { recordReplaySummary } from './history';
+import {
+  deriveBehaviourScore,
+  deriveGoatState,
+  deriveKeyMoments,
+  deriveNearMisses,
+  deriveVerdict,
+  isAnimatedState,
+  type BehaviourScore,
+  type GoatState,
+  type KeyMoment,
+  type NearMiss,
+} from './story';
 
 /**
  * How much history the agent is given before the replay's own start.
@@ -97,6 +109,38 @@ export const DEFAULT_BACKTEST_WARMUP_MINUTES = 240;
  * agent answer a question about a market it had already left behind.
  */
 export const BACKTEST_WAKE_TIMEOUT_MS = 120_000;
+
+/**
+ * How long the replay lingers on a moment worth watching, in real milliseconds.
+ *
+ * Adaptive pacing, and the only sleeps in the replay that are not the model
+ * runtime's own. They exist because a replay that moves at a constant speed can
+ * only ever feel like one thing happening: the difference between "a watch fired
+ * and the GOAT acted" and "six hours passed" is that the first one stops.
+ *
+ * Each hold is entered only when the event stream actually produced the event, so
+ * a run in which nothing happens is never slowed down. Every one of them is real
+ * time, and none of them advances the simulated clock.
+ */
+export const REPLAY_HOLD_ON_ORDER_MS = 350;
+export const REPLAY_HOLD_ON_FILL_MS = 500;
+export const REPLAY_HOLD_ON_OUTCOME_MS = 700;
+
+/**
+ * How long a fired watch holds the replay, in real milliseconds.
+ *
+ * A tracker firing is the moment the whole replay exists for: the condition the
+ * GOAT set, met by a market that has already happened. Letting the clock run
+ * straight through it is how a replay ends up being unreadable exactly where it
+ * should be most watchable.
+ */
+export const REPLAY_HOLD_ON_WAKE_MS = 600;
+
+/** A pause, so a browser can paint and a host can schedule. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
 
 export type BacktestState =
   | 'IDLE'
@@ -273,6 +317,55 @@ export interface BacktestSnapshot {
   tradePhase?: BacktestTradePhase;
 }
 
+/**
+ * The semantic view of a replay: what the GOAT is doing, what happened, and what
+ * the run says about it.
+ *
+ * Separate from the snapshot on purpose. The snapshot is state — clock, speed,
+ * progress — and it changes several times a second. This is the *reading* of that
+ * state, and a surface renders it rather than deriving it, so the word on the
+ * screen and the moment list beside it are always taken from the same instant.
+ */
+export interface BacktestStory {
+  state: GoatState;
+  /** Whether the state is one worth animating. */
+  animated: boolean;
+  moments: KeyMoment[];
+  nearMisses: NearMiss[];
+  /** Absent while the run is still going: there is nothing to conclude yet. */
+  verdict?: { summary: string; observations: string[] };
+  score: BehaviourScore;
+}
+
+/**
+ * One trade, as the GOAT's record of deciding it.
+ *
+ * Four blocks, in the order a reader asks for them: what it knew, what it decided,
+ * what the deterministic layer said, and what the simulation did about it. Nothing
+ * here is reconstructed from prices after the fact — every field came from an event
+ * that was written at the moment it happened.
+ */
+export interface DecisionReview {
+  planId: string;
+  /** When the decision was recorded, epoch ms. */
+  at: number;
+  knew: {
+    thesis?: string;
+    invalidation?: string;
+    resolutions?: string[];
+    account: { equity?: number; openPositions: number; riskPerTrade?: number };
+  };
+  decision: {
+    side?: string;
+    entry?: number;
+    stopLoss?: number;
+    takeProfit?: number;
+    reason?: string;
+  };
+  risk: { verdict?: string; reason?: string };
+  outcome: { filledAt?: number; closedAt?: number; pnl?: number };
+}
+
 export class BacktestSession {
   readonly market: string;
   /**
@@ -287,7 +380,6 @@ export class BacktestSession {
   readonly end: number;
 
   private readonly request: BacktestRequest;
-  private readonly clock: SimulationClock;
   /**
    * Which resolutions this replay reads, and what each is for.
    *
@@ -299,10 +391,22 @@ export class BacktestSession {
   private readonly plan: TimeframePlan;
   private readonly warmupMs: number;
   private readonly initialBalance: number;
-  private readonly stores: GoatStores;
-  private readonly agentRuntime: AgentRuntime;
-  private readonly trackers: TrackerRuntime;
   private readonly listeners = new Set<(snapshot: BacktestSnapshot) => void>();
+
+  /*
+   * The replay world.
+   *
+   * Mutable, and rebuilt wholesale by `restart`, because "start again" has to
+   * mean a genuinely new world rather than a few arrays emptied. A restart that
+   * kept the clock object would resume from wherever the previous run stopped
+   * advancing it; one that kept the agent runtime would inherit the previous
+   * run's generation counter, memory and audit trail. Two runs would then share
+   * a history, which is precisely the thing a replay must not do.
+   */
+  private clock!: SimulationClock;
+  private stores!: GoatStores;
+  private agentRuntime!: AgentRuntime;
+  private trackers!: TrackerRuntime;
 
   private environment?: SimulationEnvironment;
   private orchestrator?: GoatOrchestrator;
@@ -311,12 +415,12 @@ export class BacktestSession {
   private currentState: BacktestState = 'IDLE';
   private lastMessage?: string;
   private report?: BacktestReport;
-  private readonly reportedTrades = new Set<string>();
-  private readonly executedPlans = new Set<string>();
+  private reportedTrades = new Set<string>();
+  private executedPlans = new Set<string>();
   /**
    * The trades this replay has taken.
    *
-   * Created with the session and never persisted, which is what makes "a new
+   * Created with the world and never persisted, which is what makes "a new
    * backtest has no trades from the last one" true by construction: there is no
    * path by which a previous replay's trades can appear in a new one, because
    * there is nothing to carry over.
@@ -325,6 +429,30 @@ export class BacktestSession {
   private lastTickPrice?: number;
   private wakeInFlight = 0;
   private starting?: Promise<void>;
+  /** Close instants delivered to the trackers, per resolution. */
+  private deliveredBarsByTimeframe = new Map<string, Set<number>>();
+  /**
+   * Which run is current.
+   *
+   * Bumped by anything that ends or replaces a run. Every wait in the replay
+   * carries the epoch it started in and gives up the moment it changes, so a
+   * model request that is still outstanding when the user presses STOP — or when
+   * a restart replaces the world underneath it — cannot write into a replay that
+   * has already moved on. This is the same idea as the agent runtime's execution
+   * generation, one level up: that one stops a cycle trading, this one stops a
+   * world mutating.
+   */
+  private epoch = 0;
+  /** The replay loop, while one is running. At most one, by construction. */
+  private loop?: Promise<void>;
+  private loopEpoch = 0;
+  /** Bars consumed per loop pass, before adaptive pacing reduces it. */
+  private barBudget = 1;
+  /** How long the loop lingers on a moment worth noticing, in real ms. */
+  private adaptiveHoldMs = 0;
+  /** The derived story, and the run-shape it was derived from. */
+  private storyCache?: { signature: string; story: BacktestStory };
+
 
   constructor(request: BacktestRequest) {
     this.request = request;
@@ -361,27 +489,43 @@ export class BacktestSession {
       setup: request.timeframe ?? declared[Math.floor(declared.length / 2)],
     });
 
+    /*
+     * Bars per replay pass.
+     *
+     * The requested speed is the starting budget rather than a delay, because a
+     * delay would make a week of one-minute data take hours of real time while a
+     * budget replays it in a minute of it. Every bar in a pass is still processed
+     * individually, in order.
+     */
+    this.barBudget = request.speed ?? DEFAULT_SIMULATION_SPEED;
+
+    this.buildWorld();
+  }
+
+  /**
+   * Construct the world: clock, stores, the GOAT's runtime, its tracker runtime.
+   *
+   * One place, called by the constructor and again by `restart`. The reason it
+   * is one place rather than a constructor body is that a restart has to produce
+   * something indistinguishable from a first run, and "indistinguishable" is only
+   * true if both go through the same code. A restart that nulled a few fields and
+   * called `start()` again would inherit whatever the previous run left in the
+   * objects it kept — which is the bug that made the old restart replay the old
+   * run's conclusions over the same candles.
+   */
+  private buildWorld(): void {
     this.clock = new SimulationClock({
-      start: request.start,
-      speed: request.speed ?? DEFAULT_SIMULATION_SPEED,
-      ...(request.scheduler ? { scheduler: request.scheduler } : {}),
+      start: this.request.start,
+      speed: this.request.speed ?? DEFAULT_SIMULATION_SPEED,
+      ...(this.request.scheduler ? { scheduler: this.request.scheduler } : {}),
     });
 
-    /*
-     * Its own stores, its own agent runtime, its own tracker runtime.
-     *
-     * Not a fork: the same classes the live application constructs at startup,
-     * instantiated separately so that a replay's goals, theses, trackers and
-     * activity feed are its own. Sharing them would mean a backtest could
-     * overwrite a live GOAT's thesis, and would make "live mode is unchanged"
-     * untestable.
-     */
     this.stores = createGoatStores('MEMORY');
     this.agentRuntime = new AgentRuntime(
       capabilityRegistry,
       undefined,
       undefined,
-      request.model,
+      this.request.model,
       new InMemoryAgentTimelineStore(),
     );
     this.trackers = new TrackerRuntime({
@@ -396,6 +540,20 @@ export class BacktestSession {
     });
     this.trackers.setEnvironment('BACKTEST');
   }
+
+  /**
+   * Tear the current world down without stopping a run.
+   *
+   * Used only by `restart`. Both runtimes hold subscriptions — the tracker
+   * runtime to the event bus, the agent runtime to position events — and a
+   * replay that replaced its world without releasing them would leave the old
+   * ones writing into a session nobody reads.
+   */
+  private teardownWorld(): void {
+    this.trackers.dispose();
+    this.agentRuntime.dispose();
+  }
+
 
   // -------------------------------------------------------------------------
   // Lifecycle
@@ -494,6 +652,13 @@ export class BacktestSession {
       onEvent: async (event: TrackerEvent) => {
         const wake = this.trackers.wakeRequestForEvent(event.id);
         if (!wake) return;
+        /*
+         * A watch firing is the moment the replay exists for. The loop drops to a
+         * single bar for a beat, so what follows — the GOAT waking, reading,
+         * deciding — happens at a pace a person can follow instead of being
+         * somewhere in the past before it has finished happening.
+         */
+        this.adaptiveHoldMs = Math.max(this.adaptiveHoldMs, REPLAY_HOLD_ON_WAKE_MS);
         this.wakeInFlight += 1;
         try {
           await this.orchestrator?.runWake(wake);
@@ -509,6 +674,7 @@ export class BacktestSession {
           this.wakeInFlight -= 1;
         }
       },
+
     });
 
     this.setState('SETTING_UP', 'Forming its first hypothesis');
@@ -622,11 +788,15 @@ export class BacktestSession {
   }
 
   /**
-   * Start (or resume) the clock.
+   * Start (or resume) the replay.
    *
    * Separate from `start` so a surface can enter the workspace while the GOAT is
    * still thinking — the user watches the setup happen rather than staring at a
    * loading screen — and so START and RESUME are the same operation.
+   *
+   * Nothing here installs a timer. The loop below paces itself, which is the
+   * difference between a replay that advances its market when it is ready to and
+   * one that is dragged forward by a scheduler it cannot answer back to.
    */
   async play(): Promise<void> {
     await this.start();
@@ -636,10 +806,121 @@ export class BacktestSession {
       return;
     }
     this.setState('RUNNING');
-    this.clock.start(SIMULATION_STEP_MS, (now) => {
-      void this.tick(now);
-    });
+    this.resumeLoop();
     this.emit();
+  }
+
+  /**
+   * Make sure exactly one loop is running.
+   *
+   * The guard is the point. The previous implementation armed an interval that
+   * called `tick()` and did not wait for it, so a second tick arrived every
+   * 250ms while the first was still awaiting a model — which meant the clock
+   * advanced during a decision, two `step()`s ran against the same simulated
+   * world at once, and the whole "historical time does not move while the GOAT
+   * decides" claim was true only of the UI copy.
+   */
+  private resumeLoop(): void {
+    if (this.loop) return;
+    const epoch = this.epoch;
+    this.loopEpoch = epoch;
+    this.loop = this.runLoop(epoch).finally(() => {
+      if (this.loopEpoch === epoch) this.loop = undefined;
+    });
+  }
+
+  /**
+   * The replay loop.
+   *
+   * The whole pacing contract, in order:
+   *
+   *   advance to the next *bar* boundary  (never past one, so none is skipped)
+   *   → process that bar                 (orders, positions, trackers)
+   *   → let the GOAT finish              (model included; the loop waits)
+   *   → execute what it approved
+   *   → settle and report
+   *   → repeat
+   *
+   * Historical time therefore only moves at the top of a pass, and only when the
+   * previous pass is completely finished. A wake that takes four seconds holds
+   * the market for those four seconds, which is the behaviour the surface has
+   * always claimed and the loop now actually provides.
+   *
+   * How many bars a pass covers is the speed control, and it is a count rather
+   * than a duration: at 10× the loop processes ten bars per pass, each one fully
+   * and in order. That is the difference between "fast" and "skipping", and it
+   * is why the budget is capped by what is left rather than applied to the clock.
+   */
+  private async runLoop(epoch: number): Promise<void> {
+    while (this.currentState === 'RUNNING' && this.epoch === epoch) {
+      const environment = this.environment;
+
+      if (!environment) return;
+
+      if (environment.exhausted) {
+        await this.complete();
+        return;
+      }
+
+      /*
+       * Adaptive pacing, applied before the work rather than after it.
+       *
+       * A moment worth noticing — a watch firing, an order filling, a target hit
+       * — is given real time to be read. The budget shrinks to a single bar while
+       * a hold is outstanding, so the replay visibly slows down around what
+       * matters and speeds back up through the quiet, without the user having to
+       * touch anything.
+       */
+      const budget = this.adaptiveHoldMs > 0 ? 1 : Math.max(1, Math.min(this.barBudget, 240));
+
+      for (let index = 0; index < budget; index += 1) {
+        if (this.currentState !== 'RUNNING' || this.epoch !== epoch) return;
+
+        const next = environment.nextBarClose();
+
+        if (next === undefined) {
+          await this.complete();
+          return;
+        }
+
+        /*
+         * The only place the clock moves during a run, and it moves to a boundary
+         * the dataset actually contains. A speed of 30 over one-minute data
+         * therefore reveals thirty minutes as thirty boundaries, each processed,
+         * rather than as one jump to the newest candle with twenty-nine of them
+         * silently discarded.
+         */
+        this.clock.advanceTo(next);
+        await this.step();
+
+        if (this.adaptiveHoldMs > 0) {
+          await this.hold(epoch, this.adaptiveHoldMs);
+          this.adaptiveHoldMs = 0;
+          break;
+        }
+      }
+
+      this.emit();
+      /*
+       * A yield, so a browser can paint between passes. Without it a fast replay
+       * holds the main thread for as long as the window takes, and the surface
+       * looks frozen at exactly the moment the user is watching the clock move.
+       */
+      await this.yieldToHost();
+    }
+  }
+
+  /** Real-time breathing room for a moment worth watching. */
+  private async hold(epoch: number, ms: number): Promise<void> {
+    if (ms <= 0) return;
+    const until = Date.now() + ms;
+    while (Date.now() < until && this.epoch === epoch && this.currentState === 'RUNNING') {
+      await sleep(Math.min(60, until - Date.now()));
+    }
+  }
+
+  private async yieldToHost(): Promise<void> {
+    await sleep(0);
   }
 
   /** Hold the simulation where it is. The GOAT keeps whatever it believes. */
@@ -657,13 +938,29 @@ export class BacktestSession {
    * is over. Anything the GOAT was holding is stated as held, and the report is
    * final — because a "stopped" run whose numbers kept moving would be
    * unreadable.
+   *
+   * The epoch moves first, before anything is settled or reported, and the
+   * agent's own execution authority is revoked with it. A model request that is
+   * still outstanding at this instant therefore cannot resolve into a trade: the
+   * loop has already left, the wait it was inside has been released, and any
+   * cycle it was driving fails closed at its execution boundary. That ordering is
+   * the whole difference between "stopped" and "stopped, probably".
    */
   async stop(reason = 'Stopped by the operator.'): Promise<BacktestReport> {
+    this.epoch += 1;
     this.clock.stop();
+    if (this.agentId) {
+      /*
+       * Revokes the agent's execution generation, so an in-flight cycle cannot
+       * reach the simulated book after the run it belonged to has ended.
+       */
+      await this.agentRuntime.stop(this.agentId).catch(() => undefined);
+    }
     this.record('BACKTEST_STOPPED', { reason, ...this.elapsedFields() });
     await this.environment?.finalize();
     this.reportClosedTrades();
     this.report = await this.buildReport('STOPPED', reason);
+    this.recordReplaySummary();
     this.setState('STOPPED', reason);
     this.emit();
     return this.report;
@@ -672,31 +969,53 @@ export class BacktestSession {
   /**
    * Begin again from the same instant.
    *
-   * A true restart rather than a rewind: the clock is rebuilt, the stores are
-   * rebuilt, and the agent is redeployed with no memory of the previous run.
-   * Resuming a finished GOAT with its old thesis would not be a replay of
-   * anything — it would be the first run's conclusions, applied to the same
-   * candles, which is the exact thing a replay must never do.
+   * A true restart rather than a rewind, and the difference is the whole point.
+   *
+   * The previous version cleared some fields and called `start()` again, which
+   * left the clock object, the stores, the agent runtime and the tracker runtime
+   * exactly as the finished run had left them: the clock carried its accumulated
+   * elapsed time, the agent runtime its generation counter, memory and audit
+   * trail, and the tracker runtime its cooldowns and "already reported" state.
+   * The replay that resulted was the first run's conclusions applied to the same
+   * candles, which is the one thing a replay must never be.
+   *
+   * So the world is rebuilt rather than emptied. Same GOAT, same objective, same
+   * historical window, and no memory of having been here before.
    */
   async restart(): Promise<void> {
+    this.epoch += 1;
     this.clock.stop();
+    this.teardownWorld();
     this.environment = undefined;
     this.orchestrator = undefined;
     this.goal = undefined;
     this.agentId = undefined;
     this.report = undefined;
     this.starting = undefined;
+    this.loop = undefined;
+    this.loopEpoch = this.epoch;
     this.currentState = 'IDLE';
-    this.reportedTrades.clear();
-    this.executedPlans.clear();
+    this.lastMessage = undefined;
+    this.reportedTrades = new Set<string>();
+    this.executedPlans = new Set<string>();
     this.lastTickPrice = undefined;
-    this.trackers.dispose();
+    this.wakeInFlight = 0;
+    this.adaptiveHoldMs = 0;
+    this.deliveredBarsByTimeframe = new Map<string, Set<number>>();
+    this.storyCache = undefined;
+    this.buildWorld();
     await this.start();
   }
 
   setSpeed(speed: SimulationSpeed): void {
     if (!isSimulationSpeed(speed)) throw new Error(`${String(speed)}x is not a replay speed.`);
     this.clock.setSpeed(speed);
+    /*
+     * Speed is how many bars a pass consumes, not how far the clock jumps. The
+     * two are equal for one-minute data and diverge for coarser datasets, where a
+     * "60×" pass of 5m bars would otherwise be 300 minutes of market per frame.
+     */
+    this.barBudget = speed;
     this.emit();
   }
 
@@ -705,31 +1024,11 @@ export class BacktestSession {
   // -------------------------------------------------------------------------
 
   /**
-   * One simulated step.
-   *
-   * The order is the argument of the whole file:
-   *
-   *   1. open positions settle against the candle that just closed
-   *   2. trackers evaluate against it
-   *   3. whatever woke is allowed to finish, including its model call
-   *   4. a risk-validated plan may be executed against the simulated book
-   *
-   * Step 3 before step 4 and before the next tick is the difference between a
-   * replay and a race: an agent reasoning about 10:43 while the simulation is
-   * already at 10:47 is reasoning about a market that no longer exists.
-   */
-  private async tick(now: number): Promise<void> {
-    if (this.currentState !== 'RUNNING') return;
-    void now;
-    await this.step();
-  }
-
-  /**
    * One replay step: the whole pipeline, at the clock's current instant.
    *
-   * Split out from the timer so that a caller can advance the simulation itself
+   * Split out from the loop so that a caller can advance the simulation itself
    * and get exactly the same behaviour — one base bar at a time, with the agent
-   * allowed to finish between them. The timer and a hand-driven replay share this
+   * allowed to finish between them. The loop and a hand-driven replay share this
    * method, which is why a test can prove the ordering the browser will use.
    */
   private async step(): Promise<void> {
@@ -738,6 +1037,8 @@ export class BacktestSession {
     if (this.currentState === 'COMPLETED' || this.currentState === 'STOPPED' || this.currentState === 'ERROR') {
       return;
     }
+    const epoch = this.epoch;
+
 
     /*
      * Orders settle before positions, and both before the trackers hear about the
@@ -760,7 +1061,6 @@ export class BacktestSession {
     this.tradeEngine.settle();
 
     if (environment.exhausted) {
-      this.clock.stop();
       await this.complete();
       return;
     }
@@ -770,8 +1070,16 @@ export class BacktestSession {
     if (bar) this.recordTick(bar.close, now);
 
     await this.deliverToTrackers(now);
-    await this.settle();
-    await this.executeApprovedPlan();
+    await this.settle(epoch);
+
+    /*
+     * A run that ended while the GOAT was deciding must not act on what it
+     * decided. The wait above returns early on a changed epoch, so this is the
+     * place that turns "the user pressed stop" into "the plan is not executed".
+     */
+    if (this.epoch !== epoch) return;
+
+    await this.executeApprovedPlan(epoch);
     this.reportClosedTrades();
     this.emit();
   }
@@ -779,28 +1087,48 @@ export class BacktestSession {
   /**
    * Move the simulation forward by a simulated duration, without a timer.
    *
-   * The same mechanism the interval drives, one base bar at a time, so nothing
-   * is skipped: a 30-minute advance settles positions and delivers thirty
-   * candles' worth of tracker evaluations rather than jumping to the last one.
-   * Used by the tests to replay a whole session in milliseconds, and available
-   * to a surface that wants to move the market on demand.
+   * The same mechanism the loop drives, one base bar at a time, so nothing is
+   * skipped: a 30-minute advance settles positions and delivers thirty minutes of
+   * tracker evaluations rather than jumping to the last one. Used by the tests to
+   * replay a whole session in milliseconds, and available to a surface that wants
+   * to move the market on demand.
    */
   async advance(simulatedMs: number): Promise<void> {
     await this.start();
-    if (this.clock.running) {
-      throw new Error('The simulation clock is already being driven by its timer; pause it first.');
+    if (this.loop) {
+      throw new Error('The simulation clock is already being driven by its replay loop; pause it first.');
     }
     if (this.currentState === 'COMPLETED' || this.currentState === 'STOPPED') return;
 
     const wasRunning = this.currentState === 'RUNNING';
     this.setState('RUNNING');
-    let remaining = Math.max(0, simulatedMs);
-    while (remaining > 0 && this.currentState === 'RUNNING') {
-      const chunk = Math.min(60_000, remaining);
-      this.clock.advanceBy(chunk);
-      remaining -= chunk;
+    const deadline = this.clock.now() + Math.max(0, simulatedMs);
+
+    while (this.clock.now() < deadline) {
+      const environment = this.environment;
+      if (!environment) break;
+      if (environment.exhausted) {
+        this.clock.stop();
+        await this.complete();
+        return;
+      }
+
+      const next = environment.nextBarClose();
+
+      if (next === undefined || next > deadline) {
+        /*
+         * A partial final bar is not replayed. Half a candle is a forecast, and
+         * the environment will not reveal one, so the advance stops at the last
+         * complete boundary rather than pretending the remainder happened.
+         */
+        if (next !== undefined) this.clock.advanceTo(next);
+        break;
+      }
+
+      this.clock.advanceTo(next);
       await this.step();
     }
+
     if (this.currentState === 'RUNNING' && !wasRunning) this.setState('PAUSED');
   }
 
@@ -864,6 +1192,20 @@ export class BacktestSession {
        * armed, correct, and never fires.
        */
       const closed = newest.time * 1000;
+      /*
+       * Every base bar is delivered exactly once, and the record of it is kept so
+       * "no bar was skipped" is something a test can assert rather than infer.
+       *
+       * The old loop advanced the clock by a duration and delivered only the
+       * newest visible bar, so at high speed several bars became visible between
+       * two deliveries and the intermediate ones were never evaluated by
+       * anything — the candles existed, the agent could have read them, and no
+       * condition was ever tested against them.
+       */
+      const delivered = this.deliveredBarsByTimeframe.get(timeframe) ?? new Set<number>();
+      delivered.add(closed);
+      this.deliveredBarsByTimeframe.set(timeframe, delivered);
+
       const input: TrackerInput = {
         // The id names the delivery, so the same candle is never evaluated
         // twice for the same tracker however many times the clock ticks.
@@ -900,16 +1242,26 @@ export class BacktestSession {
    * Bounded, and reported when the bound is hit. A replay that silently pushed
    * on would let the agent answer a question about a market it had already
    * left, which is the subtlest way a backtest can flatter a strategy.
+   *
+   * The bound is real time, and the simulated clock is not moving while this
+   * waits — that is the promise the surface makes in as many words. Three things
+   * end the wait early: the agent finishing, the epoch moving (the user stopped,
+   * or a restart replaced the world), and the budget running out. A late answer
+   * after the first two is refused downstream by the epoch check in `step` and by
+   * the agent runtime's own execution generation, so the timeout cannot become a
+   * race with the historical clock.
    */
-  private async settle(): Promise<void> {
+  private async settle(epoch: number): Promise<void> {
     const deadline = Date.now() + BACKTEST_WAKE_TIMEOUT_MS;
     while (Date.now() < deadline) {
+      if (this.epoch !== epoch) return;
       const waitingOnModel = this.agentId
         ? this.orchestrator?.pendingModelRequest(this.agentId) !== undefined
         : false;
       if (this.wakeInFlight === 0 && !waitingOnModel) return;
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await sleep(10);
     }
+    if (this.epoch !== epoch) return;
     this.record('ERROR', {
       message: 'The agent did not finish reacting to a simulated event within the replay budget.',
     });
@@ -923,8 +1275,9 @@ export class BacktestSession {
    * and neither is recalculated here. The plan's own invalidation becomes the
    * stop, because that is what it is: the price at which the thesis is wrong.
    */
-  private async executeApprovedPlan(): Promise<void> {
+  private async executeApprovedPlan(epoch: number): Promise<void> {
     if (!this.agentId || !this.goal || !this.environment || !this.orchestrator) return;
+    if (this.epoch !== epoch) return;
     const mission = this.orchestrator.mission(this.goal.id);
     const plan = mission?.tradePlan;
     if (!plan || plan.status !== 'READY') return;
@@ -961,6 +1314,15 @@ export class BacktestSession {
       simulated: true,
     });
     this.orchestrator.applyExecution(plan.id, { status: 'EXECUTING', reason: 'A limit order is resting.' });
+    /*
+     * Something just happened that a reader wants to see.
+     *
+     * The loop slows to a single bar for a moment after an order is placed, so
+     * the replay reads as a GOAT acting rather than as a clock spinning past a
+     * decision. The pacing is derived from the event stream, never from a timer,
+     * so a run with nothing happening in it is never slowed down.
+     */
+    this.adaptiveHoldMs = Math.max(this.adaptiveHoldMs, REPLAY_HOLD_ON_ORDER_MS);
   }
 
   /**
@@ -970,16 +1332,24 @@ export class BacktestSession {
    * trades close: a size computed against the opening balance would silently
    * exceed the strategy's risk budget by the time the fourth trade was placed.
    *
+   * It used to hand the engine `this.initialBalance` — the balance the account
+   * opened with, not the balance it had — so every trade in a replay was sized as
+   * though the run had made nothing and lost nothing. A GOAT that doubled its
+   * account and then risked 1% was risking 1% of the original deposit, and a run
+   * that lost half its equity went on trading as though it were flush. Sizing now
+   * reads the live simulated account: equity after unrealised P&L, which is the
+   * number the risk limits are written against everywhere else in the product.
+   *
    * `valuePerUnit` is 1 by default, which is right for instruments quoted in the
    * account's own currency and wrong for ones that are not. It is a known
    * approximation of the sizing layer rather than a claim of accuracy, and the
    * orchestrator's own `risk.calculatePositionSize` capability remains the
    * authority for anything that reaches a live venue.
    */
-  private tradeContext(): TradeContext {
+  tradeContext(): TradeContext {
     const environment = this.environment;
     const bar = environment?.currentBar();
-    const equity = this.initialBalance;
+    const account = environment?.accountSnapshot();
     /*
      * The deployment's own risk policy, read through the live agent rather than a
      * field on the session — the policy is the agent's, and duplicating it here
@@ -991,7 +1361,7 @@ export class BacktestSession {
       symbol: this.market,
       currentPrice: bar?.close ?? 0,
       maxRiskFractionOfEquity: maxRiskPerTrade,
-      equity,
+      equity: account?.equity ?? this.initialBalance,
       valuePerUnit: 1,
       mayExecute: this.orchestrator?.mission(this.goal?.id ?? '')?.mayExecute ?? false,
       // One position at a time.
@@ -1026,9 +1396,11 @@ export class BacktestSession {
         return;
       case 'FILLED':
         this.record('ORDER_FILLED', shared);
+        this.adaptiveHoldMs = Math.max(this.adaptiveHoldMs, REPLAY_HOLD_ON_FILL_MS);
         return;
       case 'RUNNING':
         this.record('POSITION_OPENED', shared);
+        this.adaptiveHoldMs = Math.max(this.adaptiveHoldMs, REPLAY_HOLD_ON_FILL_MS);
         return;
       case 'EXPIRED':
         this.record('ORDER_EXPIRED', shared);
@@ -1043,6 +1415,13 @@ export class BacktestSession {
       case 'STOPPED_OUT':
       case 'EXITED':
         this.record('TRADE_CLOSED', { ...shared, ...(transition.pnl !== undefined ? { pnl: transition.pnl } : {}) });
+        /*
+         * A closed trade is the loudest moment in a replay, so it gets the
+         * longest beat of anything here. A target hit at 400 simulated miles per
+         * minute is the same event as one at 5×, and only one of them can be
+         * watched.
+         */
+        this.adaptiveHoldMs = Math.max(this.adaptiveHoldMs, REPLAY_HOLD_ON_OUTCOME_MS);
         return;
       default:
         return;
@@ -1098,6 +1477,7 @@ export class BacktestSession {
   }
 
   private async complete(): Promise<BacktestReport> {
+    this.epoch += 1;
     this.clock.stop();
     await this.environment?.finalize();
     this.reportClosedTrades();
@@ -1108,9 +1488,32 @@ export class BacktestSession {
       netPnl: this.report.performance.netPnl,
       modelCalls: this.report.behaviour.modelCalls,
     });
+    this.recordReplaySummary();
     this.setState('COMPLETED', this.report.message);
     this.emit();
     return this.report;
+  }
+
+  /**
+   * File this run's summary, so the next one can be compared against it.
+   *
+   * Best effort and never awaited into the critical path: a replay that finished
+   * has finished, and a failure to write its own history is not a reason to
+   * report the run as failed.
+   */
+  private recordReplaySummary(): void {
+    if (!this.report) return;
+    recordReplaySummary({
+      market: this.market,
+      goal: this.request.goal,
+      ...(this.request.name?.trim() ? { name: this.request.name.trim() } : {}),
+      start: this.replayStart,
+      end: this.end,
+      simulatedMs: Math.max(0, this.clock.now() - this.replayStart),
+      outcome: this.report.outcome,
+      performance: this.report.performance,
+      behaviour: this.report.behaviour,
+    });
   }
 
   private async buildReport(
@@ -1192,6 +1595,83 @@ export class BacktestSession {
   /** The agent log, from the same projection the live workspace renders. */
   agentLog(limit = 200) {
     return this.goal && this.orchestrator ? this.orchestrator.agentLog(this.goal.id, limit) : [];
+  }
+
+  /**
+   * The replay as a story.
+   *
+   * One call rather than six, because a surface that assembles the semantic view
+   * from six separate reads can show a state, a moment list and a verdict taken
+   * from three different instants — which is how a replay ends up saying "WATCHING"
+   * above a moment list whose newest entry is a fill.
+   *
+   * Memoised on the shape of the run rather than on a clock, because the surface
+   * asks for this several times a second and the derivation walks the whole log.
+   * Any change to the log's length, the trade book, or the lifecycle invalidates
+   * it; a quiet run re-derives nothing.
+   */
+  story(): BacktestStory {
+    const snapshot = this.snapshot();
+    const trades = snapshot.trades ?? [];
+    const openPositions = this.environment?.openPositions().length ?? 0;
+    const restingOrders = this.environment?.restingOrders().length ?? 0;
+    const events = this.events();
+    const signature = [
+      snapshot.state,
+      events.length,
+      trades.length,
+      openPositions,
+      restingOrders,
+      snapshot.agentBusy ? 1 : 0,
+      snapshot.mission?.tradePlan?.status ?? '-',
+      snapshot.mission?.thesis?.id ?? '-',
+      this.report?.outcome ?? '-',
+    ].join('|');
+
+    if (this.storyCache?.signature === signature) return this.storyCache.story;
+
+    const nearMisses = deriveNearMisses(
+      this.environment?.orderHistory() ?? [],
+      (order) => this.environment?.nearestApproach(order),
+      { pricePrecision: 5 },
+    );
+
+    const lastOutcome = lastTradeOutcome(this.environment?.simulatedTrades() ?? []);
+
+    const state = deriveGoatState({
+      state: snapshot.state,
+      ...(snapshot.agentBusy !== undefined ? { agentBusy: snapshot.agentBusy } : {}),
+      ...(snapshot.tradePhase ? { tradePhase: snapshot.tradePhase } : {}),
+      ...(snapshot.mission?.tradePlan ? { hasPlan: true } : {}),
+      openPositions,
+      restingOrders,
+      ...(lastOutcome ? { lastOutcome } : {}),
+      thesisCount: snapshot.mission?.thesisCount ?? (snapshot.mission?.thesis ? 1 : 0),
+      ...(snapshot.mission ? { invalidatedTheses: 0 } : {}),
+      ...(snapshot.progress !== undefined ? { progress: snapshot.progress } : {}),
+    });
+
+    const story: BacktestStory = {
+      state,
+      animated: isAnimatedState(state),
+      moments: deriveKeyMoments(events, nearMisses),
+      nearMisses,
+      score: deriveBehaviourScore({
+        behaviour: this.report?.behaviour ?? emptyBehaviour(),
+        performance: this.report?.performance ?? emptyPerformance(this.initialBalance),
+      }),
+    };
+
+    if (this.report) {
+      story.verdict = deriveVerdict({
+        behaviour: this.report.behaviour,
+        performance: this.report.performance,
+        nearMisses: nearMisses.length,
+      });
+    }
+
+    this.storyCache = { signature, story };
+    return story;
   }
 
   /** Observe state changes. Returns an unsubscribe function. */
@@ -1295,6 +1775,118 @@ export class BacktestSession {
     return this.environment;
   }
 
+  /**
+   * The simulated account, right now.
+   *
+   * Read by the results and decision-review surfaces so that the balance a
+   * reader is shown is the account the simulation actually holds — including
+   * unrealised P&L and the commissions already paid — rather than the deposit it
+   * started with.
+   */
+  account(): ReturnType<SimulationEnvironment['accountSnapshot']> | undefined {
+    return this.environment?.accountSnapshot();
+  }
+
+  /**
+   * How many distinct bars have been handed to the trackers at this resolution.
+   *
+   * Exists to make "no intermediate bar is skipped" checkable from outside. A
+   * replay that dropped candles between steps would still consume them — the
+   * cursor would move — so the count is the only thing that distinguishes a
+   * replay which *processed* every bar from one that merely skipped past them.
+   */
+  deliveredBars(timeframe: string): number {
+    return this.deliveredBarsByTimeframe.get(timeframe)?.size ?? 0;
+  }
+
+  /** The newest instant any delivery has carried, for boundary assertions. */
+  lastDeliveredInstant(timeframe: string): number | undefined {
+    const delivered = this.deliveredBarsByTimeframe.get(timeframe);
+    if (!delivered || delivered.size === 0) return undefined;
+    return Math.max(...delivered);
+  }
+
+  /** Resting orders the simulated book holds, for near-miss reporting. */
+  orderHistory() {
+    return this.environment?.orderHistory() ?? [];
+  }
+
+  /**
+   * What the GOAT knew when it decided this trade.
+   *
+   * Assembled from the record rather than reconstructed: the thesis that was live
+   * at the time, the resolutions that had been read, the plan's own numbers, the
+   * risk layer's verdict, and the account as it stood. All of it is already on the
+   * timeline, which is what makes it safe to show — there is no second source and
+   * nothing here is generated for display.
+   *
+   * What it deliberately does not contain is the model's private deliberation. The
+   * activity projection never recorded it, so there is nothing to expose even in
+   * principle: this is the inputs and the decision, not the thinking.
+   */
+  decisionReview(planId: string): DecisionReview | undefined {
+    const events = this.events();
+    const upTo = events.findIndex(
+      (event) => record(event).planId === planId || record(event).tradeId === planId,
+    );
+    if (upTo < 0) return undefined;
+
+    const before = events.slice(0, upTo + 1);
+    const withPlanId = before.filter((event) => record(event).planId === planId);
+
+    const thesis = [...before].reverse().find((event) => event.type === 'THESIS_FORMED' || event.type === 'THESIS_REVISED');
+    const context = [...before].reverse().find((event) => event.type === 'MARKET_CONTEXT_PREPARED');
+    const risk = withPlanId.find((event) => event.type === 'TRADE_PLAN_RISK_CHECKED' || event.type === 'TRADE_PLAN_REJECTED');
+    const order = withPlanId.find((event) => event.type === 'ORDER_PLACED');
+    const fill = withPlanId.find((event) => event.type === 'ORDER_FILLED');
+    const closed = withPlanId.find((event) => event.type === 'TRADE_CLOSED');
+
+    const orderRecord = order ? record(order) : {};
+    const thesisRecord = thesis ? record(thesis) : {};
+    const riskRecord = risk ? record(risk) : {};
+    const contextRecord = context ? record(context) : {};
+
+    const side = textField(orderRecord.side);
+    const entry = numberField(orderRecord.entry);
+    const stop = numberField(orderRecord.stop);
+    const target = numberField(orderRecord.target);
+
+    return {
+      planId,
+      at: order?.timestamp ?? risk?.timestamp ?? before[before.length - 1]?.timestamp ?? this.clock.now(),
+      knew: {
+        thesis: textField(thesisRecord.statement) ?? textField(thesisRecord.reason),
+        invalidation: textField(thesisRecord.invalidation),
+        resolutions: Array.isArray(contextRecord.timeframes)
+          ? contextRecord.timeframes.filter((item): item is string => typeof item === 'string')
+          : undefined,
+        account: {
+          equity: this.account()?.equity,
+          openPositions: this.account()?.openPositions ?? 0,
+          riskPerTrade: this.agentId
+            ? this.agentRuntime.getAgent(this.agentId)?.agent.policy.maxRiskPerTrade
+            : undefined,
+        },
+      },
+      decision: {
+        ...(side ? { side } : {}),
+        ...(entry !== undefined ? { entry } : {}),
+        ...(stop !== undefined ? { stopLoss: stop } : {}),
+        ...(target !== undefined ? { takeProfit: target } : {}),
+        reason: textField(orderRecord.reason) ?? textField(riskRecord.reason),
+      },
+      risk: {
+        verdict: textField(riskRecord.status) ?? (riskRecord.approved === true ? 'PASSED' : undefined),
+        reason: textField(riskRecord.reason),
+      },
+      outcome: {
+        filledAt: fill ? record(fill).price as number | undefined : undefined,
+        closedAt: closed?.timestamp,
+        pnl: closed ? numberField(record(closed).pnl) : undefined,
+      },
+    };
+  }
+
   /** The historical clock. */
   get simulatedClock(): SimulationClock {
     return this.clock;
@@ -1334,4 +1926,78 @@ export class BacktestSession {
       }
     }
   }
+}
+
+/**
+ * The exit reason of the most recent closed trade.
+ *
+ * Used to name the loudest moment in a replay — a target and a stop are the same
+ * event to the engine and completely different things to read about.
+ */
+function lastTradeOutcome(
+  trades: Trade[],
+): 'TAKE_PROFIT' | 'STOP_LOSS' | 'EXITED' | undefined {
+  for (let index = trades.length - 1; index >= 0; index -= 1) {
+    const reason = trades[index]?.exitReason;
+    if (reason === 'TAKE_PROFIT' || reason === 'STOP_LOSS') return reason;
+    if (reason === 'MANUAL') return 'EXITED';
+  }
+  return undefined;
+}
+
+/**
+ * Placeholders for a run that has not finished.
+ *
+ * Zeroes, and *labelled* zeroes — every dimension derived from these renders as
+ * absent rather than as a score of zero, which is the difference between "we do
+ * not know" and "it did nothing well".
+ */
+function emptyBehaviour() {
+  return {
+    hypothesesFormed: 0,
+    hypothesesRevised: 0,
+    hypothesesInvalidated: 0,
+    trackersCreated: 0,
+    trackersFired: 0,
+    plansCreated: 0,
+    plansRejectedByRisk: 0,
+    wakes: 0,
+    waits: 0,
+    modelCalls: 0,
+    modelFailures: 0,
+    modelLatencyMs: 0,
+    simulatedMinutes: 0,
+    longestSilenceMinutes: 0,
+    /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
+  } as unknown as BacktestReport['behaviour'];
+}
+
+function emptyPerformance(initialBalance: number) {
+  return {
+    trades: 0,
+    wins: 0,
+    losses: 0,
+    netPnl: 0,
+    netR: undefined,
+    winRatePercent: 0,
+    endingEquity: initialBalance,
+    maxDrawdown: 0,
+    maxDrawdownPercent: 0,
+    averageWin: 0,
+    averageLoss: 0,
+  };
+}
+
+function record(event: AgentTimelineEvent): Record<string, unknown> {
+  return typeof event.data === 'object' && event.data !== null && !Array.isArray(event.data)
+    ? (event.data as Record<string, unknown>)
+    : {};
+}
+
+function textField(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function numberField(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }

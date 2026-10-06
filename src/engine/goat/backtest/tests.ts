@@ -38,12 +38,23 @@ import type { Bar } from '../../../types/trading';
 
 import { GoatOrchestrator, createGoatStores } from '../orchestrator';
 import { BacktestSession } from './session';
+import type { BacktestReport } from './results';
 import { SimulationClock } from './clock';
 import { SimulationEnvironment, latestAtOrBefore, timeframeSeconds } from './simulationEnvironment';
 import {
   resolveTimeframePlan,
   timeframesInStatement,
 } from '../timeframes';
+import {
+  HISTORICAL_PRESETS,
+  windowForPresetRequest,
+} from './window';
+import {
+  deriveBehaviourScore,
+  deriveGoatState,
+  deriveKeyMoments,
+  deriveNearMisses,
+} from './story';
 
 // ---------------------------------------------------------------------------
 // Assertions
@@ -1219,8 +1230,472 @@ test('acquisition: the replay holds the clock while the GOAT decides', async () 
 });
 
 // ---------------------------------------------------------------------------
-// Runner
+// 11. The replay loop itself
+//
+// These are the properties of the *loop*, not of the boundary: that it cannot
+// overlap itself, that it holds historical time while the GOAT decides, that a
+// fast pass processes every bar rather than skipping to the newest, that a
+// restart is a new run, and that a model answer arriving too late changes
+// nothing. Each of them was a live defect.
 // ---------------------------------------------------------------------------
+
+/**
+ * A model that answers the setup immediately and then holds its wake answer.
+ *
+ * The gate has to be on the wake specifically: the setup answers are what make
+ * the replay arm a watch in the first place, and a test that held the
+ * investigation would only prove the old "loading holds" behaviour.
+ */
+class WakeGatedModel extends ScriptedBacktestModel {
+  entered = 0;
+  /** Highest number of `run` calls alive at the same time. The overlap detector. */
+  concurrent = 0;
+  maxConcurrent = 0;
+  /** Simulated instants the model was asked about. */
+  readonly seenInstants: number[] = [];
+  private release?: () => void;
+  private held?: Promise<void>;
+  private heldNow?: () => void;
+
+  async run(request: {
+    contract?: string;
+    instructions: string;
+    wakeReason?: string;
+    observation?: { timestamp?: number };
+  }) {
+    this.concurrent += 1;
+    this.maxConcurrent = Math.max(this.maxConcurrent, this.concurrent);
+    try {
+      if (typeof request.observation?.timestamp === 'number') {
+        this.seenInstants.push(request.observation.timestamp);
+      }
+      if (request.contract === 'PLAN') {
+        this.entered += 1;
+        if (!this.held) {
+          this.held = new Promise<void>((resolve) => {
+            this.heldNow = resolve;
+          });
+          await this.held;
+        }
+      }
+      return await super.run(request);
+    } finally {
+      this.concurrent -= 1;
+    }
+  }
+
+  letGo(): void {
+    this.heldNow?.();
+    this.held = undefined;
+  }
+}
+
+test('loop: the replay cannot overlap itself, and historical time holds while the GOAT decides', async () => {
+  /*
+   * The contract: advance time, process a bar, wait for the GOAT, execute,
+   * settle, and only then advance again.
+   *
+   * The previous loop armed an interval that fired every 250ms and did not wait
+   * for the tick it had started, so while a model thought for four seconds the
+   * clock ran sixteen simulated minutes past it and sixteen `step()`s ran
+   * concurrently against one world. Two things are asserted here: that no two
+   * cycles are ever alive at once, and that the simulated instant does not move
+   * by a single millisecond while a request is outstanding.
+   */
+  const { session } = await makeSession({ dataset: makeDataset({ count: 1_200 }) });
+  const model = new WakeGatedModel();
+  const replay = new BacktestSession({
+    goal: 'Watch USD/JPY and act when the evidence supports one.',
+    market: 'USD/JPY',
+    timeframe: '15m',
+    timeframes: ['1m'],
+    start: session.snapshot().now,
+    end: session.snapshot().now + 4 * 60 * 60 * 1000,
+    bars: makeDataset({ count: 1_200 }),
+    model,
+    speed: 60,
+    costModel: { initialBalance: 10_000, spreadPrice: 0.001, pipSize: 0.01 },
+  });
+
+  await replay.start();
+  replay.goat!.loop.reviseThesis(replay.snapshot().mission!.thesis!.id, { state: 'ACTIONABLE' });
+  replay.setSpeed(60);
+  void replay.play();
+
+  // Wait until a wake is genuinely in flight and the model is holding its answer.
+  const deadline = Date.now() + 20_000;
+  while (model.entered === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert(model.entered > 0, 'a watch fired and the GOAT was asked for its answer');
+
+  const heldAt = replay.simulatedClock.now();
+  const barsAt = replay.simulation.barsConsumed();
+  await new Promise((resolve) => setTimeout(resolve, 250));
+
+  assertEqual(replay.simulatedClock.now(), heldAt, 'the simulated clock does not move during a decision');
+  assertEqual(replay.simulation.barsConsumed(), barsAt, 'and no new candle becomes visible while it waits');
+  assert(
+    replay.simulation.horizon() <= replay.simulatedClock.now(),
+    'the data boundary held throughout the wait',
+  );
+
+  model.letGo();
+  await new Promise((resolve) => setTimeout(resolve, 400));
+
+  assertEqual(model.maxConcurrent, 1, 'two replay steps were never alive at once');
+  await replay.stop('test finished');
+});
+
+test('loop: a fast pass processes every bar rather than skipping to the newest', async () => {
+  /*
+   * Speed is a budget of bars per pass, not a jump in the clock.
+   *
+   * At 60× over one-minute data the loop advances sixty boundaries per pass and
+   * processes each one. The old implementation advanced by `250ms × speed` and
+   * delivered only the newest visible bar, so a pass that covered several
+   * minutes evaluated conditions against the last candle and silently discarded
+   * the ones in between — the candles existed and the agent could have read
+   * them, but nothing was ever tested against them.
+   */
+  const bars = makeDataset({ count: 1_200 });
+  const startSeconds = bars[400].time;
+  // A scalper's answer, because it arms its watches at 1m — a 15m watch would
+  // only ever be delivered once per fifteen bars and would prove nothing about
+  // per-bar processing.
+  const session = new BacktestSession({
+    goal: 'Scalp USD/JPY on 1m and 5m while the higher timeframe stays neutral.',
+    market: 'USD/JPY',
+    timeframe: '1m',
+    timeframes: ['1m', '5m'],
+    model: new ScalpModel(),
+    start: startSeconds * 1000,
+    end: (bars[800].time + 60) * 1000,
+    bars,
+    speed: 60,
+    costModel: { initialBalance: 10_000, spreadPrice: 0.001, pipSize: 0.01 },
+  });
+
+  await session.start();
+  session.goat!.loop.reviseThesis(session.snapshot().mission!.thesis!.id, { state: 'ACTIONABLE' });
+  await session.advance(30 * 60_000);
+
+  const expectedBars = 30;
+  assert(
+    session.deliveredBars('1m') >= expectedBars,
+    `every 1m bar in the window was delivered to the trackers (${session.deliveredBars('1m')} delivered)`,
+  );
+  assert(
+    session.lastDeliveredInstant('1m')! <= session.simulatedClock.now(),
+    'no delivery carried an instant the simulation had not reached',
+  );
+  assertEqual(
+    session.simulatedClock.now(),
+    (startSeconds + expectedBars * 60) * 1000,
+    'and the clock landed exactly on the last bar boundary rather than past it',
+  );
+});
+
+test('restart: a restarted replay is a new run, not the old one resumed', async () => {
+  /*
+   * A restart has to be indistinguishable from a first run.
+   *
+   * The previous restart nulled a handful of fields and called `start()` again,
+   * keeping the clock object (and its accumulated elapsed time), the agent
+   * runtime (and its generation counter, memory and audit trail) and the tracker
+   * runtime (and its cooldowns and "already reported" state). The replay that
+   * resulted carried the first run's conclusions into the same candles, which is
+   * the one thing a replay must never be.
+   */
+  const bars = makeDataset({ count: 1_500 });
+  const session = new BacktestSession({
+    goal: 'Scalp USD/JPY on 1m and 5m while the higher timeframe stays neutral.',
+    market: 'USD/JPY',
+    timeframe: '1m',
+    timeframes: ['1m', '5m'],
+    start: bars[500].time * 1000,
+    end: bars[bars.length - 1].time * 1000,
+    bars,
+    model: new ScalpModel(),
+    speed: 1,
+    costModel: { initialBalance: 10_000, spreadPrice: 0.001, pipSize: 0.01 },
+  });
+  await session.start();
+  await session.advance(45 * 60_000);
+
+  const midRun = session.snapshot();
+  assert(midRun.simulatedMinutes > 0, 'the first run actually moved through history');
+  assert(session.agentLog(500).length > 0, 'and wrote a log worth replacing');
+  const deliveredBefore = session.deliveredBars('1m');
+  assert(deliveredBefore > 0, 'and really did deliver candles to its own watches');
+
+  await session.restart();
+
+  const fresh = session.snapshot();
+  assertEqual(session.simulatedClock.elapsed, 0, 'the clock is back at the start of the window');
+  assertEqual(session.simulatedClock.now(), session.replayStart, 'and reads the original instant again');
+  assertEqual(fresh.state, 'READY', 'the replay is ready to run again');
+  assertEqual(fresh.report, undefined, 'no report is carried over from the previous run');
+  assertEqual(fresh.trades?.length ?? 0, 0, 'no trades are carried over');
+  assertEqual(session.deliveredBars('1m'), 0, 'and not one of those deliveries is carried over');
+  assertEqual(session.orderHistory().length, 0, 'no order is carried over');
+  assertEqual(session.simulation.openPositions().length, 0, 'no position is carried over');
+  assertEqual(session.simulation.simulatedTrades().length, 0, 'no trade is carried over');
+  assertEqual(session.account()?.equity, 10_000, 'the account is the deposit again');
+  assertEqual(
+    session.simulatedClock.speed,
+    1,
+    'and the speed is the requested default rather than a carried-over setting',
+  );
+  assert(
+    session.snapshot().mission?.thesis?.id !== undefined,
+    'the GOAT exists again, with a fresh identity of its own',
+  );
+
+  /*
+   * And it can genuinely run again, which is the only way to know the world is
+   * new rather than emptied: a second run that reaches the same simulated instant
+   * must deliver the same bars in the same order.
+   */
+  await session.advance(10 * 60_000);
+  assert(session.deliveredBars('1m') >= 10, 'the replay runs again over the same window');
+});
+
+test('replay: a model answer that arrives after the run ended changes nothing', async () => {
+  /*
+   * A late answer must not act.
+   *
+   * The replay waits for the GOAT, and the wait is bounded at two minutes. A user
+   * who presses STOP inside that window — or a RESTART that replaces the world —
+   * must not find a trade submitted a second later by an answer to a question
+   * about a market that no longer exists. Three independent guards have to hold:
+   * the epoch moves first, the agent's execution generation is revoked, and the
+   * loop checks the epoch before it acts on anything.
+   */
+  const base = await makeSession({ dataset: makeDataset({ count: 1_200 }) });
+  const model = new WakeGatedModel();
+  const session = new BacktestSession({
+    goal: 'Watch USD/JPY and act when the evidence supports one.',
+    market: 'USD/JPY',
+    timeframe: '15m',
+    timeframes: ['1m'],
+    start: base.session.snapshot().now,
+    end: base.session.snapshot().now + 4 * 60 * 60 * 1000,
+    bars: makeDataset({ count: 1_200 }),
+    model,
+    speed: 60,
+    costModel: { initialBalance: 10_000, spreadPrice: 0.001, pipSize: 0.01 },
+  });
+
+  await session.start();
+  session.goat!.loop.reviseThesis(session.snapshot().mission!.thesis!.id, { state: 'ACTIONABLE' });
+  void session.play();
+
+  const deadline = Date.now() + 20_000;
+  while (model.entered === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert(model.entered > 0, 'the wake reached the model');
+
+  await session.stop('The operator stopped the replay mid-decision.');
+  const clockAtStop = session.simulatedClock.now();
+
+  model.letGo();
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  assertEqual(session.snapshot().state, 'STOPPED', 'the run stayed stopped');
+  assertEqual(session.simulatedClock.now(), clockAtStop, 'and the clock stayed where it was left');
+  assertEqual(session.orderHistory().length, 0, 'no order was submitted by the late answer');
+  assertEqual(session.simulation.openPositions().length, 0, 'and no position was opened by it');
+  assert(session.snapshot().report !== undefined, 'the stopped run still produced its report');
+});
+
+test('account: sizing reads the live simulated account, not the opening deposit', async () => {
+  /*
+   * Equity is a moving number and sizing has to move with it.
+   *
+   * The trade context handed the engine `initialBalance` — the deposit — so every
+   * trade in a run was sized as though the account had neither won nor lost. A
+   * GOAT that doubled its account went on risking 1% of the original, and one that
+   * lost half its equity kept trading as though it were flush. This proves the
+   * book moves and the context follows it.
+   */
+  const { session } = await makeSession({ dataset: makeDataset({ count: 1_200 }) });
+  await session.start();
+
+  const opening = session.tradeContext();
+  assertEqual(opening.equity, 10_000, 'the risk context opens on the deposit');
+
+  /*
+   * A winning trade, driven through the simulated book rather than through the
+   * GOAT. The question is what the *context* reports, and the cheapest honest way
+   * to move the account is to take a real simulated profit against it.
+   */
+  const environment = session.simulation;
+  await environment.placeMarketOrder({ symbol: 'USD/JPY', side: 'BUY', volume: 1_000 });
+  const opened = environment.openPositions()[0];
+  assert(opened !== undefined, 'a simulated position was opened');
+
+  await environment.closePosition(opened.id);
+
+  const after = session.tradeContext();
+  const account = session.account();
+
+  assert(after.equity !== 10_000, 'the simulated account is no longer the deposit it opened with');
+  assertEqual(after.equity, account!.equity, 'and the risk context carries that account, not the constant');
+  assert(
+    Math.abs(account!.equity - account!.balance) < 1e-6,
+    'with nothing open, equity is the balance: the balance moved by the spread and commission, and the context followed it',
+  );
+  assertEqual(
+    account!.equity,
+    Math.round(account!.equity * 100) / 100,
+    'and it is the reported account state rather than a re-derived figure',
+  );
+});
+
+
+// ---------------------------------------------------------------------------
+// 12. Choosing a window, and telling the story of what happened
+// ---------------------------------------------------------------------------
+
+test('window: yesterday is a whole day, and a long window does not ask for a month of minutes', () => {
+  /*
+   * The window is the one thing a reader should not have to do arithmetic for, and
+   * the resolution that comes with it is a decision about their browser rather than
+   * about their strategy.
+   */
+  const now = Date.UTC(2026, 2, 18, 14, 37, 12);
+  const yesterday = HISTORICAL_PRESETS.find((preset) => preset.id === 'yesterday')!;
+  const yesterdayWindow = windowForPresetRequest(yesterday, { warmupMinutes: 240, now });
+  assertEqual(
+    yesterdayWindow.end - yesterdayWindow.start,
+    86_400_000,
+    'yesterday is one whole day rather than the last twenty-four hours',
+  );
+  assertEqual(
+    new Date(yesterdayWindow.start).getUTCHours(),
+    0,
+    'and it starts at midnight UTC, the way a day does',
+  );
+  assertEqual(
+    yesterdayWindow.warmupStart,
+    yesterdayWindow.start - 240 * 60_000,
+    'the warm-up is fetched separately and sits before the window',
+  );
+  assertEqual(yesterdayWindow.baseTimeframe, '1m', 'a single day is read at the finest resolution');
+
+  const sixMonths = HISTORICAL_PRESETS.find((preset) => preset.id === 'half')!;
+  const longWindow = windowForPresetRequest(sixMonths, { warmupMinutes: 240, now });
+  assertEqual(longWindow.baseTimeframe, '5m', 'a six-month window is read at 5m rather than half a million bars');
+  assert(/5m/.test(longWindow.baseReason), 'and says why, so the reader is not left guessing at the resolution');
+  assert(new Date(longWindow.end).getTime() <= now, 'no window ever ends in the future');
+});
+
+test('story: the state word is about the agent, not the transport', () => {
+  /*
+   * A reader's question is "what is it doing", and `RUNNING` never answered it. The
+   * order matters as much as the words: an open position outranks a written plan,
+   * which outranks a wake, which outranks thinking.
+   */
+  assertEqual(deriveGoatState({ state: 'LOADING' }), 'BUILDING HISTORICAL WORLD', 'loading says so');
+  assertEqual(deriveGoatState({ state: 'SETTING_UP' }), 'DEPLOYING GOAT', 'and so does deployment');
+  assertEqual(deriveGoatState({ state: 'RUNNING', thesisCount: 0 }), 'INVESTIGATING', 'a GOAT with no thesis is investigating');
+  assertEqual(deriveGoatState({ state: 'RUNNING', thesisCount: 1 }), 'WATCHING', 'one with a thesis is watching');
+  assertEqual(deriveGoatState({ state: 'RUNNING', thesisCount: 1, agentBusy: true }), 'RE-EVALUATING', 'and re-evaluating while it thinks');
+  assertEqual(deriveGoatState({ state: 'RUNNING', thesisCount: 1, hasPlan: true }), 'TRADE PLAN READY', 'a written plan is named as one');
+  assertEqual(deriveGoatState({ state: 'RUNNING', hasPlan: true, restingOrders: 1 }), 'ORDER WAITING', 'a resting order outranks the plan that made it');
+  assertEqual(deriveGoatState({ state: 'RUNNING', openPositions: 1 }), 'POSITION OPEN', 'an open position outranks everything');
+  assertEqual(
+    deriveGoatState({ state: 'RUNNING', openPositions: 1, lastOutcome: 'TAKE_PROFIT' }),
+    'TARGET HIT',
+    'and the loudest moment in a replay is named',
+  );
+  assertEqual(deriveGoatState({ state: 'COMPLETED' }), 'DONE', 'a finished run says so');
+});
+
+test('story: a dimension the log cannot support is absent, not zero', () => {
+  /*
+   * The difference between "we do not know" and "it did nothing well".
+   *
+   * A run that armed no conditions and wrote no plans has no evidence about
+   * selectivity or risk control, and scoring it 0 on both would be a claim about
+   * behaviour that never happened.
+   */
+  const empty = deriveBehaviourScore({ behaviour: emptyBehaviour(), performance: emptyPerformance() });
+  assert(empty.overall === undefined, 'a run with no events has no overall score');
+  assert(
+    empty.lines.every((line) => line.score === undefined),
+    'and no dimension is scored at all',
+  );
+  assert(
+    empty.lines.every((line) => line.basis.length > 0),
+    'every dimension still explains why it cannot be measured',
+  );
+
+  const recorded = deriveBehaviourScore({
+    behaviour: {
+      ...emptyBehaviour(),
+      wakes: 4,
+      waits: 6,
+      trackersCreated: 10,
+      trackersFired: 2,
+      plansCreated: 5,
+      plansRejectedByRisk: 1,
+      hypothesesFormed: 3,
+      hypothesesRevised: 1,
+    },
+    performance: { ...emptyPerformance(), trades: 4 },
+  });
+  assertEqual(recorded.lines.find((line) => line.dimension === 'DISCIPLINE')?.score, 60, 'discipline is the share of wakes it chose to wait through');
+  assertEqual(recorded.lines.find((line) => line.dimension === 'SELECTIVITY')?.score, 80, 'selectivity is the share of armed conditions that never came true');
+  assertEqual(recorded.lines.find((line) => line.dimension === 'RISK CONTROL')?.score, 80, 'risk control is the share of plans the gate allowed');
+  assertEqual(recorded.overall, Math.round((60 + 80 + 80 + 33 + 80) / 5), 'and the overall is the mean of what could be measured');
+});
+
+test('story: a near miss has to be near', () => {
+  /*
+   * "NEAR MISS" is a sentence about patience, and it is only worth printing when
+   * the market actually came to the price. Measured against nothing, every unfilled
+   * order is dramatic; measured against the risk the setup was taking, it is a fact.
+   */
+  const order = {
+    id: 'order-1',
+    side: 'BUY' as const,
+    entryPrice: 157.9,
+    status: 'EXPIRED',
+    placedAt: 1_000,
+    expiresAt: 2_000,
+  };
+
+  const close = deriveNearMisses([order], () => ({ distance: 0.0002, at: 1_500, price: 157.9002 }));
+  assertEqual(close.length, 1, 'an order the market came within a hair of is a near miss');
+  assert(/missed by/.test(close[0]!.detail), 'and the sentence says how close it was');
+
+  const distant = deriveNearMisses([order], () => ({ distance: 4.2, at: 1_500, price: 161.9 }));
+  assertEqual(distant.length, 0, 'an order the market never approached is not dressed up as one');
+
+  const filled = deriveNearMisses([{ ...order, filledAt: 1_800, status: 'FILLED' }], () => ({ distance: 0, at: 1_800, price: 157.9 }));
+  assertEqual(filled.length, 0, 'and an order that filled has no near miss — it got its price');
+});
+
+test('story: key moments come from the record, and every line points at it', () => {
+  /*
+   * Compression is only honest if the original is reachable, so a moment is either
+   * traceable to an event id or it is not shown as a moment.
+   */
+  const moments = deriveKeyMoments([
+    { id: 'e1', agentId: 'a', timestamp: 1_000, type: 'THESIS_FORMED', data: { statement: 'The range holds while 1h stays flat.', direction: 'BULLISH' } },
+    { id: 'e2', agentId: 'a', timestamp: 2_000, type: 'MODEL_REQUEST', data: { model: 'x' } },
+    { id: 'e3', agentId: 'a', timestamp: 3_000, type: 'TRACKER_FIRED', data: { purpose: 'Price crossing 157.9', price: 157.9, level: 157.9 } },
+  ]);
+
+  assertEqual(moments.length, 2, 'the model request is machinery, not a moment');
+  assertEqual(moments[0]!.kind, 'THESIS', 'the thesis comes first');
+  assertEqual(moments[1]!.kind, 'WATCH_FIRED', 'and the watch firing second');
+  assert(moments.every((moment) => moment.eventId !== undefined), 'every moment names the event it came from');
+  assert(/157.9/.test(moments[1]!.detail ?? ''), 'and carries the numbers a reader wants');
+});
 
 export async function runBacktestTests(): Promise<void> {
   let passed = 0;
@@ -1245,4 +1720,46 @@ export async function runBacktestTests(): Promise<void> {
 
 if (import.meta.main) {
   await runBacktestTests();
+}
+
+/**
+ * A run that has recorded nothing.
+ *
+ * Zeroes, and labelled zeroes: every dimension derived from these renders as absent
+ * rather than as a zero, which is the difference between "we do not know" and "it
+ * did nothing well".
+ */
+function emptyBehaviour() {
+  return {
+    hypothesesFormed: 0,
+    hypothesesRevised: 0,
+    hypothesesInvalidated: 0,
+    trackersCreated: 0,
+    trackersFired: 0,
+    plansCreated: 0,
+    plansRejectedByRisk: 0,
+    wakes: 0,
+    waits: 0,
+    modelCalls: 0,
+    modelFailures: 0,
+    modelLatencyMs: 0,
+    simulatedMinutes: 0,
+    longestSilenceMinutes: 0,
+  } as unknown as BacktestReport['behaviour'];
+}
+
+function emptyPerformance(initialBalance = 10_000) {
+  return {
+    trades: 0,
+    wins: 0,
+    losses: 0,
+    netPnl: 0,
+    netR: undefined,
+    winRatePercent: 0,
+    endingEquity: initialBalance,
+    maxDrawdown: 0,
+    maxDrawdownPercent: 0,
+    averageWin: 0,
+    averageLoss: 0,
+  };
 }

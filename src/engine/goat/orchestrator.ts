@@ -2501,7 +2501,7 @@ export class GoatOrchestrator {
 
     const inFlightModel = this.pendingModels.has(goal.agentId);
     this.pendingModels.delete(goal.agentId);
-    const reconsiderations = this.clearReconsideration(goal.agentId) ?? 0;
+    const reconsiderations = this.clearReconsideration(goal.agentId);
 
     // 2. Cancel the trackers, *before* the agent is unregistered.
     //
@@ -3776,12 +3776,20 @@ export class GoatOrchestrator {
     }
   }
 
-  /** Cancel a pending look. Called whenever the deployment stops. */
-  private clearReconsideration(agentId: string): void {
+  /**
+   * Cancel a pending look. Called whenever the deployment stops.
+   *
+   * Returns how many were discarded — one or none, never more, because a GOAT has
+   * at most one look pending at a time. Reported rather than assumed so a caller
+   * describing what a clear removed can count the attempt that was thrown away
+   * instead of claiming there was none.
+   */
+  private clearReconsideration(agentId: string): number {
     const timer = this.reconsiderTimers.get(agentId);
-    if (!timer) return;
+    if (!timer) return 0;
     clearTimeout(timer);
     this.reconsiderTimers.delete(agentId);
+    return 1;
   }
 
   /**
