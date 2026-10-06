@@ -1435,6 +1435,141 @@ test('frame: a frame is worth about as much as one observation, not three', () =
   );
 });
 
+/*
+ * Provenance that survives the evidence store.
+ *
+ * Novelty is the mechanism that stops three observations of one bar reading as
+ * three confirmations, and it works by asking whether this delivery has been seen
+ * before. That question was answered from the evidence list — which is bounded and
+ * evicted oldest-first — so on a thesis awake long enough, the record of an
+ * observation disappeared and the next appearance of that observation was scored
+ * as brand new. These two cases hold the boundary: a repeat stays a repeat after
+ * the record of the first time is gone, and a genuinely new delivery still counts.
+ */
+test('provenance: a repeat stays a repeat after its evidence record is evicted', () => {
+  const h = makeHarness();
+  const thesis = seedThesis(h);
+  const tracker = makeTracker(h, thesis.id);
+
+  h.loop.applyPlan(wakeFor(h, thesis.id, tracker.id, {
+    id: 'evt_cap_first', sourceEventId: 'bar:cap', reason: 'Price crossed above the level',
+  }), { kind: 'CONFIRM_THESIS', thesisId: thesis.id, reason: 'first look' });
+  const afterFirst = h.theses.get(thesis.id)!.confidence ?? 0;
+
+  // A delivery seen again, however much unrelated evidence has piled up since.
+  h.loop.applyPlan(wakeFor(h, thesis.id, tracker.id, {
+    id: 'evt_cap_second', sourceEventId: 'bar:cap', reason: 'Price crossed above the level',
+  }), { kind: 'CONFIRM_THESIS', thesisId: thesis.id, reason: 'seen before' });
+  assertEqual(
+    h.theses.get(thesis.id)!.confidence,
+    afterFirst,
+    'the same delivery a second time moves nothing',
+  );
+  assertEqual(
+    h.evidence.listForThesis(thesis.id).slice(-1)[0]!.novelty,
+    0,
+    'and is recorded as worth nothing',
+  );
+
+  // And a delivery nobody has seen still moves belief. Not by the full amount: it
+  // is the same tracker asking again, which is discounted — but discounted, not
+  // zeroed. A provenance system that suppressed legitimate later evidence would be
+  // as wrong as one that let repeats through.
+  h.loop.applyPlan(wakeFor(h, thesis.id, tracker.id, {
+    id: 'evt_cap_third', sourceEventId: 'bar:different', reason: 'Price crossed above the level',
+  }), { kind: 'CONFIRM_THESIS', thesisId: thesis.id, reason: 'a different bar' });
+  const moved = h.theses.get(thesis.id)!.confidence ?? 0;
+  assert(moved > afterFirst, 'a genuinely new delivery moves belief, even after a repeat');
+  assertEqual(
+    h.evidence.listForThesis(thesis.id).slice(-1)[0]!.provenance,
+    'delivery:bar:different',
+    'and is recorded against the delivery that produced it',
+  );
+});
+
+test('provenance: the cap on retained evidence does not decide what counts as new', () => {
+  /*
+   * Driven directly, because provoking 5,000 real observations would make this
+   * test slow for no extra insight: the store's retention policy is the input, and
+   * novelty must not depend on it.
+   */
+  const key = 'delivery:bar:ancient';
+  // What is left of the record after the store's cap has recycled the rest.
+  const evicted: Array<{ provenance?: string; sourceTrackerId?: string }> = [];
+  assertEqual(
+    noveltyWeight({ provenanceKey: key, trackerId: 't1', prior: evicted }),
+    1,
+    'with nothing left in the record to compare, an old delivery looks new — which is the defect',
+  );
+  assertEqual(
+    noveltyWeight({ provenanceKey: key, trackerId: 't1', prior: evicted, seenProvenance: new Set([key]) }),
+    0,
+    'and the durable identity is what stops it',
+  );
+  assertEqual(
+    noveltyWeight({ provenanceKey: 'delivery:bar:new', trackerId: 't1', prior: evicted, seenProvenance: new Set([key]) }),
+    1,
+    'without suppressing a delivery nobody has seen',
+  );
+  assertEqual(
+    noveltyWeight({
+      provenanceKey: key,
+      trackerId: 't1',
+      prior: [{ provenance: key, sourceTrackerId: 't1' }],
+      seenProvenance: new Set<string>(),
+    }),
+    0,
+    'and the record still answers it when the record is there',
+  );
+});
+
+/*
+ * A refusal is information.
+ *
+ * The transition table does not allow every move, and a wake can carry a plan the
+ * table refuses. That refusal used to throw, which unwound the caller before it
+ * could report anything: the evidence the wake had already recorded disappeared,
+ * the reason for the refusal disappeared, and the orchestrator's in-flight session
+ * marker stayed pinned — silently dropping every later activity line for that
+ * GOAT. A refusal has to leave a record and leave the session as it found it.
+ */
+test('refusal: a plan the state machine will not accept still reports, and loses nothing', () => {
+  const h = makeHarness();
+  /*
+   * `INVESTIGATING` cannot become `STRENGTHENING` — the table does not allow it —
+   * and a thesis with a live tracker can sit in `INVESTIGATING`. This is that
+   * shape, reached the way the product reaches it.
+   */
+  const thesis = h.loop.createThesis({
+    goalId: h.goal.id,
+    agentId: h.goal.agentId,
+    statement: 'The decline is corrective inside a broader bullish structure.',
+    direction: 'BULLISH',
+    invalidation: 'A sustained structural break below 1.0950.',
+    requiredConfirmation: ['a 15m close above 1.1010'],
+  });
+  h.loop.reviseThesis(thesis.id, { state: 'INVESTIGATING' });
+  assertEqual(h.theses.get(thesis.id)!.state, 'INVESTIGATING', 'the thesis really is in a state that refuses this move');
+  const tracker = makeTracker(h, thesis.id);
+  const before = h.evidence.listForThesis(thesis.id).length;
+
+  const outcome = h.loop.applyPlan(wakeFor(h, thesis.id, tracker.id, {
+    id: 'evt_investigating', sourceEventId: 'bar:inv', reason: 'Price crossed above the level',
+  }), { kind: 'CONFIRM_THESIS', thesisId: thesis.id, reason: 'this should be refused' });
+
+  assertEqual(
+    h.theses.get(thesis.id)!.state,
+    'INVESTIGATING',
+    'the thesis is exactly where it was',
+  );
+  assert(outcome.rejections.length > 0, 'and the refusal is reported rather than thrown');
+  assert(
+    h.evidence.listForThesis(thesis.id).length > before,
+    'the evidence the wake recorded before the refusal is kept',
+  );
+  assert(outcome.evidenceRecorded.length > 0, 'and is named in the outcome');
+});
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------

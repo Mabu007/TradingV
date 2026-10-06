@@ -425,8 +425,21 @@ export class SimulationEnvironment implements ITradingEnvironment {
   nearestApproach(order: SimulatedOrder): { distance: number; at: number; price: number } | undefined {
     if (order.status !== 'PENDING' && order.status !== 'EXPIRED' && order.status !== 'CANCELLED') return undefined;
     if (order.filledAt !== undefined) return undefined;
+    /*
+     * Bounded by the replay's own horizon, not by the dataset's.
+     *
+     * The question being answered is "how close did the market come to this
+     * order", and during a replay that question is only meaningful up to *now*.
+     * Reading to the end of the dataset answered it with the future: an order
+     * still resting could be reported mid-run as a near miss at a timestamp the
+     * replay had not reached yet, and that count fed the run's own verdict. The
+     * agent never saw it — the reader, and the score derived from what they
+     * read, did.
+     */
     const from = order.placedAt;
-    const to = order.expiresAt ?? (this.bars.length > 0 ? this.bars[this.bars.length - 1].time + this.baseSeconds : from);
+    const horizon = this.clock.now();
+    const to = Math.min(order.expiresAt ?? Number.POSITIVE_INFINITY, horizon);
+    if (to < from) return undefined;
     let best: { distance: number; at: number; price: number } | undefined;
 
     for (const bar of this.bars) {
@@ -499,10 +512,13 @@ export class SimulationEnvironment implements ITradingEnvironment {
 
     if (seconds === this.baseSeconds) return visible.slice(Math.max(0, visible.length - count));
 
-    const aggregated: Bar[] = [];
+    type Bucket = Bar & { baseBars: number };
+    const aggregated: Bucket[] = [];
     const horizon = Math.floor(this.clock.now() / 1000);
     let bucketStart: number | undefined;
-    let bucket: Bar | undefined;
+    // Carries a member-count alongside the OHLC values, so `flush` can tell a
+    // finished bucket from a period the dataset only partly covers.
+    let bucket: Bucket | undefined;
 
     /*
      * A bucket is only a candle once every one of its minutes has closed.
@@ -514,7 +530,17 @@ export class SimulationEnvironment implements ITradingEnvironment {
      * the boundary test that exists to catch exactly this.
      */
     const flush = (): void => {
-      if (bucket && bucketStart !== undefined && bucketStart + seconds <= horizon) {
+      /*
+       * Only if the bucket is whole.
+       *
+       * `bucketStart + seconds <= horizon` says the time period has elapsed; it
+       * does not say the period was *filled*. A dataset with a hole — or one
+       * stitched from several venue pages — would otherwise have a bucket of nine
+       * minutes published as a finished fifteen-minute candle, carrying a close
+       * taken from the wrong instant, and the GOAT would be asked to reason about
+       * a candle that never happened.
+       */
+      if (bucket && bucketStart !== undefined && bucketStart + seconds <= horizon && bucket.baseBars >= seconds / this.baseSeconds) {
         aggregated.push(bucket);
       }
       bucket = undefined;
@@ -526,9 +552,10 @@ export class SimulationEnvironment implements ITradingEnvironment {
       if (bucketStart === undefined || start !== bucketStart) {
         flush();
         bucketStart = start;
-        bucket = { time: start, open: bar.open, high: bar.high, low: bar.low, close: bar.close, ...(bar.volume !== undefined ? { volume: 0 } : {}) };
+        bucket = { time: start, open: bar.open, high: bar.high, low: bar.low, close: bar.close, baseBars: 0, ...(bar.volume !== undefined ? { volume: 0 } : {}) };
       }
       if (!bucket) continue;
+      bucket.baseBars += 1;
       bucket.high = Math.max(bucket.high, bar.high);
       bucket.low = Math.min(bucket.low, bar.low);
       bucket.close = bar.close;
@@ -536,7 +563,12 @@ export class SimulationEnvironment implements ITradingEnvironment {
     }
     flush();
 
-    return aggregated.slice(Math.max(0, aggregated.length - count));
+    // The member count is bookkeeping for `flush`, not a market fact.
+    const candles: Bar[] = aggregated.map((entry) => {
+      const { baseBars: _baseBars, ...bar } = entry;
+      return bar;
+    });
+    return candles.slice(Math.max(0, candles.length - count));
   }
 
   /**
@@ -1047,9 +1079,19 @@ export class SimulationEnvironment implements ITradingEnvironment {
   ): number {
     const difference = position.side === 'BUY' ? exitPrice - position.entryPrice : position.entryPrice - exitPrice;
     const pnl = this.round2(difference * volume);
-    const commission = this.commissionPerLot * (volume / this.lotSize);
+    const exitCommission = this.commissionPerLot * (volume / this.lotSize);
+    /*
+     * The whole round trip, not just this side of it.
+     *
+     * The balance is charged commission on entry *and* on exit, so a trade
+     * carrying only the exit leg described a number the account never saw — and a
+     * report built by summing `pnl` therefore disagreed with the equity curve by
+     * exactly one commission per trade, with no visible cause. Carrying both legs
+     * makes `pnl - commission` the figure that reconciles.
+     */
+    const commission = this.round2((position.commission ?? 0) + exitCommission);
 
-    this.balance += pnl - commission;
+    this.balance += pnl - exitCommission;
     this.trades.push({
       id: `sim_trd_${this.nextTradeId++}`,
       positionId: position.id,
@@ -1063,7 +1105,7 @@ export class SimulationEnvironment implements ITradingEnvironment {
       pnl,
       pnlPercent: this.round2((difference / position.entryPrice) * 100),
       returnPercent: this.round2((difference / position.entryPrice) * 100),
-      commission: this.round2(commission),
+      commission,
       exitReason: reason,
     });
 

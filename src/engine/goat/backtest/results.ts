@@ -99,23 +99,35 @@ function riskPerTrade(trades: Trade[]): number | undefined {
   return risks.reduce((sum, value) => sum + value, 0) / risks.length;
 }
 
+/**
+ * What a trade actually kept, after what it cost to open and close.
+ *
+ * Every figure in this report is net of commission. A run whose headline number
+ * was the gross price move would disagree with its own equity curve by one
+ * commission per trade, and the two would both be defensible readings of the same
+ * run — which is how a replay ends up reporting a profit the account never made.
+ */
+function netOf(trade: Trade): number {
+  return trade.pnl - (trade.commission ?? 0);
+}
+
 export function summarisePerformance(trades: Trade[], initialBalance: number, equity: number): BacktestPerformance {
-  const wins = trades.filter((trade) => trade.pnl > 0);
-  const losses = trades.filter((trade) => trade.pnl <= 0);
-  const netPnl = round2(trades.reduce((sum, trade) => sum + trade.pnl, 0));
+  const wins = trades.filter((trade) => netOf(trade) > 0);
+  const losses = trades.filter((trade) => netOf(trade) <= 0);
+  const netPnl = round2(trades.reduce((sum, trade) => sum + netOf(trade), 0));
 
   let peak = initialBalance;
   let maxDrawdown = 0;
   let running = initialBalance;
   for (const trade of trades) {
-    running += trade.pnl;
+    running += netOf(trade);
     if (running > peak) peak = running;
     maxDrawdown = Math.max(maxDrawdown, peak - running);
   }
 
   const risk = riskPerTrade(trades);
-  const averageWin = wins.length > 0 ? round2(wins.reduce((sum, t) => sum + t.pnl, 0) / wins.length) : 0;
-  const averageLoss = losses.length > 0 ? round2(losses.reduce((sum, t) => sum + t.pnl, 0) / losses.length) : 0;
+  const averageWin = wins.length > 0 ? round2(wins.reduce((sum, t) => sum + netOf(t), 0) / wins.length) : 0;
+  const averageLoss = losses.length > 0 ? round2(losses.reduce((sum, t) => sum + netOf(t), 0) / losses.length) : 0;
 
   return {
     trades: trades.length,

@@ -178,7 +178,20 @@ export function noveltyWeight(input: {
   provenanceKey: string;
   trackerId?: string;
   prior: ReadonlyArray<{ provenance?: string; sourceTrackerId?: string }>;
+  /**
+   * Provenance keys already recorded for this thesis, independent of the
+   * evidence store's retention.
+   *
+   * `prior` answers "what has this thesis seen?" only for as long as the store
+   * keeps it. Evidence is capped and evicted oldest-first, so on a long-lived
+   * thesis the record of an observation quietly disappears — and once it does,
+   * that same observation looks brand new again and is weighted as a fresh
+   * confirmation. Passing the durable keys separately means a repeat stays a
+   * repeat after the record of the first time has been recycled.
+   */
+  seenProvenance?: ReadonlySet<string>;
 }): number {
+  if (input.seenProvenance?.has(input.provenanceKey)) return 0;
   if (input.prior.length === 0) return 1;
   const seenDelivery = input.prior.some(
     (item) => item.provenance === input.provenanceKey,
@@ -252,6 +265,8 @@ export function weighEvidence(input: {
   priorEvidence: readonly Evidence[];
   /** Weight of the strongest prior item that points the other way, if any. */
   strongestCounterWeight?: number;
+  /** Durable provenance keys for this thesis; see `noveltyWeight`. */
+  seenProvenance?: ReadonlySet<string>;
 }): EvidenceWeight {
   const key = provenanceKey(input.event);
   const novelty = noveltyWeight({
@@ -261,6 +276,7 @@ export function weighEvidence(input: {
       ...(item.provenance ? { provenance: item.provenance } : {}),
       ...(item.sourceTrackerId ? { sourceTrackerId: item.sourceTrackerId } : {}),
     })),
+    ...(input.seenProvenance ? { seenProvenance: input.seenProvenance } : {}),
   });
   const repeated = novelty === 0;
 

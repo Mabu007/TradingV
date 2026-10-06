@@ -242,6 +242,13 @@ export class TrackerRuntime {
   private readonly lastEvent = new Map<string, number>();
   private readonly eventHistory = new Map<string, EventRecord[]>();
   private readonly inFlight = new Set<string>();
+  /**
+   * Monotonic counter behind every minted id.
+   *
+   * Bounded by construction: it only ever counts up for the life of the runtime,
+   * holds one number, and is reset with everything else on `dispose()`.
+   */
+  private idSequence = 0;
   private readonly recentInputIds = new Map<string, number>();
   private readonly processedEvents = new Map<string, Set<string>>();
   private readonly instrumentCache = new Map<string, Promise<InstrumentMetadata | undefined>>();
@@ -327,9 +334,26 @@ export class TrackerRuntime {
     return this.clockFn ? this.clockFn() : Date.now();
   }
 
+  /**
+   * Mint a tracker id.
+   *
+   * A counter, not a random suffix — and this is load-bearing rather than
+   * cosmetic. Tracker ids are the tiebreak in the evaluation order
+   * (`priority`, then id), and the evaluation order decides which observation
+   * becomes the frame's primary, which is the observation a wake is addressed to
+   * and the one the reasoning layer reads first. A random suffix therefore made
+   * two identical replays of one historical session disagree about which
+   * observation the GOAT woke on, while looking exactly as deterministic as before.
+   *
+   * The counter is monotonic per runtime, so ids stay unique; the timestamp keeps
+   * them distinguishable across restarts in a log a human reads. Nothing here
+   * depends on the id being unguessable — ownership is checked against the
+   * registry, not against secrecy.
+   */
   private nextId(prefix: string): string {
     if (this.idFactoryFn) return this.idFactoryFn(prefix);
-    return `${prefix}_${this.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    this.idSequence += 1;
+    return `${prefix}_${this.now().toString(36)}_${this.idSequence.toString(36)}`;
   }
 
   // ---------------------------------------------------------------------
@@ -357,6 +381,7 @@ export class TrackerRuntime {
      * waiting for a timer.
      */
     this.epoch += 1;
+    this.idSequence = 0;
     this.evaluators.clear();
     this.lastEvent.clear();
     this.eventHistory.clear();

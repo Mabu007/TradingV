@@ -267,6 +267,29 @@ export interface InvestigationOutcome {
 export const MAX_RISK_REVISIONS = 3;
 
 /**
+ * How many deliveries a thesis remembers having weighed.
+ *
+ * Far more than the evidence cap needs to be, and deliberately so: this set is
+ * the only thing standing between a long session and "the observation I already
+ * counted has become new again". It holds a short string each, insertion order is
+ * eviction order, and a delivery older than this cannot recur in a way that
+ * matters — a tracker that has not reported for this many deliveries is no longer
+ * one the novelty rule is protecting.
+ */
+const MAX_REMEMBERED_PROVENANCE = 20_000;
+
+/** Add a provenance key, evicting the oldest once the bound is reached. */
+function rememberProvenance(seen: Set<string>, key: string): void {
+  if (seen.has(key)) return;
+  seen.add(key);
+  while (seen.size > MAX_REMEMBERED_PROVENANCE) {
+    const oldest = seen.values().next();
+    if (oldest.done) break;
+    seen.delete(oldest.value);
+  }
+}
+
+/**
  * The most steps one composite plan may contain.
  *
  * A bound on transaction size, not a budget for ambition. Four is enough for
@@ -287,6 +310,22 @@ export const MAX_COMPOSITE_STEPS = 4;
  */
 export class GoatLoop {
   private readonly inflight = new Set<string>();
+  /**
+   * Provenance already accounted for, per thesis, kept apart from the evidence
+   * store.
+   *
+   * "Have I already weighed this observation?" is a question about *identity*,
+   * and identity outlives the record of it. Evidence is bounded and evicted
+   * oldest-first, so on a thesis that has been awake a long time the first
+   * observation of a delivery is eventually recycled — and the next time that
+   * delivery's siblings arrive, novelty would rate them as fresh independent
+   * confirmations, which is precisely the failure the provenance key exists to
+   * prevent.
+   *
+   * Bounded per thesis, oldest-first, and released with the thesis. It holds one
+   * short string per delivery, so it is the cheapest thing the loop retains.
+   */
+  private readonly seenProvenance = new Map<string, Set<string>>();
   /** Refusals from the most recent plan restore, for the caller to report. */
   private readonly lastRestoreRefusals: string[] = [];
 
@@ -867,6 +906,14 @@ export class GoatLoop {
     };
 
     this.deps.theses.save(updated);
+
+    /*
+     * A terminal thesis will never be woken again, so its provenance memory goes
+     * with it. Nothing else releases it: the set is keyed by thesis id, and a
+     * retired hypothesis that keeps a 20,000-entry identity list is a leak that
+     * only shows up after a long session with many finished hypotheses.
+     */
+    if (isTerminalThesisState(updated.state)) this.seenProvenance.delete(thesisId);
     return updated;
   }
 
@@ -924,6 +971,23 @@ export class GoatLoop {
       } else {
         this.applyStep(wake, plan, outcome);
       }
+    } catch (error) {
+      /*
+       * A refusal, not a crash.
+       *
+       * `applyStep` can legitimately throw: the transition table refuses some
+       * moves, and a wake carrying CONFIRM_THESIS against a thesis still in
+       * INVESTIGATING is one of them. Letting that escape did two things that
+       * were both worse than refusing. It discarded the whole `WakeOutcome` — so
+       * the evidence `weighFrame` had already recorded, and the reason the plan
+       * was refused, both vanished — and it unwound past the caller's cleanup, so
+       * the orchestrator's in-flight session marker for that GOAT stayed pinned
+       * and every later activity line for that agent was silently dropped.
+       *
+       * Nothing is rolled back: whatever was written before the refusal stands,
+       * exactly as it would after a step-level refusal.
+       */
+      outcome.rejections.push(this.describeRejection(error));
     } finally {
       // Bounded: an id is only remembered long enough to catch a
       // genuine double delivery.
@@ -1431,6 +1495,15 @@ export class GoatLoop {
    * happened is its own; the rest follow in the order the runtime committed to, so
    * the record reads the same way twice.
    */
+  /** The durable provenance set for a thesis, created on first use. */
+  private seenProvenanceFor(thesisId: string): Set<string> {
+    const existing = this.seenProvenance.get(thesisId);
+    if (existing) return existing;
+    const created = new Set<string>();
+    this.seenProvenance.set(thesisId, created);
+    return created;
+  }
+
   private observationsOf(wake: WakeRequest): TrackerEvent[] {
     const batch = wake.batch?.events;
     if (!batch || batch.length === 0) return [wake.event];
@@ -1464,13 +1537,22 @@ export class GoatLoop {
 
     for (const event of this.observationsOf(wake)) {
       const prior = this.deps.evidence.listForThesis(wake.thesisId);
+      const seen = this.seenProvenanceFor(wake.thesisId);
+      const key = provenanceKey(event);
       const weight = weighEvidence({
         event,
         polarity,
         ...(thesisTimeframe ? { thesisTimeframe } : {}),
         priorEvidence: prior,
+        seenProvenance: seen,
         strongestCounterWeight: strongestWeight(prior, polarity === 'SUPPORTS' ? 'CONTRADICTS' : 'SUPPORTS'),
       });
+      /*
+       * Remembered before the record is written, so the very next sibling in this
+       * same frame measures against the first one — which is what makes three
+       * observations of one bar worth one observation rather than three.
+       */
+      rememberProvenance(seen, key);
       recorded.push(
         this.recordObservationEvidence(wake, event, polarity, weight.effect, {
           novelty: weight.novelty,

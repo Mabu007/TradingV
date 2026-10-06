@@ -514,6 +514,16 @@ export class BacktestSession {
    * run's conclusions over the same candles.
    */
   private buildWorld(): void {
+    /*
+     * Pacing is rebuilt with the world, not inherited by it.
+     *
+     * `barBudget` is how many bars one pass consumes, and `setSpeed` moves it. A
+     * restart rebuilt the clock at the *requested* speed while leaving the budget
+     * at whatever the last `setSpeed` had set, so the snapshot reported one speed
+     * and the loop consumed bars at another — a restarted replay no longer paced
+     * itself like the run it was repeating.
+     */
+    this.barBudget = this.request.speed ?? DEFAULT_SIMULATION_SPEED;
     this.clock = new SimulationClock({
       start: this.request.start,
       speed: this.request.speed ?? DEFAULT_SIMULATION_SPEED,
@@ -1120,8 +1130,14 @@ export class BacktestSession {
          * A partial final bar is not replayed. Half a candle is a forecast, and
          * the environment will not reveal one, so the advance stops at the last
          * complete boundary rather than pretending the remainder happened.
+         *
+         * The clock is deliberately *not* moved onto that boundary. Advancing to
+         * it would reveal the bar — the environment's visible count moves with the
+         * clock — and then skip the step, so the replay would consume a complete
+         * bar without ever delivering it to a tracker, settling an order against
+         * it, or marking a position with it. A bar present in the record but in no
+         * decision is a hole that reads as a bar the GOAT ignored.
          */
-        if (next !== undefined) this.clock.advanceTo(next);
         break;
       }
 

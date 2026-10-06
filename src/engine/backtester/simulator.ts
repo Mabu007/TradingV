@@ -39,6 +39,8 @@ export class BacktestSimulator {
   private signals: SignalEvent[] = [];
   private strategyState: Map<string, any> = new Map();
   private maxEquitySeen: number = 10000;
+  /** Fills placed so far, so slippage can vary per fill and stay repeatable. */
+  private fillSequence = 0;
   private maxDrawdown: number = 0;
   private maxDrawdownPercent: number = 0;
 
@@ -91,14 +93,29 @@ export class BacktestSimulator {
       this.updateEquity(currentBar);
     }
 
-    // Close any remaining open positions at the final bar's close price
+    /*
+     * Close whatever is left, and charge for getting out.
+     *
+     * Two things were wrong here. The liquidation used the raw last close while
+     * every entry had paid half a spread plus slippage, so a run that finished
+     * holding a position was closing it for free — a round trip that could only
+     * look good. And equity was not recomputed afterwards, so the realised P&L of
+     * those final positions, entry costs included, never reached `netProfit` or
+     * the last point of the equity curve: the account reported a balance it did
+     * not have.
+     */
     if (this.positions.length > 0 && bars.length > 0) {
       const lastBar = bars[bars.length - 1];
+      const exitPrice = this.exitFillPrice(lastBar);
       const remaining = [...this.positions];
       for (const pos of remaining) {
-        this.closePosition(pos.id, lastBar.close, lastBar.time, 'MANUAL');
+        this.closePosition(pos.id, exitPrice, lastBar.time, 'MANUAL');
       }
     }
+
+    // Equity is a balance plus what is still open. Nothing is open now, so this
+    // is the honest final number, and the curve gets a last point saying so.
+    if (bars.length > 0) this.updateEquity(bars[bars.length - 1]!);
 
     return this.calculateResults(strategyId, strategyName);
   }
@@ -227,11 +244,48 @@ export class BacktestSimulator {
     };
   }
 
+  /**
+   * Slippage for one fill, as a fraction of the model's slippage distance.
+   *
+   * A repeating cycle rather than a hash: simple, obviously bounded, and the same
+   * sequence of fills always produces the same sequence of prices. A backtest
+   * that charges a little more slippage on some fills than others should be
+   * modelling fills, not an entropy source.
+   */
+  /**
+   * What a close costs, at this bar's close.
+   *
+   * Mirrors the entry fill's cost so a forced exit is priced the same way a
+   * voluntary one is. Charging only the entry side would make exiting free, and
+   * the only runs that would notice are the ones that end holding something.
+   */
+  private exitFillPrice(bar: Bar): number {
+    const halfSpread = this.spreadDistance() / 2;
+    const slippage = this.slippageForBar();
+    return bar.close - halfSpread - slippage;
+  }
+
+  private slippageForBar(): number {
+    this.fillSequence += 1;
+    const cycle = [0, 0.5, 0.25, 0.75];
+    return cycle[this.fillSequence % cycle.length]! * this.slippageDistance();
+  }
+
   private executeMarketOrder(req: MarketOrderRequest): OrderResult {
     const currentBar = this.bars[this.currentBarIndex];
     const digits = this.config.pricePrecision ?? 5;
     const spread = this.spreadDistance();
-    const slippage = Math.random() * this.slippageDistance();
+    /*
+     * Deterministic, not random.
+     *
+     * This was the only source of variation in a fill price, and it came from an
+     * unseeded `Math.random()` — so two runs of one strategy over one dataset
+     * produced different entries and therefore different equity curves, which
+     * makes every comparison of two strategies unrepeatable. A slippage model has
+     * to be *some* assumption; this one is now a stated one, derived from the bar
+     * being traded, so the same bar always fills at the same price.
+     */
+    const slippage = this.slippageForBar();
 
     /*
      * Risk Check. The bar close is the reference price used to value
@@ -312,28 +366,40 @@ export class BacktestSimulator {
       let exitPrice = bar.close;
       let exitReason: Trade['exitReason'] = 'MANUAL';
 
+      /*
+       * The stop is checked before the target, on purpose.
+       *
+       * When one bar reaches both levels the data cannot say which came first —
+       * OHLC records the range, not the path — so a replay has to pick. Every
+       * other environment in this codebase picks the worse outcome and says so;
+       * this one picked the better one, which quietly turned every ambiguous bar
+       * into a win and made optimistic strategies look better than they were. The
+       * ambiguity is real and the choice is a declared assumption, not an
+       * accident.
+       */
       if (pos.side === 'BUY') {
-        // Take Profit hit
-        if (pos.takeProfit && bar.high >= pos.takeProfit) {
-          exitPrice = pos.takeProfit;
-          exitReason = 'TAKE_PROFIT';
-          closed = true;
-        }
         // Stop Loss hit
-        else if (pos.stopLoss && bar.low <= pos.stopLoss) {
+        if (pos.stopLoss && bar.low <= pos.stopLoss) {
           exitPrice = pos.stopLoss;
           exitReason = 'STOP_LOSS';
+          closed = true;
+        }
+        // Take Profit hit
+        else if (pos.takeProfit && bar.high >= pos.takeProfit) {
+          exitPrice = pos.takeProfit;
+          exitReason = 'TAKE_PROFIT';
           closed = true;
         }
       } else {
         // SELL position
-        if (pos.takeProfit && bar.low <= pos.takeProfit) {
-          exitPrice = pos.takeProfit;
-          exitReason = 'TAKE_PROFIT';
-          closed = true;
-        } else if (pos.stopLoss && bar.high >= pos.stopLoss) {
+        if (pos.stopLoss && bar.high >= pos.stopLoss) {
           exitPrice = pos.stopLoss;
           exitReason = 'STOP_LOSS';
+          closed = true;
+        }
+        else if (pos.takeProfit && bar.low <= pos.takeProfit) {
+          exitPrice = pos.takeProfit;
+          exitReason = 'TAKE_PROFIT';
           closed = true;
         }
       }

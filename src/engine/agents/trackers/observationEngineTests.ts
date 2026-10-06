@@ -201,6 +201,112 @@ const tick = (id: string, price: number, timestamp: number): TrackerInput => ({
   state: { timestamp, symbol: 'EURUSD', price, spread: 0.7, environment: 'DEMO', bars: [bar] },
 });
 
+
+/**
+ * Source identity is the frame's whole right to group.
+ *
+ * When an observation cannot name the delivery that produced it, the frame has to
+ * fall back on something. Falling back on "unknown" would put every observation
+ * that lacks a source id into one frame — which is not a smaller batch, it is a
+ * batch of unrelated market moments presented to the GOAT as one observation. The
+ * fallback is the event's own identity, which is unique per tracker per delivery,
+ * so a missing source id costs the grouping and nothing else.
+ */
+async function missingSourceIdentityCannotMergeUnrelatedObservations(): Promise<void> {
+  const trackers = [
+    makeTracker('a', 'agent-a', 'PRICE_THRESHOLD', { operator: 'ABOVE', level: 10 }, { thesisId: 'thesis:one', priority: 1 }),
+    makeTracker('b', 'agent-a', 'PRICE_THRESHOLD', { operator: 'ABOVE', level: 10 }, { thesisId: 'thesis:one', priority: 2 }),
+    makeTracker('c', 'agent-a', 'PRICE_THRESHOLD', { operator: 'ABOVE', level: 10 }, { thesisId: 'thesis:one', priority: 3 }),
+  ];
+  const { trackers: runtime, wakes } = await harness({ trackers });
+
+  /*
+   * Ingested one at a time with no `sourceEventId` at all — the shape a caller
+   * gets from a manual replay of a recorded event.
+   */
+  for (const tracker of trackers) {
+    runtime.ingestEvent({
+      id: `manual:${tracker.id}`,
+      trackerId: tracker.id,
+      agentId: tracker.agentId,
+      kind: tracker.kind,
+      eventType: tracker.eventType,
+      timestamp: 1_000,
+      environment: 'DEMO',
+      symbol: 'EURUSD',
+      reason: 'Price crossed above 10.',
+      priority: tracker.evaluation.priority ?? 0,
+      severity: 'INFO',
+    });
+  }
+
+  assertEqual(wakes.length, 3, 'three source-less observations are three frames, not one');
+  assert(
+    wakes.every((wake) => wake.batch?.events.length === 1),
+    'and none of them borrowed another\'s observation',
+  );
+  assert(
+    new Set(wakes.map((wake) => wake.batch!.batchId)).size === 3,
+    'each identifies itself separately',
+  );
+  assert(
+    wakes.every((wake) => wake.batch!.sourceEventId === wake.event.id),
+    'and the frame names the identity it fell back to',
+  );
+  assert(
+    wakes.every((wake) => wake.event.sourceEventId === undefined),
+    'without inventing one on the observation, which would misattribute its provenance',
+  );
+
+  // The same event id is the same observation, and grouping it with itself is
+  // correct rather than accidental.
+  runtime.ingestEvent({
+    id: 'manual:a',
+    trackerId: 'a',
+    agentId: 'agent-a',
+    kind: 'PRICE_THRESHOLD',
+    eventType: 'CONDITION_MET',
+    timestamp: 1_000,
+    environment: 'DEMO',
+    symbol: 'EURUSD',
+    reason: 'Price crossed above 10.',
+    priority: 0,
+    severity: 'INFO',
+  });
+  assertEqual(wakes[3]!.batch!.events.length, 1, 'a repeated source-less observation is still a frame of one');
+}
+
+/**
+ * The same delivery, twice, wakes the same way twice.
+ *
+ * Ids are minted by a counter precisely so they are reproducible: they break ties
+ * in the evaluation order, and the evaluation order decides which observation a
+ * wake is addressed to. With a random suffix in the id, two replays of one
+ * session could agree on every input and still disagree about which observation
+ * the GOAT woke on — a replay that could not be compared with itself.
+ */
+async function mintedIdsAreReproducibleAcrossRuns(): Promise<void> {
+  const definitions = [
+    makeTracker('one', 'agent-a', 'PRICE_THRESHOLD', { operator: 'ABOVE', level: 10 }, { thesisId: 'thesis:agent-a' }),
+    makeTracker('two', 'agent-a', 'PRICE_THRESHOLD', { operator: 'ABOVE', level: 10 }, { thesisId: 'thesis:agent-a' }),
+  ];
+
+  const mint = async (): Promise<string[]> => {
+    const { trackers: runtime } = await harness({ trackers: definitions, now: () => 5_000 });
+    const created: string[] = [];
+    for (const definition of definitions) {
+      created.push(runtime.createTracker(
+        definition.thesisId as string,
+        definition.agentId,
+        { purpose: definition.purpose, kind: definition.kind, config: definition.config },
+      ).id);
+    }
+    return created;
+  };
+
+  assertEqual((await mint()).join(','), (await mint()).join(','), 'two identical runs mint identical tracker ids');
+}
+
 /**
  * The observation engine.
  *
@@ -228,6 +334,8 @@ export async function runTrackerObservationEngineTests(): Promise<void> {
   await disposalStopsAnInFlightEvaluation();
   await instrumentLookupFailureIsNotRememberedForever();
   await positionEventsAreNotDuplicatedByTheFrame();
+  await missingSourceIdentityCannotMergeUnrelatedObservations();
+  await mintedIdsAreReproducibleAcrossRuns();
 }
 
 /**
@@ -743,6 +851,8 @@ const CASES: Array<[string, () => Promise<void>]> = [
   ['lifecycle: a disposed runtime is inert immediately', disposalStopsAnInFlightEvaluation],
   ['cache: a failed metadata lookup is not remembered', instrumentLookupFailureIsNotRememberedForever],
   ['positions: an observation delivered twice is observed once', positionEventsAreNotDuplicatedByTheFrame],
+  ['frame: a missing source id cannot merge unrelated observations', missingSourceIdentityCannotMergeUnrelatedObservations],
+  ['frame: minted tracker ids are reproducible across runs', mintedIdsAreReproducibleAcrossRuns],
 ];
 
 if (import.meta.main) {

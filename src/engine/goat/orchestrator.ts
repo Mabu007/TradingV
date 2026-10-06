@@ -4687,9 +4687,28 @@ export class GoatOrchestrator {
     const session = this.sessions.current(wake.agentId);
     if (!this.sessions.isCurrent(session)) return undefined;
     this.inFlightSessions.set(wake.agentId, session);
+    /*
+     * Released on every exit below, and only by the wake that took it.
+     *
+     * Two wakes can be in flight for one GOAT at once — the tracker runtime
+     * delivers frames without waiting, so a second frame arrives while the first
+     * is still with the model. The old code deleted the marker unconditionally,
+     * so whichever wake finished first removed the *other's*, leaving that GOAT
+     * unguarded: a CLEAR pressed during its model call would have had its answer
+     * written into a session that no longer existed. Deleting only when the
+     * marker is still ours cannot release someone else's lock.
+     */
+    const ownsMarker = (): void => {
+      if (this.inFlightSessions.get(wake.agentId) === session) {
+        this.inFlightSessions.delete(wake.agentId);
+      }
+    };
 
     const context = this.loop.buildContext(wake.agentId, wake.thesisId, wake.event);
-    if (!context) return undefined;
+    if (!context) {
+      ownsMarker();
+      return undefined;
+    }
 
     const deployment = this.stores.deployments.currentFor(wake.agentId);
 
@@ -4759,13 +4778,13 @@ export class GoatOrchestrator {
      * user had just deleted, and logging them into a session that no longer exists.
      */
     if (!this.sessions.isCurrent(session)) {
-      this.inFlightSessions.delete(wake.agentId);
+      ownsMarker();
       this.staleWork('A wake decision', session);
       return undefined;
     }
 
     const outcome = this.loop.applyPlan(wake, decided);
-    this.inFlightSessions.delete(wake.agentId);
+    ownsMarker();
 
     /*
      * Evidence, before the conclusion it produced.
