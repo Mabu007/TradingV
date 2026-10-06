@@ -25,6 +25,7 @@
     "verify": "bun run lint && bun run test:audit && bun run test:hardening && bun run test:trade-engine && bun run test:trade-flow && bun run test:clear-session && bun run test:runtime-lifecycle && bun run test:surface && bun run test:conditions && bun run test:engine && bun run test:pipeline && bun run test:security && bun run test:agents && bun run test:venue && bun run test:hyperliquid && bun run test:hyperliquid:execution && bun run test:execution && bun run test:openrouter && bun run test:wallet && bun run verify:no-bots && bun run verify:no-triggers && cd watchers && npm run typecheck && npm test",
     "test:pipeline": "bun src/engine/agents/pipelineAcceptance.ts",
     "test:audit": "bun src/engine/agents/trackers/auditRegressionTests.ts",
+    "test:observation": "bun src/engine/agents/trackers/observationEngineTests.ts",
     "test:hardening": "bun src/engine/goat/releaseHardeningTests.ts",
     "test:surface": "bun src/engine/goat/agentSurfaceTests.ts",
     "test:backtest": "bun src/engine/goat/backtest/tests.ts",

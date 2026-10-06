@@ -31,7 +31,7 @@
 import { eventBus, TradingGOATsEvent } from '../../../types/events';
 import { AgentRuntime } from '../runtime';
 import { agentTimeframes } from '../types';
-import { AgentWakeEvent } from '../types';
+import { AgentWakeEvent, TradingEnvironmentMode } from '../types';
 import { AgentTimelineStore } from '../timeline/types';
 import { InstrumentMetadata } from '../../../types/instruments';
 import { ITradingEnvironment } from '../types';
@@ -46,6 +46,7 @@ import {
   TrackerEventType,
   TrackerInput,
   TrackerKind,
+  TrackerObservationBatch,
   TrackerRequest,
   TrackerStatus,
   TrackerThesisView,
@@ -84,6 +85,19 @@ export const DEFAULT_TRACKER_LIMITS: TrackerRuntimeLimits = {
 const MAX_RETAINED_WAKE_REQUESTS = 500;
 
 /**
+ * Consecutive evaluator failures before a tracker is quarantined.
+ *
+ * Three, and the shape of the rule matters more than the number. A single failure
+ * is a fact about one delivery — a malformed candle, a missing level, a bar that
+ * arrived half-formed — and a tracker that gave up on the first one would be a
+ * tracker that loses its watch because of a bad packet. Consecutive is the
+ * operative word: one success in between resets the count, so the quarantine means
+ * "this tracker cannot evaluate what it is being given", not "this tracker has
+ * failed three times this morning".
+ */
+const EVALUATOR_FAILURE_THRESHOLD = 3;
+
+/**
  * The narrow view of a GOAT the runtime needs for scope checks.
  *
  * Structural rather than the concrete `AgentInstance` so the runtime
@@ -107,8 +121,18 @@ export interface TrackerAgentScope {
 export interface TrackerDomainBinding {
   resolveThesis(thesisId: string): TrackerThesisView | undefined;
   resolveSkillIds(agentId: string): string[];
-  /** Called when a tracker produces an event. The GOAT reasons there. */
-  onEvent?(event: TrackerEvent): void | Promise<void>;
+  /**
+   * Called when a logical frame produces observations. The GOAT reasons there.
+   *
+   * The batch is passed as a second argument rather than replacing the event, so
+   * every existing binding keeps working unchanged: a caller that reads only
+   * `event` sees exactly what it saw before, and one that reads `batch` gets the
+   * whole frame and can avoid paying for a model call per observation.
+   *
+   * Called **once per logical frame**, not once per event. That is the whole point
+   * of batching, and it is why a binding must not assume one call per event.
+   */
+  onEvent?(event: TrackerEvent, batch?: TrackerObservationBatch): void | Promise<void>;
 }
 
 export class TrackerRuntimeError extends Error {
@@ -183,6 +207,18 @@ export interface TrackerRuntimeOptions {
   limits?: TrackerRuntimeLimits;
   clock?: () => number;
   idFactory?: (prefix: string) => string;
+  /**
+   * Build one tracker's evaluator. Defaults to the real one.
+   *
+   * The circuit breaker only exists for evaluators that throw, and nothing in the
+   * evaluator is allowed to throw on ordinary input — that is the point of it. So the
+   * failure path has no natural way to be reached with a well-formed tracker and a
+   * well-formed delivery, and a policy that cannot be exercised cannot be claimed
+   * to work. This is the seam: production never passes it, and a test can hand in
+   * an evaluator that fails for a chosen tracker and measure what the runtime does
+   * about it.
+   */
+  evaluatorFactory?: (evaluationKey: string, tracker: Tracker) => TrackerEvaluator;
 }
 
 export class TrackerRuntime {
@@ -192,6 +228,7 @@ export class TrackerRuntime {
   private readonly limits: TrackerRuntimeLimits;
   private readonly clockFn?: () => number;
   private readonly idFactoryFn?: (prefix: string) => string;
+  private readonly evaluatorFactoryFn?: (evaluationKey: string, tracker: Tracker) => TrackerEvaluator;
 
   /**
    * Per-tracker evaluation state.
@@ -212,6 +249,29 @@ export class TrackerRuntime {
   private readonly eventsByTracker = new Map<string, TrackerEvent[]>();
   private readonly allEvents: TrackerEvent[] = [];
   private readonly wakeRequests: TrackerWakeRequest[] = [];
+  /**
+   * Consecutive evaluator failures, per environment and tracker.
+   *
+   * Environment-scoped for the same reason evaluator state is: a tracker that is
+   * malformed in a replay is malformed in a replay, and one that is being handed
+   * something a live feed produced is a different failure with a different cause.
+   * Sharing the counter would let a backtest quarantine a tracker that is working
+   * perfectly in front of the user.
+   *
+   * Bounded by construction: one entry per live tracker, removed whenever the
+   * tracker is forgotten, so it cannot outlive the thing it describes.
+   */
+  private readonly evaluatorFailures = new Map<string, number>();
+  /**
+   * Trackers already reported as quarantined, so the diagnostic is written once.
+   *
+   * Without this a broken tracker emits an ERROR row on every single tick, which
+   * buries the one line that matters and grows without bound. Cleared when the
+   * tracker is forgotten or recovers.
+   */
+  private readonly quarantined = new Set<string>();
+  /** Bumped by dispose(); anything in flight checks it before mutating state. */
+  private epoch = 0;
 
   private readonly delivery: TrackerDelivery;
   private readonly resolveAgent: TrackerRegistry['getAgent'];
@@ -227,6 +287,7 @@ export class TrackerRuntime {
     this.limits = options.limits ?? DEFAULT_TRACKER_LIMITS;
     this.clockFn = options.clock;
     this.idFactoryFn = options.idFactory;
+    this.evaluatorFactoryFn = options.evaluatorFactory;
 
     this.resolveAgent = (agentId: string) => this.registry.getAgent(agentId);
     this.delivery = {
@@ -284,6 +345,18 @@ export class TrackerRuntime {
    */
   dispose(): void {
     this.stop();
+    /*
+     * Invalidate anything already in flight before releasing anything.
+     *
+     * `process()` is asynchronous and can be several awaits deep when it is
+     * disposed from underneath it. Without this, a disposed runtime keeps
+     * evaluating, recording and waking for as long as those promises take to
+     * finish — writing into stores that were just emptied and delivering wakes to
+     * an agent that was just stopped. The epoch is checked at each boundary, so a
+     * disposal that lands mid-delivery takes effect at the next one rather than
+     * waiting for a timer.
+     */
+    this.epoch += 1;
     this.evaluators.clear();
     this.lastEvent.clear();
     this.eventHistory.clear();
@@ -293,6 +366,8 @@ export class TrackerRuntime {
     this.agentByPosition.clear();
     this.instrumentCache.clear();
     this.eventsByTracker.clear();
+    this.evaluatorFailures.clear();
+    this.quarantined.clear();
     this.allEvents.length = 0;
     this.wakeRequests.length = 0;
   }
@@ -448,6 +523,7 @@ export class TrackerRuntime {
       .sort((left, right) => (right.evaluation.priority ?? 0) - (left.evaluation.priority ?? 0) || left.id.localeCompare(right.id));
 
     const fired: TrackerEvent[] = [];
+    const epoch = this.epoch;
     for (const tracker of scoped) {
       const processed = this.processedEvents.get(tracker.id) ?? new Set<string>();
       if (processed.has(deliveryKey)) continue;
@@ -466,19 +542,78 @@ export class TrackerRuntime {
 
       const evaluationKey = `${input.environment}:${tracker.id}`;
       let evaluator = this.evaluators.get(evaluationKey);
-      if (!evaluator) this.evaluators.set(evaluationKey, evaluator = new TrackerEvaluator());
+      if (!evaluator) {
+        evaluator = this.evaluatorFactoryFn
+          ? this.evaluatorFactoryFn(evaluationKey, tracker)
+          : new TrackerEvaluator();
+        this.evaluators.set(evaluationKey, evaluator);
+      }
 
       let reason: string | undefined;
       try {
         const boundedInput = input.state.bars ? { ...input, state: { ...input.state, bars: input.state.bars.slice(-1000) } } : input;
         reason = evaluator.evaluate(tracker, boundedInput);
+        /*
+         * A successful evaluation is the end of the failure streak.
+         *
+         * Reset here rather than only on a *report*: a tracker that evaluates
+         * cleanly four times and then throws has had one failure, not five, and a
+         * counter that only resets on a report would quarantine a tracker for
+         * being quiet.
+         */
+        this.evaluatorFailures.delete(evaluationKey);
+        this.quarantined.delete(evaluationKey);
       } catch (error: unknown) {
-        await this.recordError(tracker.agentId, tracker.id, input.timestamp, error);
+        /*
+         * One broken tracker, isolated.
+         *
+         * The streak is counted per environment and the tracker keeps evaluating
+         * until it crosses the threshold, because a single malformed delivery is a
+         * fact about the delivery and not about the tracker. Three in a row is a
+         * fact about the tracker, and at that point it is quarantined rather than
+         * left to fail on every tick forever.
+         */
+        const failures = (this.evaluatorFailures.get(evaluationKey) ?? 0) + 1;
+        this.evaluatorFailures.set(evaluationKey, failures);
+        if (failures >= EVALUATOR_FAILURE_THRESHOLD) {
+          await this.quarantine(tracker, evaluationKey, failures, input.timestamp, error);
+        } else {
+          await this.recordError(tracker.agentId, tracker.id, input.timestamp, error);
+        }
         continue;
       }
       if (!reason || !this.canReport(tracker, input.timestamp) || this.inFlight.has(evaluationKey)) continue;
+
+      /*
+       * The last chance to notice that this observation has stopped being valid.
+       *
+       * Between the scope checks above and here, the evaluator ran: it may have
+       * awaited nothing, but the delivery itself was handed in by a caller who
+       * could have paused, cancelled, expired or failed the tracker in that gap —
+       * and an evaluation is only worth reporting while the thing being evaluated
+       * is still being watched. Checked here, immediately before anything is
+       * recorded or delivered, and it fails closed: a tracker that is no longer
+       * ACTIVE produces no event, no timeline row and no wake.
+       *
+       * `epoch` covers the other half of the same race — a runtime that was
+       * disposed while this loop was running, where the tracker is still ACTIVE in
+       * the registry but the runtime holding it no longer exists.
+       */
+      if (epoch !== this.epoch) return fired;
+      const live = this.registry.get(tracker.id);
+      if (!live || live.lifecycle.status !== 'ACTIVE') continue;
+
       this.inFlight.add(evaluationKey);
       this.markReported(tracker, input.timestamp);
+
+      /*
+       * The indicators this observation is measured against, computed once.
+       *
+       * They were computed twice per event — once for the snapshot and once for
+       * the observed values — which is the most expensive thing on this path and
+       * could not have returned two different answers.
+       */
+      const indicators = calculateTrackerIndicators(tracker, input);
 
       const event: TrackerEvent = {
         id: `${tracker.id}:${input.id}`,
@@ -493,19 +628,27 @@ export class TrackerRuntime {
         symbol: tracker.symbol || input.symbol,
         timeframe: tracker.timeframe || input.timeframe,
         reason,
-        marketSnapshot: safeSnapshot(input.state, calculateTrackerIndicators(tracker, input)),
+        marketSnapshot: safeSnapshot(input.state, indicators),
         /*
          * The numbers, on the event itself.
          *
-         * `observedValues` is what the GOAT copies into its evidence record,
-         * and it was never populated: every tracker-derived piece of
-         * evidence therefore carried `observed: undefined` while the actual
-         * measurements sat unread in `marketSnapshot`. Evidence is "the
-         * record of why the agent believes what it believes", so an
-         * observation with no observation attached is the evidence system
-         * failing at its one job.
+         * `observedValues` is what the GOAT copies into its evidence record, and
+         * it was never populated: every tracker-derived piece of evidence
+         * therefore carried `observed: undefined` while the actual measurements
+         * sat unread in `marketSnapshot`. Evidence is "the record of why the agent
+         * believes what it believes", so an observation with no observation
+         * attached is the evidence system failing at its one job.
          */
-        observedValues: observedValuesFor(input.state, calculateTrackerIndicators(tracker, input)),
+        observedValues: observedValuesFor(input.state, indicators),
+        /*
+         * The delivery that produced it.
+         *
+         * Every tracker fired by one delivery carries the same value here, and
+         * that is the point rather than an accident: it is what lets the reasoning
+         * layer see that three observations came from one movement and decide for
+         * itself how much independence that is worth. The runtime asserts nothing
+         * about it.
+         */
         sourceEventId: input.sourceEventId || input.id,
         priority: tracker.evaluation.priority ?? 0,
         severity: severityFor(tracker.evaluation.priority),
@@ -514,7 +657,6 @@ export class TrackerRuntime {
         positionId: input.positionId,
       };
 
-      fired.push(event);
       try {
         await this.timeline.append({
           id: `timeline:${event.id}:tracker`,
@@ -535,6 +677,27 @@ export class TrackerRuntime {
             snapshot: event.marketSnapshot,
           },
         });
+        /*
+         * One observation, one record. `ingestEvent` is what attributes the event
+         * to its tracker and hands it to the domain binding, and it re-checks the
+         * lifecycle itself — so it is called *before* the agent delivery rather
+         * than after, which closes the window in which a paused tracker's wake was
+         * still delivered. If it refuses, nothing downstream runs.
+         */
+        if (!this.ingestEvent(event, { deferDelivery: true })) {
+          this.inFlight.delete(evaluationKey);
+          this.forget(tracker.id);
+          continue;
+        }
+        /*
+         * Accepted: this observation joins the frame.
+         *
+         * Collected only now, because `ingestEvent` is the point at which the
+         * runtime's own lifecycle check is applied. An event the runtime refuses
+         * must not reappear through the batch, which is delivered outside the
+         * per-tracker error handling.
+         */
+        fired.push(event);
         try {
           await this.delivery.wake(event);
         } catch (error: unknown) {
@@ -557,15 +720,19 @@ export class TrackerRuntime {
         await this.recordError(tracker.agentId, tracker.id, input.timestamp, error);
         continue;
       }
-
-      /*
-       * The event is only recorded once the audit trail has it. A tracker
-       * that produced an observation which nothing can see is a tracker
-       * the GOAT cannot be reasoned about, so a failure to record is a
-       * failure to report.
-       */
-      if (!this.ingestEvent(event)) this.forget(tracker.id);
     }
+
+    /*
+     * The wake, once for the frame rather than once per observation.
+     *
+     * Every event above is already recorded and individually queryable by the time
+     * this runs; batching only decides who is woken and with what. Grouped by the
+     * strongest identity available — environment, GOAT, thesis, market and the
+     * delivery that produced them — so two GOATs, two theses, two markets and two
+     * separate deliveries are never merged, and the grouping is the same at 1× and
+     * at 60× because nothing here reads a clock.
+     */
+    this.deliverBatches(fired, input.environment);
     return fired;
   }
 
@@ -724,8 +891,17 @@ export class TrackerRuntime {
   /** Release everything remembered about one GOAT's trackers. */
   disposeAgent(agentId: string): void {
     for (const tracker of this.registry.listForAgent(agentId)) this.forget(tracker.id);
+    /*
+     * Both environments' entries, whatever the key format.
+     *
+     * A disposed GOAT must release what it held, and the metadata cache is keyed by
+     * agent — a prefix match on the agent alone is what actually identifies it now
+     * that the key carries an environment in front.
+     */
     for (const cacheKey of [...this.instrumentCache.keys()]) {
-      if (cacheKey.startsWith(`${agentId}:`)) this.instrumentCache.delete(cacheKey);
+      if (cacheKey.includes(`|${agentId}:`) || cacheKey.startsWith(`${agentId}:`)) {
+        this.instrumentCache.delete(cacheKey);
+      }
     }
   }
 
@@ -821,6 +997,25 @@ export class TrackerRuntime {
       },
       updatedAt: this.now(),
     };
+
+    /*
+     * A recovered tracker starts clean.
+     *
+     * `updateTracker` is the existing `FAILED -> ACTIVE` path, and the recovery has
+     * to include the evaluator's memory: a tracker that was quarantined because its
+     * evaluator kept throwing would otherwise resume holding whatever partial state
+     * the last successful evaluation left behind, and the first comparison it makes
+     * on the way back is against that. The failure counters go with it, or a
+     * repaired tracker is one bad delivery away from being quarantined again.
+     */
+    if (tracker.lifecycle.status === 'FAILED') {
+      this.evaluators.delete(`DEMO:${trackerId}`);
+      this.evaluators.delete(`BACKTEST:${trackerId}`);
+      for (const environment of ['DEMO', 'BACKTEST'] as const) {
+        this.evaluatorFailures.delete(`${environment}:${trackerId}`);
+        this.quarantined.delete(`${environment}:${trackerId}`);
+      }
+    }
 
     return this.registry.update(updated);
   }
@@ -972,6 +1167,18 @@ export class TrackerRuntime {
     this.lastEvent.delete(trackerId);
     this.eventHistory.delete(trackerId);
     this.processedEvents.delete(trackerId);
+    /*
+     * Failure state is released with everything else, in both environments.
+     *
+     * A tracker that is forgotten — cancelled, expired, quarantined — and then
+     * reissued must not inherit the previous one's failure count. That would make
+     * a repaired tracker look like a broken one and quarantine it before it had
+     * evaluated anything.
+     */
+    for (const environment of ['DEMO', 'BACKTEST'] as const) {
+      this.evaluatorFailures.delete(`${environment}:${trackerId}`);
+      this.quarantined.delete(`${environment}:${trackerId}`);
+    }
   }
 
   private assertCapacity(thesisId: string, agentId: string): void {
@@ -1097,7 +1304,16 @@ export class TrackerRuntime {
    * from the event, so a caller cannot attribute an observation to a
    * tracker, a GOAT, or a thesis it does not belong to.
    */
-  ingestEvent(event: TrackerEvent): TrackerEvent | undefined {
+  /**
+   * Record an observation and deliver the wake it implies.
+   *
+   * `deferDelivery` exists for `process()`, which evaluates a delivery as a unit
+   * and hands the whole frame to the reasoning layer afterwards. An observation
+   * ingested on its own — a manual replay of one recorded event, a position update
+   * the runtime never evaluated — is a frame of one and is delivered immediately,
+   * exactly as before.
+   */
+  ingestEvent(event: TrackerEvent, options?: { deferDelivery?: boolean }): TrackerEvent | undefined {
     const tracker = this.registry.get(event.trackerId);
     if (!tracker) return undefined;
     // A paused or cancelled tracker must not produce evidence, even if
@@ -1125,7 +1341,8 @@ export class TrackerRuntime {
     };
 
     this.recordEvent(tracker, owned);
-    this.recordWake(tracker, owned);
+    const request = this.recordWake(tracker, owned);
+    if (request && !options?.deferDelivery) this.deliverBatches([owned], owned.environment);
     return owned;
   }
 
@@ -1154,13 +1371,24 @@ export class TrackerRuntime {
     });
   }
 
-  private recordWake(tracker: Tracker, event: TrackerEvent): void {
+  /**
+   * Build and retain the wake an observation implies.
+   *
+   * Delivery is not this method's business. Recording an observation and *delivering*
+   * it are separate acts, and the runtime keeps them separate: `process()` evaluates a
+   * whole delivery, sees which trackers it satisfied, and only then wakes the
+   * reasoning layer — once, for the frame. Waking per observation here would mean
+   * three model calls to be told one market movement three times.
+   *
+   * Returns the request it retained, or nothing when there is no wake to build.
+   */
+  private recordWake(tracker: Tracker, event: TrackerEvent): TrackerWakeRequest | undefined {
     /*
      * A tracker with no thesis is a bare engine-level observation: it is
      * still recorded and still delivered, but there is no hypothesis for
      * it to be evidence about, so there is nothing to wake.
      */
-    if (!tracker.thesisId) return;
+    if (!tracker.thesisId) return undefined;
     const thesis = this.resolveThesis(tracker.thesisId);
     if (!thesis) {
       /*
@@ -1169,7 +1397,7 @@ export class TrackerRuntime {
        * with an empty hypothesis.
        */
       this.cancelTrackersForThesis(tracker.thesisId, 'Thesis no longer exists.');
-      return;
+      return undefined;
     }
 
     const request: TrackerWakeRequest = {
@@ -1187,9 +1415,181 @@ export class TrackerRuntime {
     if (this.wakeRequests.length > MAX_RETAINED_WAKE_REQUESTS) {
       this.wakeRequests.splice(0, this.wakeRequests.length - MAX_RETAINED_WAKE_REQUESTS);
     }
+    return request;
+  }
 
-    if (this.domain?.onEvent) {
-      void this.domain.onEvent(event);
+  /**
+   * Isolate one tracker after repeated evaluator failures.
+   *
+   * The whole of what "quarantined" means here, and it is deliberately small:
+   * the tracker stops being evaluated, its evaluation memory is released, and one
+   * diagnostic is written saying which tracker, in which environment, after how
+   * many failures, and what the error was. Nothing else in the runtime is touched —
+   * a broken watch is an isolated watch, and one that poisons the GOAT which armed
+   * it would be a worse failure than the one being contained.
+   *
+   * The diagnostic is written once per tracker per environment. A quarantined
+   * tracker is not evaluated again, so without this the row could not repeat — but
+   * if that ever changes, "once" is the behaviour that was intended.
+   */
+  private async quarantine(
+    tracker: Tracker,
+    evaluationKey: string,
+    failures: number,
+    timestamp: number,
+    error: unknown,
+  ): Promise<void> {
+    const alreadyReported = this.quarantined.has(evaluationKey);
+    this.quarantined.add(evaluationKey);
+
+    if (!alreadyReported) {
+      try {
+        await this.timeline.append({
+          id: `tracker-quarantine:${evaluationKey}`,
+          agentId: tracker.agentId,
+          timestamp,
+          type: 'ERROR',
+          trackerId: tracker.id,
+          data: {
+            code: 'TRACKER_QUARANTINED',
+            message:
+              `Tracker ${tracker.id} failed to evaluate ${failures} times in a row in ${evaluationKey.split(':')[0]} and was isolated. ` +
+              `The rest of the runtime is unaffected: ${redactMessage(error)}`,
+            environment: evaluationKey.split(':')[0],
+            failures,
+          },
+        });
+      } catch {
+        // A store that cannot take the row must not stop the quarantine.
+      }
+    }
+
+    const current = this.registry.get(tracker.id);
+    if (current && current.lifecycle.status === 'ACTIVE') {
+      this.registry.update({
+        ...current,
+        lifecycle: {
+          ...current.lifecycle,
+          status: 'FAILED',
+          failureReason: `Evaluator failed ${failures} times in a row: ${redactMessage(error)}`,
+        },
+        updatedAt: this.now(),
+      });
+    }
+    // Releases evaluator state, cooldown memory and the dedupe set for it.
+    this.forget(tracker.id);
+    this.quarantined.delete(evaluationKey);
+    this.evaluatorFailures.delete(evaluationKey);
+  }
+
+  /**
+   * Wake the reasoning layer once per logical frame.
+   *
+   * One market observation routinely satisfies several trackers: a 15m bar closing
+   * above a level can satisfy a price cross, a breakout and an indicator cross at
+   * once. Waking the GOAT once per tracker meant three model calls to be told one
+   * thing three times — and with a reasoning layer that weighs evidence, the third
+   * pass was not merely wasteful but actively worse, because it could not see what
+   * the first two had already counted.
+   *
+   * The grouping is logical rather than temporal. Every event here already carries
+   * the delivery that produced it, so two events belong to one frame exactly when
+   * they share an environment, a GOAT, a thesis, a market and a source delivery.
+   * No timer, no window, no wall-clock: the same replay produces the same batches in
+   * the same order at any speed, and two observations that happen to share a
+   * millisecond without sharing a delivery are never merged.
+   *
+   * Nothing is lost. Every event in every batch is already recorded and remains
+   * individually queryable; the batch is how they are *delivered*.
+   */
+  private deliverBatches(events: TrackerEvent[], environment: TradingEnvironmentMode): void {
+    if (events.length === 0 || !this.domain?.onEvent) return;
+
+    const frames = new Map<string, TrackerEvent[]>();
+    for (const event of events) {
+      /*
+       * An observation with no thesis has nothing to reason about, and `recordWake`
+       * already declined to build a wake for it. It is still an event, and it is
+       * still recorded; it just does not belong in a batch that would wake anyone.
+       */
+      if (!event.thesisId) continue;
+      const key = `${environment}|${event.agentId}|${event.thesisId}|${event.symbol ?? ''}|${event.sourceEventId ?? event.id}`;
+      const bucket = frames.get(key);
+      if (bucket) bucket.push(event);
+      else frames.set(key, [event]);
+    }
+
+    for (const [key, batch] of frames) {
+      /*
+       * Deterministic order, in the sequence the batch documents: observation
+       * time, then the frame identity, then priority descending, then id ascending.
+       *
+       * Not by evaluation order and certainly not by completion order — evaluation
+       * happens in priority order already, but `Map` iteration and promise
+       * resolution are not contracts, and a batch whose order could change between
+       * two identical replays could not be compared against either.
+       */
+      batch.sort(
+        (left, right) =>
+          left.timestamp - right.timestamp ||
+          left.id.localeCompare(right.id) ||
+          (right.priority ?? 0) - (left.priority ?? 0),
+      );
+
+      const primary = batch[0]!;
+      // The frame key already holds every identity component, in order, so the id
+      // is derived from it rather than rebuilt from the primary event — a batch of
+      // three events from one delivery and a batch of one event from that delivery
+      // are the same frame and must not claim different identities.
+      const batchId = `batch:${key.split('|').join(':')}`;
+      const observationBatch: TrackerObservationBatch = {
+        batchId,
+        agentId: primary.agentId,
+        thesisId: primary.thesisId as string,
+        environment,
+        symbol: primary.symbol ?? '',
+        observationTimestamp: primary.timestamp,
+        sourceEventId: primary.sourceEventId ?? primary.id,
+        events: [...batch],
+        primaryEventId: primary.id,
+      };
+
+      /*
+       * The wake request for every event in the frame gains the batch, so the
+       * reasoning layer can find the whole observation from whichever wake it is
+       * handed. The primary's request is the one that is actually delivered; the
+       * others remain individually addressable through `wakeRequestForEvent`, which
+       * is how a caller that wants one specific observation still gets it.
+       */
+      for (const event of batch) {
+        const request = this.wakeRequestForEvent(event.id);
+        if (request) request.batch = observationBatch;
+      }
+
+      /*
+       * Not awaited, and that is a decision rather than an omission.
+       *
+       * `process()` runs on the tick path. Everything behind `onEvent` is the
+       * reasoning layer, which means a model call, and a tick path that waits for a
+       * model is a tick path whose latency is the market's to pay for. The runtime
+       * hands the frame over and returns; what the GOAT does with it takes as long
+       * as it takes.
+       *
+       * It also keeps the boundary the way it was: the runtime reports what it
+       * observed, and does not measure how long the reader took. The frames are
+       * still issued in the deterministic order built above, and each one carries
+       * its own error boundary, so a refusal in one cannot swallow the next.
+       */
+      void this.deliverFrame(primary, observationBatch);
+    }
+  }
+
+  /** Hand one frame to the reasoning layer, and contain whatever comes back. */
+  private async deliverFrame(primary: TrackerEvent, batch: TrackerObservationBatch): Promise<void> {
+    try {
+      await this.domain?.onEvent?.(primary, batch);
+    } catch (error: unknown) {
+      await this.recordError(primary.agentId, primary.trackerId, primary.timestamp, error);
     }
   }
 
@@ -1324,13 +1724,48 @@ export class TrackerRuntime {
     state: TrackerInput['state'],
   ): Promise<TrackerInput['state']> {
     if (!agentId) return state;
-    const cacheKey = `${agentId}:${symbol}`;
+    /*
+     * Keyed by environment as well as agent and market.
+     *
+     * The cache holds a promise, so two concurrent deliveries for the same market
+     * share one lookup — which is the point of caching it, and the reason the entry
+     * must not outlive a failure (see below). What it must never do is answer for
+     * one environment with the other's metadata, and a DEMO lookup and a BACKTEST
+     * lookup are two different queries against two different environments even
+     * though the agent and symbol are the same.
+     */
+    const environment = state.environment;
+    const cacheKey = `${environment}|${agentId}:${symbol}`;
     let pending = this.instrumentCache.get(cacheKey);
     if (!pending) {
       pending = this.resolveInstrument(agentId, symbol);
       this.instrumentCache.set(cacheKey, pending);
     }
-    const instrument = await pending;
+
+    let instrument: InstrumentMetadata | undefined;
+    try {
+      instrument = await pending;
+    } catch (error: unknown) {
+      // Never expected — `resolveInstrument` swallows — but a poisoned entry must
+      // not be able to reject every future caller, so it is dropped either way.
+      this.instrumentCache.delete(cacheKey);
+      throw error;
+    }
+
+    if (instrument === undefined) {
+      /*
+       * Evict a miss.
+       *
+       * "No metadata" and "no metadata *yet*" are different states, and the cache
+       * cannot tell them apart. Keeping the miss would mean a market that publishes
+       * its instruments a second later is permanently unmeasurable in this runtime:
+       * every evaluator that asks gets the cached absence forever, and nothing in
+       * the product will ever retry. A lookup that succeeded is kept — that is
+       * stable metadata — and only the failure is forgotten.
+       */
+      this.instrumentCache.delete(cacheKey);
+    }
+
     return instrument ? { ...state, instrument } : state;
   }
 

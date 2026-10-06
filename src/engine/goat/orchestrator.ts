@@ -109,6 +109,7 @@ import {
   Thesis,
   TrackerEvent,
   TrackerKind,
+  TrackerObservationBatch,
   TrackerRequest,
   TradeIdea,
   WakeRequest,
@@ -754,7 +755,14 @@ export class GoatOrchestrator {
         const goal = this.stores.goals.getForAgent(agentId);
         return goal?.skillIds ?? [];
       },
-      onEvent: (event) => this.handleTrackerEvent(event),
+      /*
+       * The runtime calls this once per logical observation frame, not once per
+       * event, so one bar closing can wake the GOAT once however many of its
+       * trackers it satisfied. The batch rides along as the second argument and is
+       * attached to the wake request by the runtime itself; a handler that reads
+       * only `event` behaves exactly as it did before.
+       */
+      onEvent: (event, batch) => this.handleTrackerEvent(event, batch),
     });
 
     this.registerTrackerCapabilities();
@@ -4617,7 +4625,7 @@ export class GoatOrchestrator {
    * it inherits the single-flight guard, the relevance filter and the
    * timeline record that every other wake already gets.
    */
-  private async handleTrackerEvent(event: TrackerEvent): Promise<void> {
+  private async handleTrackerEvent(event: TrackerEvent, batch?: TrackerObservationBatch): Promise<void> {
     const wake = this.trackers.wakeRequestForEvent(event.id);
     if (!wake) return;
     /*
@@ -4697,21 +4705,35 @@ export class GoatOrchestrator {
      *
      * Written from the tracker record, so the reason is the tracker's own.
      */
-    this.recordActivity({
-      goatId: context.agentId,
-      deploymentId: context.deployment.deploymentId,
-      agentId: wake.agentId,
-      type: 'TRACKER_FIRED',
-      data: {
-        trackerId: wake.event.trackerId,
-        thesisId: wake.thesisId,
-        symbol: wake.event.symbol,
-        kind: wake.event.kind,
-        reason: wake.event.reason,
-        severity: wake.event.severity,
-        observed: wake.event.observedValues,
-      },
-    });
+    /*
+     * Every observation in the frame is announced, not only the one the wake is
+     * addressed to.
+     *
+     * Batching is a delivery optimisation and the log is the record of what the
+     * runtime observed, so collapsing three `TRACKER_FIRED` lines into one would
+     * hide two observations that genuinely happened. The wake is one; the
+     * observations are still three, and each says which tracker produced it.
+     */
+    for (const observation of wake.batch?.events ?? [wake.event]) {
+      this.recordActivity({
+        goatId: context.agentId,
+        deploymentId: context.deployment.deploymentId,
+        agentId: wake.agentId,
+        type: 'TRACKER_FIRED',
+        data: {
+          trackerId: observation.trackerId,
+          thesisId: wake.thesisId,
+          symbol: observation.symbol,
+          kind: observation.kind,
+          reason: observation.reason,
+          severity: observation.severity,
+          observed: observation.observedValues,
+          ...(wake.batch && wake.batch.events.length > 1
+            ? { observations: wake.batch.events.length, frame: wake.batch.batchId }
+            : {}),
+        },
+      });
+    }
 
     this.recordActivity({
       goatId: context.agentId,

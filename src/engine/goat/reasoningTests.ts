@@ -1312,6 +1312,129 @@ test('ownership: a wake cannot act on a thesis it did not wake for', () => {
   assert(outcome.thesis.id === bull.id, 'the outcome describes the wake\'s thesis');
 });
 
+/*
+ * The other side of batching.
+ *
+ * The runtime groups observations of one market moment into one wake; this is where
+ * that becomes meaningful. Every observation is recorded as its own evidence — and
+ * because they share a delivery, the second and third are worth nothing, so three
+ * trackers agreeing about one bar produce one piece of support rather than three.
+ *
+ * These two claims are the reason batching is safe to do at all. If the loop only
+ * read the wake's first event, observations would vanish; if it treated a frame as
+ * independent confirmations, confidence would walk to certainty on a single bar.
+ */
+test('frame: every observation in a batch is recorded, and they are not independent', () => {
+  const h = makeHarness();
+  const thesis = seedThesis(h);
+  const first = makeTracker(h, thesis.id, { purpose: 'Price cross', priority: 60 });
+  const second = makeTracker(h, thesis.id, { purpose: 'Indicator cross', priority: 50 });
+  const third = makeTracker(h, thesis.id, { purpose: 'Breakout', priority: 40 });
+
+  const wake = wakeFor(h, thesis.id, first.id, {
+    id: `evt_frame_primary_${NOW}`,
+    sourceEventId: 'bar:1000',
+    reason: 'Price closed above the level',
+  });
+  // The other two observations of the same bar, which the runtime put in the frame.
+  const siblings = [
+    wakeFor(h, thesis.id, second.id, {
+      id: `evt_frame_rsi_${NOW}`, sourceEventId: 'bar:1000', reason: 'RSI crossed above 50',
+    }),
+    wakeFor(h, thesis.id, third.id, {
+      id: `evt_frame_breakout_${NOW}`, sourceEventId: 'bar:1000', reason: 'Price broke the range',
+    }),
+  ];
+
+  // One frame of three, exactly as the runtime delivers it.
+  const frame = {
+    batchId: 'batch:DEMO:agent-1:bar:1000',
+    agentId: h.goal.agentId,
+    thesisId: thesis.id,
+    environment: 'DEMO' as const,
+    symbol: 'EURUSD',
+    observationTimestamp: NOW,
+    sourceEventId: 'bar:1000',
+    events: [wake.event, ...siblings.map((sibling) => sibling.event)],
+    primaryEventId: wake.event.id,
+  };
+  const before = h.evidence.listForThesis(thesis.id).length;
+  const outcome = h.loop.applyPlan({ ...wake, batch: frame }, {
+    kind: 'CONFIRM_THESIS',
+    thesisId: thesis.id,
+    reason: 'The reclaim held.',
+  });
+
+  const recorded = h.evidence.listForThesis(thesis.id).slice(before);
+  assertEqual(recorded.length, 3, 'every observation in the frame became its own evidence record');
+  assert(
+    recorded.every((item) => item.summary.includes('Tracker event')),
+    'and each says what was observed',
+  );
+  assertEqual(
+    new Set(recorded.map((item) => item.provenance)).size,
+    1,
+    'all three name the one delivery they came from, which is how they are known to be one movement',
+  );
+  assertEqual(
+    recorded.filter((item) => (item.weight ?? 0) !== 0).length,
+    1,
+    'and only the observation the wake is addressed to carried weight',
+  );
+  assertEqual(
+    new Set(outcome.evidenceRecorded).size,
+    3,
+    'the outcome reports all of them, because the GOAT was shown all of them',
+  );
+});
+
+test('frame: a frame is worth about as much as one observation, not three', () => {
+  const one = makeHarness();
+  const thesisOne = seedThesis(one);
+  const single = makeTracker(one, thesisOne.id);
+  const oneOutcome = one.loop.applyPlan(wakeFor(one, thesisOne.id, single.id, {
+    id: 'evt_single', sourceEventId: 'bar:2000', reason: 'Price closed above the level',
+  }), { kind: 'CONFIRM_THESIS', thesisId: thesisOne.id, reason: 'The reclaim held.' });
+  const confidenceAfterOne = one.theses.get(thesisOne.id)!.confidence;
+
+  const many = makeHarness();
+  const thesisMany = seedThesis(many);
+  const a = makeTracker(many, thesisMany.id, { purpose: 'Price cross', priority: 60 });
+  const b = makeTracker(many, thesisMany.id, { purpose: 'Indicator cross', priority: 50 });
+  const c = makeTracker(many, thesisMany.id, { purpose: 'Breakout', priority: 40 });
+
+  const primary = wakeFor(many, thesisMany.id, a.id, {
+    id: 'evt_many_primary', sourceEventId: 'bar:2000', reason: 'Price closed above the level',
+  });
+  const siblings = [
+    wakeFor(many, thesisMany.id, b.id, {
+      id: 'evt_many_rsi', sourceEventId: 'bar:2000', reason: 'RSI crossed above 50',
+    }),
+    wakeFor(many, thesisMany.id, c.id, {
+      id: 'evt_many_breakout', sourceEventId: 'bar:2000', reason: 'Price broke the range',
+    }),
+  ];
+  many.loop.applyPlan({ ...primary, batch: {
+    batchId: 'batch:DEMO:agent-1:bar:2000',
+    agentId: many.goal.agentId,
+    thesisId: thesisMany.id,
+    environment: 'DEMO',
+    symbol: 'EURUSD',
+    observationTimestamp: NOW,
+    sourceEventId: 'bar:2000',
+    events: [primary.event, ...siblings.map((sibling) => sibling.event)],
+    primaryEventId: primary.event.id,
+  } }, { kind: 'CONFIRM_THESIS', thesisId: thesisMany.id, reason: 'The reclaim held.' });
+  const confidenceAfterFrame = many.theses.get(thesisMany.id)!.confidence;
+
+  assertEqual(oneOutcome.thesis.id, thesisOne.id, 'the single-observation wake described its thesis');
+  assertEqual(
+    confidenceAfterFrame,
+    confidenceAfterOne,
+    'three trackers reporting the same bar moves belief exactly as much as one of them did',
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------

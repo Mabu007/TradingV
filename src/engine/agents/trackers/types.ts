@@ -309,9 +309,92 @@ export interface TrackerWakeRequest {
   thesis: TrackerThesisView;
   /** Other recent events for the same tracker, newest last. */
   relatedEvents: TrackerEvent[];
+  /**
+   * Every observation from one logical frame, when this wake belongs to one.
+   *
+   * Absent for an observation delivered on its own, which is the common case for a
+   * position, order or risk event. When it is present, `event` is
+   * `batch.primaryEventId` and the batch is the full delivery — so a reasoning
+   * layer that only reads `event` behaves exactly as before, and one that reads
+   * the batch sees the whole observation.
+   */
+  batch?: TrackerObservationBatch;
   /** Skills active at wake time. */
   skillIds: string[];
   createdAt: number;
+}
+
+/**
+ * Several observations that belong to one logical reasoning opportunity.
+ *
+ * ## What this is, and what it is not
+ *
+ * It is a *delivery container*. One market observation — one bar closing, one
+ * quote arriving, one position update — very often satisfies several trackers at
+ * once, and waking the reasoning layer once per tracker means paying for three
+ * model calls to be told the same thing three times. The batch says "these
+ * observations came from one observation of the market" and nothing more.
+ *
+ * It is emphatically not a merged observation. There is no combined event, no
+ * `COMBINED_CONFIRMATION`, no synthetic event type: every `TrackerEvent` in
+ * `events` remains individually addressable, individually queryable and
+ * individually attributable to the tracker that produced it, and
+ * `listEventsForTracker` still answers for each of them.
+ *
+ * ## Why there is no "independent" flag
+ *
+ * Two trackers firing on the same price movement are two facts about one fact.
+ * Whether they are *independent evidence* is a question about the thesis they bear
+ * on, and only the reasoning layer can answer it — it knows what it already holds
+ * and what it has already counted. So the batch preserves each event's
+ * `sourceEventId`, which is the delivery that produced it, and lets the reasoning
+ * layer compare that against what it has recorded. Nothing here decides anything.
+ *
+ * ## Identity is logical, never temporal
+ *
+ * `frameId` is derived from the source delivery and the environment, so the same
+ * historical input produces the same batch at 1× and at 60×. There is no timer and
+ * no wall-clock window anywhere in its construction: a batch is formed while the
+ * delivery that produced it is being processed, and never later.
+ */
+export interface TrackerObservationBatch {
+  /**
+   * Identity of this batch.
+   *
+   * Deterministic from the environment, the GOAT, the thesis, the market and the
+   * source delivery — so the same replay produces the same ids in the same order.
+   */
+  batchId: string;
+  agentId: string;
+  thesisId: string;
+  environment: TradingEnvironmentMode;
+  symbol: string;
+  /**
+   * When the market was observed, epoch ms.
+   *
+   * The *market's* time, taken from the events themselves, so a batch is stamped
+   * by the history it describes rather than by when the runtime happened to notice.
+   */
+  observationTimestamp: number;
+  /**
+   * The delivery that produced every event in the batch.
+   *
+   * Shared by all of them, and the reason the runtime does not claim they are
+   * independent: this string is what the reasoning layer compares against the
+   * provenance of evidence it has already recorded.
+   */
+  sourceEventId: string;
+  /** Every observation, in the deterministic order the runtime committed to. */
+  events: TrackerEvent[];
+  /**
+   * The event the wake is addressed to.
+   *
+   * One observation has to lead, because a wake names one — but it leads by a rule
+   * (timestamp, then priority, then id) and not by whichever evaluation finished
+   * first. It is a representative, not a summary, and the other events are not
+   * subordinate to it.
+   */
+  primaryEventId: string;
 }
 
 /** The minimum a wake needs to know about the thesis it is waking for. */

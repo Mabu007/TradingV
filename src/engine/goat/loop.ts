@@ -44,6 +44,7 @@ import {
   provenanceKey,
   readSufficiency,
   weighEvidence,
+  type EvidenceWeight,
   type SufficiencyReadout,
 } from './reasoning';
 import {
@@ -1212,25 +1213,15 @@ export class GoatLoop {
       return;
     }
 
-    const prior = this.deps.evidence.listForThesis(wake.thesisId);
-    const weight = weighEvidence({
-      event: wake.event,
-      polarity,
-      ...(this.thesisTimeframe(thesis) ? { thesisTimeframe: this.thesisTimeframe(thesis) } : {}),
-      priorEvidence: prior,
-      ...(polarity === 'CONTRADICTS'
-        ? { strongestCounterWeight: strongestWeight(prior, 'SUPPORTS') }
-        : { strongestCounterWeight: strongestWeight(prior, 'CONTRADICTS') }),
-    });
+    const thesisTimeframe = this.thesisTimeframe(thesis);
+    const frame = this.weighFrame(wake, polarity, thesisTimeframe);
+    outcome.evidenceRecorded.push(...frame.evidence.map((item) => item.id));
 
-    const evidence = this.recordWakeEvidence(wake, polarity, weight.effect, weight);
-    outcome.evidenceRecorded.push(evidence.id);
-
-    const confidence = applyConfidence(thesis.confidence, weight.effect);
+    const confidence = applyConfidence(thesis.confidence, frame.totalEffect);
     const verdict = hysteresisVerdict({
       polarity,
-      effect: weight.effect,
-      repeated: weight.repeated,
+      effect: frame.strongest.effect,
+      repeated: frame.strongest.repeated,
     });
 
     if (!verdict.changesState) {
@@ -1403,6 +1394,22 @@ export class GoatLoop {
    * the thesis is the agent's judgement, and that judgement is the
    * `summary`, not the `reason` the runtime produced.
    */
+  /**
+   * Record the observations this wake delivered, as evidence.
+   *
+   * One record per observation, not one per wake — and that is the whole of what
+   * batching changes here. The tracker runtime groups several observations of one
+   * market moment into a single wake so the GOAT is woken once; it does not merge
+   * them, and the reasoning layer still has to see each of them separately,
+   * because whether three observations of one bar are one piece of evidence or
+   * three is a question about this thesis and these records, and only this layer
+   * can answer it.
+   *
+   * They arrive here sharing a provenance key, so `noveltyWeight` gives the second
+   * and third nothing and the model is told plainly that it is not looking at
+   * three independent confirmations. The independence is *decided* here and
+   * asserted nowhere upstream.
+   */
   private recordWakeEvidence(
     wake: WakeRequest,
     polarity: 'SUPPORTS' | 'CONTRADICTS',
@@ -1413,14 +1420,100 @@ export class GoatLoop {
       conflictingWith?: Array<{ evidenceId: string; because: string }>;
     },
   ): Evidence {
-    const key = provenanceKey(wake.event);
+    return this.recordObservationEvidence(wake, wake.event, polarity, effect, detail);
+  }
+
+  /**
+   * Every observation in the wake's frame, in the runtime's deterministic order,
+   * primary first.
+   *
+   * The primary leads because the wake is addressed to it and the reason the wake
+   * happened is its own; the rest follow in the order the runtime committed to, so
+   * the record reads the same way twice.
+   */
+  private observationsOf(wake: WakeRequest): TrackerEvent[] {
+    const batch = wake.batch?.events;
+    if (!batch || batch.length === 0) return [wake.event];
+    const ordered = [wake.event, ...batch.filter((event) => event.id !== wake.event.id)];
+    return ordered;
+  }
+
+  /**
+   * Weigh and record every observation in one frame, in the runtime's order.
+   *
+   * Each observation is weighed *separately*, against the evidence as it stood when
+   * it was weighed. That ordering is what makes a batch mean something rather than
+   * merely arrive together: the first observation of a market movement is novel and
+   * the second and third, sharing its provenance, are not — so three trackers firing
+   * on one bar produce one piece of support and two records that say so, rather than
+   * three pieces of support and a confidence that walked to certainty on one bar.
+   *
+   * The effect applied to belief is the sum of what each observation was worth, and
+   * the strongest single observation decides whether the state moves at all. A
+   * batch of two marginal observations does not aggregate its way past the
+   * hysteresis floor.
+   */
+  private weighFrame(
+    wake: WakeRequest,
+    polarity: 'SUPPORTS' | 'CONTRADICTS',
+    thesisTimeframe: string | undefined,
+  ): { evidence: Evidence[]; totalEffect: number; strongest: EvidenceWeight } {
+    const recorded: Evidence[] = [];
+    let totalEffect = 0;
+    let strongest: EvidenceWeight | undefined;
+
+    for (const event of this.observationsOf(wake)) {
+      const prior = this.deps.evidence.listForThesis(wake.thesisId);
+      const weight = weighEvidence({
+        event,
+        polarity,
+        ...(thesisTimeframe ? { thesisTimeframe } : {}),
+        priorEvidence: prior,
+        strongestCounterWeight: strongestWeight(prior, polarity === 'SUPPORTS' ? 'CONTRADICTS' : 'SUPPORTS'),
+      });
+      recorded.push(
+        this.recordObservationEvidence(wake, event, polarity, weight.effect, {
+          novelty: weight.novelty,
+        }),
+      );
+      totalEffect += weight.effect;
+      if (!strongest || Math.abs(weight.effect) > Math.abs(strongest.effect)) strongest = weight;
+    }
+
+    return {
+      evidence: recorded,
+      totalEffect,
+      strongest: strongest ?? {
+        effect: 0,
+        severity: 0,
+        timeframe: 0,
+        novelty: 0,
+        stated: 0,
+        repeated: true,
+        conflicting: false,
+      },
+    };
+  }
+
+  private recordObservationEvidence(
+    wake: WakeRequest,
+    event: TrackerEvent,
+    polarity: 'SUPPORTS' | 'CONTRADICTS',
+    effect = 0,
+    detail?: {
+      novelty?: number;
+      conflicting?: boolean;
+      conflictingWith?: Array<{ evidenceId: string; because: string }>;
+    },
+  ): Evidence {
+    const key = provenanceKey(event);
     const prior = this.deps.evidence.listForThesis(wake.thesisId);
     const conflicts = detectConflicts({
       incoming: {
         polarity,
         weight: Math.abs(effect),
-        ...(wake.event.trackerId ? { sourceTrackerId: wake.event.trackerId } : {}),
-        ...(wake.event.timeframe ? { timeframe: wake.event.timeframe } : {}),
+        ...(event.trackerId ? { sourceTrackerId: event.trackerId } : {}),
+        ...(event.timeframe ? { timeframe: event.timeframe } : {}),
       },
       prior,
     });
@@ -1428,17 +1521,17 @@ export class GoatLoop {
     return this.recordEvidence({
       thesisId: wake.thesisId,
       polarity,
-      summary: `Tracker event: ${wake.event.reason}`,
+      summary: `Tracker event: ${event.reason}`,
       source: 'TRACKER_EVENT',
-      ...(wake.event.observedValues ? { observed: wake.event.observedValues } : {}),
-      ...(typeof wake.event.confidence === 'number'
-        ? { confidence: wake.event.confidence }
+      ...(event.observedValues ? { observed: event.observedValues } : {}),
+      ...(typeof event.confidence === 'number'
+        ? { confidence: event.confidence }
         : {}),
-      trackerEventId: wake.event.id,
+      trackerEventId: event.id,
       provenance: key,
-      ...(wake.event.trackerId ? { sourceTrackerId: wake.event.trackerId } : {}),
-      ...(wake.event.timeframe ? { timeframe: wake.event.timeframe } : {}),
-      ...(wake.event.symbol ? { symbol: wake.event.symbol } : {}),
+      ...(event.trackerId ? { sourceTrackerId: event.trackerId } : {}),
+      ...(event.timeframe ? { timeframe: event.timeframe } : {}),
+      ...(event.symbol ? { symbol: event.symbol } : {}),
       weight: effect,
       novelty: detail?.novelty ?? 1,
       ...(conflicts.length > 0

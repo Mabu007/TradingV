@@ -1,6 +1,7 @@
 import { runAgentInfrastructureTests } from '../tests';
 import { runAgentModelTests } from '../model/modelTests';
 import { runTrackerTimelineTests, runTrackerRegistryTests } from '../trackers/tests';
+import { runTrackerObservationEngineTests } from '../trackers/observationEngineTests';
 import { runConditionTreeTests } from '../trackers/conditionTests';
 import { runHistoricalValidationTests } from '../../backtester/historicalTests';
 import { runActivityPersistenceTests, runTimelineWriteCoalescingTests } from '../activityTests';
@@ -14,6 +15,7 @@ await runAgentModelTests();
 runTrackerRegistryTests();
 await runTrackerTimelineTests();
 runConditionTreeTests();
+await runTrackerObservationEngineTests();
 runHistoricalValidationTests();
 await runExecutionRiskTests();
 await runActivityPersistenceTests();
